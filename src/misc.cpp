@@ -23,5 +23,5 @@ void init_all()
 
     init_eval_masks();
 
-    nnue_init("nn-62ef826d1a6d.nnue");
+    nnue_init("model.nnue");
 }

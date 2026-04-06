@@ -71,7 +71,7 @@ else ifeq ($(OS_NAME),Windows)
 endif
 
 ifeq ($(BUILD),debug)
-    CXXFLAGS += -g -DDEBUG_BUILD -DDLL_EXPORT
+    CXXFLAGS += -g $(ARCH_FLAGS) -DDEBUG_BUILD -DDLL_EXPORT
 else ifeq ($(BUILD),release)
     CXXFLAGS += $(OPT_FLAGS) $(ARCH_FLAGS) -DRELEASE_BUILD -DDLL_EXPORT
 endif
@@ -81,11 +81,14 @@ endif
 ###############################################################################
 .PHONY: all release debug clean
 
-all: clean $(BUILD)
+all:
+	$(MAKE) BUILD=$(BUILD) clean $(EXE)
 
-release: clean $(EXE)
+release:
+	$(MAKE) BUILD=release clean $(EXE)
 
-debug: clean $(EXE)
+debug:
+	$(MAKE) BUILD=debug clean $(EXE)
 
 $(EXE): $(OBJECTS)
 	$(CXX) $(CXXFLAGS) $(STACK_FLAG) -o $@ $^

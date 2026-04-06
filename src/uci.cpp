@@ -9,9 +9,11 @@
 #include "search.h"
 #include "misc.h"
 #include "globals.h"
+#include "nnue.h"
 #include <stdlib.h>
 #include <vector>
 #include <cstring>
+#include <cctype>
 #include <string>
 #include <chrono>
 #include <sstream>
@@ -60,6 +62,25 @@ int stopped = 0;
 
 // Number of threads use for search
 int numThreads = 4;
+
+static std::string trim_option_value(const char* value) {
+    if (value == nullptr) {
+        return {};
+    }
+
+    std::string text(value);
+    std::size_t start = 0;
+    while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start]))) {
+        ++start;
+    }
+
+    std::size_t end = text.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+        --end;
+    }
+
+    return text.substr(start, end - start);
+}
 
 /*
 TIME CONTROL
@@ -241,7 +262,7 @@ void uci_parse_position(thrawn::Position* pos, const char *command) {
             pos->repetition_index++;
             pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
-            make_move(pos, move, all_moves,-1);
+            make_root_move(pos, move, all_moves);
 
             // Move index to the end of the current move
             while (*curr_ch && *curr_ch != ' ')
@@ -418,6 +439,7 @@ void uci_loop(thrawn::Position* pos)
             cout << "id author Feiyu Lin\n";
             cout << "option name Hash type spin default 256 min 4 max 1024" << max_hashmap_size << "\n";
             cout << "option name Threads type spin default 4 min 1 max 16" << "\n";
+            cout << "option name EvalFile type string default model.nnue" << "\n";
             cout << "uciok\n";
         }
         
@@ -441,6 +463,15 @@ void uci_loop(thrawn::Position* pos)
             if (t > 16) t = 16;
             numThreads = t;
             std::cout << "info string Set threads = " << numThreads << std::endl;
+        }
+
+        else if (!strncmp(input, "setoption name EvalFile value ", 30)) {
+            std::string path = trim_option_value(input + 30);
+            if (path.empty()) {
+                path = "model.nnue";
+            }
+            nnue_init(path.c_str());
+            nnue_refresh_root(pos);
         }
 
         else if (strncmp(input, "perft", 5) == 0)

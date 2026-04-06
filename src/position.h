@@ -8,6 +8,23 @@
 
 namespace thrawn {
 
+constexpr int NNUE_FT_SIZE = 256;
+constexpr int NNUE_MAX_PIECES = 32;
+
+struct NnueState {
+    alignas(64) std::array<int16_t, NNUE_FT_SIZE> white_acc{};
+    alignas(64) std::array<int16_t, NNUE_FT_SIZE> black_acc{};
+    std::array<uint8_t, NNUE_MAX_PIECES> piece_list{};
+    std::array<uint8_t, NNUE_MAX_PIECES> square_list{};
+    std::array<int8_t, BOARD_SIZE> index_by_square{};
+    uint8_t piece_count = 0;
+    bool valid = false;
+
+    NnueState() {
+        index_by_square.fill(-1);
+    }
+};
+
 // Holds all data needed to restore a position
 struct UndoData {
     int move;             // the packed move itself: source, target, etc.
@@ -34,6 +51,7 @@ public:
     int repetition_index;
 
     int ply;
+    std::array<NnueState, MAX_DEPTH + 1> nnue_stack;
 
     //============= ATTACK AND HASHING TABLES =============//
 

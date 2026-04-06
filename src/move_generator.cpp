@@ -5,6 +5,7 @@
 #include "constants.h"
 #include "bitboard_helpers.h"
 #include "move_helpers.h"
+#include "nnue.h"
 #include "zobrist_hashing.h"
 #include "search.h"
 #include "position.h"
@@ -459,12 +460,21 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
         int double_pawn_move = get_is_double_pawn_move(move);
         int enpassant_move = get_is_move_enpassant(move);
         int castling = get_is_move_castling(move);
+        const int nnue_ply = pos->ply;
+        const bool use_nnue = nnue_loaded();
+
+        if (use_nnue)
+            nnue_copy_parent_to_child(pos, nnue_ply);
 
         // move piece
         pop_bit(pos->piece_bitboards[piece], source);
         set_bit(pos->piece_bitboards[piece], target);
         pos->zobristKey ^= pos->piece_hashkey[piece][source]; // update hash to exclude source
         pos->zobristKey ^= pos->piece_hashkey[piece][target]; // update hash to include target
+        if (use_nnue)
+        {
+            nnue_remove_piece(pos, nnue_ply, piece, source);
+        }
         pos->fifty_move++;
 
         // if pawn moved reset fifty-move rule
@@ -491,6 +501,8 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
                         pos->undo_stack[ply].captured_piece = i;
 
                     pop_bit(pos->piece_bitboards[i], target);
+                    if (use_nnue)
+                        nnue_remove_piece(pos, nnue_ply, i, target);
                     
                     // update hashkey to exclude captured piece
                     pos->zobristKey ^= pos->piece_hashkey[i][target];
@@ -508,16 +520,23 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[P], target);
                 pos->zobristKey ^= pos->piece_hashkey[P][target];
+                if (use_nnue)
+                    nnue_add_piece(pos, nnue_ply, promoted_piece, target);
             }
             else
             {
                 pop_bit(pos->piece_bitboards[p], target);
                 pos->zobristKey ^= pos->piece_hashkey[p][target];
+                if (use_nnue)
+                    nnue_add_piece(pos, nnue_ply, promoted_piece, target);
             }
             
             set_bit(pos->piece_bitboards[promoted_piece], target);
             pos->zobristKey ^= pos->piece_hashkey[promoted_piece][target];
         }
+
+        if (use_nnue && !promoted_piece)
+            nnue_add_piece(pos, nnue_ply, piece, target);
 
         // handle enpassant capture
         if (enpassant_move)
@@ -529,11 +548,15 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[p], target + 8);
                 pos->zobristKey ^= pos->piece_hashkey[p][target + 8];
+                if (use_nnue)
+                    nnue_remove_piece(pos, nnue_ply, p, target + 8);
             }
             else
             {
                 pop_bit(pos->piece_bitboards[P], target - 8);
                 pos->zobristKey ^= pos->piece_hashkey[P][target- 8];
+                if (use_nnue)
+                    nnue_remove_piece(pos, nnue_ply, P, target - 8);
             }
         }
 
@@ -567,6 +590,11 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[R], h1);
                 set_bit(pos->piece_bitboards[R], f1);
+                if (use_nnue)
+                {
+                    nnue_remove_piece(pos, nnue_ply, R, h1);
+                    nnue_add_piece(pos, nnue_ply, R, f1);
+                }
 
                 pos->zobristKey ^= pos->piece_hashkey[R][h1];  // remove rook from h1 from hash key
                 pos->zobristKey ^= pos->piece_hashkey[R][f1];  // put rook on f1 into a hash key
@@ -575,6 +603,11 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[R], a1);
                 set_bit(pos->piece_bitboards[R], d1);
+                if (use_nnue)
+                {
+                    nnue_remove_piece(pos, nnue_ply, R, a1);
+                    nnue_add_piece(pos, nnue_ply, R, d1);
+                }
 
                 pos->zobristKey ^= pos->piece_hashkey[R][a1];  // remove rook from a1 from hash key
                 pos->zobristKey ^= pos->piece_hashkey[R][d1];  // put rook on d1 into a hash key
@@ -583,6 +616,11 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[r], h8);
                 set_bit(pos->piece_bitboards[r], f8);
+                if (use_nnue)
+                {
+                    nnue_remove_piece(pos, nnue_ply, r, h8);
+                    nnue_add_piece(pos, nnue_ply, r, f8);
+                }
 
                 pos->zobristKey ^= pos->piece_hashkey[r][h8];  // remove rook from h8 from hash key
                 pos->zobristKey ^= pos->piece_hashkey[r][f8];  // put rook on f8 into a hash key
@@ -591,6 +629,11 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[r], a8);
                 set_bit(pos->piece_bitboards[r], d8);
+                if (use_nnue)
+                {
+                    nnue_remove_piece(pos, nnue_ply, r, a8);
+                    nnue_add_piece(pos, nnue_ply, r, d8);
+                }
 
                 pos->zobristKey ^= pos->piece_hashkey[r][a8];  // remove rook from a8 from hash key
                 pos->zobristKey ^= pos->piece_hashkey[r][d8];  // put rook on d8 into a hash key
@@ -632,8 +675,11 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
             restoreBoard(pos);
             return 0;
         }
-        else 
+        else
+        {
+            nnue_debug_check(pos);
             return 1;
+        }
     }
     
     else if (move_type == only_captures)
@@ -646,6 +692,21 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
     }
 
     return 0;
+}
+
+int make_root_move(thrawn::Position* pos, int move, int move_type)
+{
+    pos->ply = 1;
+    if (!make_move(pos, move, move_type, pos->ply))
+    {
+        pos->ply = 0;
+        return 0;
+    }
+
+    pos->nnue_stack[0] = pos->nnue_stack[1];
+    pos->ply = 0;
+    nnue_debug_check(pos);
+    return 1;
 }
 
 // void unmake_move(thrawn::Position* pos, int ply)

@@ -561,53 +561,10 @@ int evaluate_HCE(thrawn::Position* pos)
 
 int evaluate(thrawn::Position* pos)
 {   
-    uint64_t bitboard;
-    int square;
-
-    // NNUE
-    // piece codes converted from Thrawn to NNUE
-    int pieces[33];
-    // square indices converted from Thrawn to NNUE
-    int squares[33];
-    int index = 2;
-    
-    for (int piece = P; piece <= k; piece++)
-    {
-        bitboard = pos->piece_bitboards[piece];
-        
-        while (bitboard)
-        {            
-            square = get_lsb_index(bitboard);
-
-            // parsing white king piece code to stockfish piece code
-            if (piece == K)
-            {
-                pieces[0] = nnue_pieces[piece];
-                squares[0] = nnue_squares[square];
-            }
-            
-            else if (piece == k)
-            {
-                pieces[1] = nnue_pieces[piece];
-                squares[1] = nnue_squares[square];
-            }
-            
-            else
-            {
-                pieces[index] = nnue_pieces[piece];
-                squares[index] = nnue_squares[square];
-                index++;    
-            }
-
-            pop_bit(bitboard, square);
-        }
-    }
-    
-    // end arrays with terminating zero
-    pieces[index] = 0;
-    squares[index] = 0;
+    if (!nnue_loaded() || !pos->nnue_stack[pos->ply].valid)
+        return evaluate_HCE(pos);
 
     // (100-fifty_move) / 100 
     // taken from Cfish for fifty move scaling
-    return nnue_evaluate(pos->colour_to_move, pieces, squares) * (100-pos->fifty_move) / 100;
+    return nnue_evaluate(pos) * (100-pos->fifty_move) / 100;
 }

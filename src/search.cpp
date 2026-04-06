@@ -5,6 +5,7 @@
 #include "zobrist_hashing.h"
 #include "transposition_table.h"
 #include "bitboard.h"
+#include "nnue.h"
 #include "uci.h" // for 'stopped' and 'communicate()'
 #include "globals.h"
 #include "constants.h"
@@ -160,6 +161,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         copyBoard(pos);
 
         pos->ply++;
+        nnue_copy_parent_to_child(pos, pos->ply);
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
@@ -171,6 +173,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         // Switch side
         pos->colour_to_move ^= 1;
         pos->zobristKey ^= pos->colour_to_move_hashkey;
+        nnue_debug_check(pos);
 
         // Null-move search with reduced depth
         int reduction = 2;

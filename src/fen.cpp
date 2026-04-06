@@ -2,6 +2,7 @@
 #include "bitboard.h"
 #include "bitboard_helpers.h"
 #include "constants.h"
+#include "nnue.h"
 #include "zobrist_hashing.h"
 #include "search.h"
 #include "position.h"
@@ -27,6 +28,7 @@ void parse_fen(thrawn::Position* pos, const char* fen)
     pos->castle_rights = 0;
     pos->repetition_index = 0;
     pos->fifty_move = 0;
+    pos->ply = 0;
     std::fill(std::begin(pos->repetition_table), std::end(pos->repetition_table), 0);
     
 
@@ -106,10 +108,8 @@ void parse_fen(thrawn::Position* pos, const char* fen)
     if (*fen != '-')
     {
         int col = *fen - 'a';
-        cout<<"fen1: "<<*fen-'a'<<endl;
         // to get to row
         *fen++;
-        cout<<"fen2: "<<*fen<<endl;
         int row = 8- (*fen -'0');
 
         pos->enpassant = row*8+col;
@@ -125,4 +125,5 @@ void parse_fen(thrawn::Position* pos, const char* fen)
     
     // init hashkeys
     pos->zobristKey = gen_hashkey(pos);
+    nnue_refresh_root(pos);
 }
