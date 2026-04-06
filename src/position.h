@@ -8,12 +8,20 @@
 
 namespace thrawn {
 
-constexpr int NNUE_FT_SIZE = 256;
+// Latest trainer export: a768_dual_v1, version 3.
+constexpr int NNUE_INPUT_FEATURES = 768;
+constexpr int NNUE_ACCUMULATOR_SIZE = 768;
+constexpr int NNUE_HIDDEN_SIZE = 128;
+constexpr int NNUE_OUTPUT_BUCKETS = 8;
+constexpr int NNUE_FT_SIZE = NNUE_ACCUMULATOR_SIZE;
 constexpr int NNUE_MAX_PIECES = 32;
+constexpr int NNUE_SIMD_ALIGNMENT = 64;
+
+static_assert(NNUE_ACCUMULATOR_SIZE % 8 == 0, "NNUE accumulator must fit NEON lanes");
 
 struct NnueState {
-    alignas(64) std::array<int16_t, NNUE_FT_SIZE> white_acc{};
-    alignas(64) std::array<int16_t, NNUE_FT_SIZE> black_acc{};
+    alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> white_acc{};
+    alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> black_acc{};
     std::array<uint8_t, NNUE_MAX_PIECES> piece_list{};
     std::array<uint8_t, NNUE_MAX_PIECES> square_list{};
     std::array<int8_t, BOARD_SIZE> index_by_square{};

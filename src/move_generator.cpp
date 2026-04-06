@@ -460,7 +460,7 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
         int double_pawn_move = get_is_double_pawn_move(move);
         int enpassant_move = get_is_move_enpassant(move);
         int castling = get_is_move_castling(move);
-        const int nnue_ply = pos->ply;
+        const int nnue_ply = (ply >= 0) ? ply : pos->ply;
         const bool use_nnue = nnue_loaded();
 
         if (use_nnue)
@@ -541,9 +541,6 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
         // handle enpassant capture
         if (enpassant_move)
         {
-            // target + 8 is going down the board, and vice versa
-            (pos->colour_to_move==white) ? pop_bit(pos->piece_bitboards[p], target + 8) : pop_bit(pos->piece_bitboards[P], target - 8);
-            
             if (pos->colour_to_move==white)
             {
                 pop_bit(pos->piece_bitboards[p], target + 8);

@@ -29,23 +29,24 @@
 namespace {
 
 constexpr char kExpectedMagic[8] = {'T', 'H', 'N', 'N', 'U', 'E', '\0', '\1'};
-constexpr uint32_t kCurrentVersion = 2;
-constexpr uint32_t kLegacyVersion = 1;
-constexpr uint32_t kExpectedNumFeatures = 768;
-constexpr uint32_t kExpectedFtSize = thrawn::NNUE_FT_SIZE;
-constexpr uint32_t kExpectedHiddenSize = 32;
+constexpr uint32_t kCurrentVersion = 3;
+constexpr uint32_t kExpectedNumFeatures = thrawn::NNUE_INPUT_FEATURES;
+constexpr uint32_t kExpectedFtSize = thrawn::NNUE_ACCUMULATOR_SIZE;
+constexpr uint32_t kExpectedHiddenSize = thrawn::NNUE_HIDDEN_SIZE;
+constexpr uint32_t kExpectedOutputBuckets = thrawn::NNUE_OUTPUT_BUCKETS;
 constexpr uint32_t kExpectedOutputPerspective = 1;
 constexpr const char* kExpectedFeatureSet = "a768_dual_v1";
 
 struct LoadedNetwork {
     uint32_t version = 0;
+    uint32_t output_buckets = 0;
     float inv_ft_scale = 0.0f;
     std::array<int16_t, kExpectedFtSize> ft_bias{};
     std::vector<int16_t> ft_weight;
     std::array<float, kExpectedHiddenSize> l1_bias{};
     std::array<float, kExpectedFtSize * 2 * kExpectedHiddenSize> l1_weight{};
-    float out_bias = 0.0f;
-    std::array<float, kExpectedHiddenSize> out_weight{};
+    std::array<float, kExpectedOutputBuckets> out_bias{};
+    std::array<float, kExpectedHiddenSize * kExpectedOutputBuckets> out_weight{};
     std::string loaded_path;
 };
 
@@ -155,18 +156,25 @@ bool is_white_piece(int piece) {
     return piece >= P && piece <= K;
 }
 
+int relative_color_bit(int piece, bool white_perspective) {
+    return white_perspective
+        ? (is_white_piece(piece) ? 0 : 1)
+        : (is_white_piece(piece) ? 1 : 0);
+}
+
+int oriented_square(int engine_square, bool white_perspective) {
+    const int white_square = engine_to_model_square(engine_square);
+    return white_perspective ? white_square : flip_vertical(white_square);
+}
+
 int feature_index(int piece, int engine_square, bool white_perspective) {
     const int piece_index = piece_type_index(piece);
-    if (piece_index < 0) {
+    if (piece_index < 0 || engine_square < 0 || engine_square >= BOARD_SIZE) {
         return -1;
     }
 
-    const int model_square = engine_to_model_square(engine_square);
-    const int relative_color_bit = white_perspective
-        ? (is_white_piece(piece) ? 0 : 1)
-        : (is_white_piece(piece) ? 1 : 0);
-    const int oriented_square = white_perspective ? model_square : flip_vertical(model_square);
-    return (piece_index * 2 + relative_color_bit) * 64 + oriented_square;
+    return (piece_index * 2 + relative_color_bit(piece, white_perspective)) * 64 +
+           oriented_square(engine_square, white_perspective);
 }
 
 const LoadedNetwork* current_network() {
@@ -208,108 +216,110 @@ int finalize_evaluation(float output) {
     return static_cast<int>(std::lround(output));
 }
 
-void add_accumulator_row_scalar(std::array<int16_t, kExpectedFtSize>& accumulator,
-                                const std::vector<int16_t>& weights,
-                                int feature) {
-    const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        accumulator[i] = static_cast<int16_t>(accumulator[i] + weights[offset + i]);
-    }
+int output_bucket_index(int piece_count) {
+    constexpr int kMinPieceCount = 2;
+    constexpr int kMaxPieceCount = 32;
+    constexpr int kPhaseSpan = kMaxPieceCount - kMinPieceCount + 1;
+
+    const int clamped_piece_count = std::min(kMaxPieceCount, std::max(kMinPieceCount, piece_count));
+    const int phase_progress = kMaxPieceCount - clamped_piece_count;
+    return std::min(
+        static_cast<int>(kExpectedOutputBuckets) - 1,
+        (phase_progress * static_cast<int>(kExpectedOutputBuckets)) / kPhaseSpan
+    );
 }
 
-void subtract_accumulator_row_scalar(std::array<int16_t, kExpectedFtSize>& accumulator,
-                                     const std::vector<int16_t>& weights,
-                                     int feature) {
-    const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        accumulator[i] = static_cast<int16_t>(accumulator[i] - weights[offset + i]);
-    }
-}
+enum class AccumulatorUpdateOp { Add, Subtract };
 
 #if defined(USE_AVX2)
-void add_accumulator_row_avx2(std::array<int16_t, kExpectedFtSize>& accumulator,
-                              const std::vector<int16_t>& weights,
-                              int feature) {
-    const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
-    const int16_t* row = weights.data() + offset;
-    int16_t* acc = accumulator.data();
+using AccumulatorVec = __m256i;
+constexpr int kAccumulatorSimdWidth = 16;
+static_assert(kExpectedFtSize % kAccumulatorSimdWidth == 0, "AVX2 accumulator width mismatch");
 
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
-        const __m256i acc_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
-        const __m256i row_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + i));
-        const __m256i sum_vec = _mm256_add_epi16(acc_vec, row_vec);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), sum_vec);
-    }
+inline AccumulatorVec accumulator_load(const int16_t* data) {
+    return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
 }
 
-void subtract_accumulator_row_avx2(std::array<int16_t, kExpectedFtSize>& accumulator,
-                                   const std::vector<int16_t>& weights,
-                                   int feature) {
-    const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
-    const int16_t* row = weights.data() + offset;
-    int16_t* acc = accumulator.data();
-
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
-        const __m256i acc_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
-        const __m256i row_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + i));
-        const __m256i diff_vec = _mm256_sub_epi16(acc_vec, row_vec);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), diff_vec);
-    }
-}
-#endif
-
-#if defined(USE_NEON)
-void add_accumulator_row_neon(std::array<int16_t, kExpectedFtSize>& accumulator,
-                              const std::vector<int16_t>& weights,
-                              int feature) {
-    const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
-    const int16_t* row = weights.data() + offset;
-    int16_t* acc = accumulator.data();
-
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
-        const int16x8_t acc_vec = vld1q_s16(acc + i);
-        const int16x8_t row_vec = vld1q_s16(row + i);
-        vst1q_s16(acc + i, vaddq_s16(acc_vec, row_vec));
-    }
+inline void accumulator_store(int16_t* data, AccumulatorVec value) {
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(data), value);
 }
 
-void subtract_accumulator_row_neon(std::array<int16_t, kExpectedFtSize>& accumulator,
-                                   const std::vector<int16_t>& weights,
-                                   int feature) {
-    const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
-    const int16_t* row = weights.data() + offset;
-    int16_t* acc = accumulator.data();
+inline AccumulatorVec accumulator_add(AccumulatorVec lhs, AccumulatorVec rhs) {
+    return _mm256_add_epi16(lhs, rhs);
+}
 
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
-        const int16x8_t acc_vec = vld1q_s16(acc + i);
-        const int16x8_t row_vec = vld1q_s16(row + i);
-        vst1q_s16(acc + i, vsubq_s16(acc_vec, row_vec));
-    }
+inline AccumulatorVec accumulator_subtract(AccumulatorVec lhs, AccumulatorVec rhs) {
+    return _mm256_sub_epi16(lhs, rhs);
+}
+#elif defined(USE_NEON)
+using AccumulatorVec = int16x8_t;
+constexpr int kAccumulatorSimdWidth = 8;
+static_assert(kExpectedFtSize % kAccumulatorSimdWidth == 0, "NEON accumulator width mismatch");
+
+inline AccumulatorVec accumulator_load(const int16_t* data) {
+    return vld1q_s16(data);
+}
+
+inline void accumulator_store(int16_t* data, AccumulatorVec value) {
+    vst1q_s16(data, value);
+}
+
+inline AccumulatorVec accumulator_add(AccumulatorVec lhs, AccumulatorVec rhs) {
+    return vaddq_s16(lhs, rhs);
+}
+
+inline AccumulatorVec accumulator_subtract(AccumulatorVec lhs, AccumulatorVec rhs) {
+    return vsubq_s16(lhs, rhs);
 }
 #endif
 
-void add_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
+bool update_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
+                            const std::vector<int16_t>& weights,
+                            int feature,
+                            AccumulatorUpdateOp op) {
+    if (feature < 0) {
+        return false;
+    }
+
+    const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
+    if (offset + kExpectedFtSize > weights.size()) {
+        return false;
+    }
+
+    const int16_t* row = weights.data() + offset;
+    int16_t* acc = accumulator.data();
+
+#if defined(USE_AVX2) || defined(USE_NEON)
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += kAccumulatorSimdWidth) {
+        const AccumulatorVec acc_vec = accumulator_load(acc + i);
+        const AccumulatorVec row_vec = accumulator_load(row + i);
+        const AccumulatorVec out_vec = (op == AccumulatorUpdateOp::Add)
+            ? accumulator_add(acc_vec, row_vec)
+            : accumulator_subtract(acc_vec, row_vec);
+        accumulator_store(acc + i, out_vec);
+    }
+#else
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
+        const int updated = (op == AccumulatorUpdateOp::Add)
+            ? (accumulator[i] + row[i])
+            : (accumulator[i] - row[i]);
+        accumulator[i] = static_cast<int16_t>(updated);
+    }
+#endif
+
+    return true;
+}
+
+bool add_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
                          const std::vector<int16_t>& weights,
                          int feature) {
-#if defined(USE_AVX2)
-    add_accumulator_row_avx2(accumulator, weights, feature);
-#elif defined(USE_NEON)
-    add_accumulator_row_neon(accumulator, weights, feature);
-#else
-    add_accumulator_row_scalar(accumulator, weights, feature);
-#endif
+    return update_accumulator_row(accumulator, weights, feature, AccumulatorUpdateOp::Add);
 }
 
-void subtract_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
+bool subtract_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
                               const std::vector<int16_t>& weights,
                               int feature) {
-#if defined(USE_AVX2)
-    subtract_accumulator_row_avx2(accumulator, weights, feature);
-#elif defined(USE_NEON)
-    subtract_accumulator_row_neon(accumulator, weights, feature);
-#else
-    subtract_accumulator_row_scalar(accumulator, weights, feature);
-#endif
+    return update_accumulator_row(accumulator, weights, feature, AccumulatorUpdateOp::Subtract);
 }
 
 void accumulate_hidden_row_scalar(std::array<float, kExpectedHiddenSize>& hidden,
@@ -367,79 +377,13 @@ void accumulate_hidden_row(std::array<float, kExpectedHiddenSize>& hidden,
 }
 
 float output_sum_scalar(const std::array<float, kExpectedHiddenSize>& hidden,
-                        const std::array<float, kExpectedHiddenSize>& out_weight,
-                        float out_bias) {
-    float output = out_bias;
+                        const LoadedNetwork& network,
+                        int bucket) {
+    float output = network.out_bias[bucket];
     for (int j = 0; j < static_cast<int>(kExpectedHiddenSize); ++j) {
-        output += clip_unit(hidden[j]) * out_weight[j];
+        output += clip_unit(hidden[j]) * network.out_weight[j * kExpectedOutputBuckets + bucket];
     }
     return output;
-}
-
-#if defined(USE_AVX2)
-float output_sum_avx2(const std::array<float, kExpectedHiddenSize>& hidden,
-                      const std::array<float, kExpectedHiddenSize>& out_weight,
-                      float out_bias) {
-    alignas(32) float clipped[8];
-    alignas(32) float products[8];
-    float output = out_bias;
-
-    for (int j = 0; j < static_cast<int>(kExpectedHiddenSize); j += 8) {
-        for (int lane = 0; lane < 8; ++lane) {
-            clipped[lane] = clip_unit(hidden[j + lane]);
-        }
-
-        const __m256 hidden_vec = _mm256_loadu_ps(clipped);
-        const __m256 weight_vec = _mm256_loadu_ps(out_weight.data() + j);
-        const __m256 product_vec = _mm256_mul_ps(hidden_vec, weight_vec);
-        _mm256_storeu_ps(products, product_vec);
-
-        for (int lane = 0; lane < 8; ++lane) {
-            output += products[lane];
-        }
-    }
-
-    return output;
-}
-#endif
-
-#if defined(USE_NEON)
-float output_sum_neon(const std::array<float, kExpectedHiddenSize>& hidden,
-                      const std::array<float, kExpectedHiddenSize>& out_weight,
-                      float out_bias) {
-    alignas(16) float clipped[4];
-    alignas(16) float products[4];
-    float output = out_bias;
-
-    for (int j = 0; j < static_cast<int>(kExpectedHiddenSize); j += 4) {
-        for (int lane = 0; lane < 4; ++lane) {
-            clipped[lane] = clip_unit(hidden[j + lane]);
-        }
-
-        const float32x4_t hidden_vec = vld1q_f32(clipped);
-        const float32x4_t weight_vec = vld1q_f32(out_weight.data() + j);
-        const float32x4_t product_vec = vmulq_f32(hidden_vec, weight_vec);
-        vst1q_f32(products, product_vec);
-
-        for (int lane = 0; lane < 4; ++lane) {
-            output += products[lane];
-        }
-    }
-
-    return output;
-}
-#endif
-
-float output_sum(const std::array<float, kExpectedHiddenSize>& hidden,
-                 const std::array<float, kExpectedHiddenSize>& out_weight,
-                 float out_bias) {
-#if defined(USE_AVX2)
-    return output_sum_avx2(hidden, out_weight, out_bias);
-#elif defined(USE_NEON)
-    return output_sum_neon(hidden, out_weight, out_bias);
-#else
-    return output_sum_scalar(hidden, out_weight, out_bias);
-#endif
 }
 
 bool add_piece_to_state(thrawn::NnueState& state, const LoadedNetwork& network, int piece, int square) {
@@ -451,8 +395,12 @@ bool add_piece_to_state(thrawn::NnueState& state, const LoadedNetwork& network, 
         return false;
     }
 
-    add_accumulator_row(state.white_acc, network.ft_weight, feature_index(piece, square, true));
-    add_accumulator_row(state.black_acc, network.ft_weight, feature_index(piece, square, false));
+    const int white_feature = feature_index(piece, square, true);
+    const int black_feature = feature_index(piece, square, false);
+    if (!add_accumulator_row(state.white_acc, network.ft_weight, white_feature) ||
+        !add_accumulator_row(state.black_acc, network.ft_weight, black_feature)) {
+        return false;
+    }
 
     const int index = state.piece_count;
     state.piece_list[index] = static_cast<uint8_t>(piece);
@@ -472,8 +420,12 @@ bool remove_piece_from_state(thrawn::NnueState& state, const LoadedNetwork& netw
         return false;
     }
 
-    subtract_accumulator_row(state.white_acc, network.ft_weight, feature_index(piece, square, true));
-    subtract_accumulator_row(state.black_acc, network.ft_weight, feature_index(piece, square, false));
+    const int white_feature = feature_index(piece, square, true);
+    const int black_feature = feature_index(piece, square, false);
+    if (!subtract_accumulator_row(state.white_acc, network.ft_weight, white_feature) ||
+        !subtract_accumulator_row(state.black_acc, network.ft_weight, black_feature)) {
+        return false;
+    }
 
     const int last_index = state.piece_count - 1;
     state.index_by_square[square] = -1;
@@ -515,6 +467,7 @@ bool build_state_from_board(const thrawn::Position* pos, const LoadedNetwork& ne
 
 int evaluate_state_scalar(const thrawn::NnueState& state, const LoadedNetwork& network, int colour_to_move) {
     std::array<float, kExpectedHiddenSize> hidden = network.l1_bias;
+    const int bucket = output_bucket_index(state.piece_count);
 
     const auto& stm_acc = (colour_to_move == white) ? state.white_acc : state.black_acc;
     const auto& nstm_acc = (colour_to_move == white) ? state.black_acc : state.white_acc;
@@ -539,11 +492,12 @@ int evaluate_state_scalar(const thrawn::NnueState& state, const LoadedNetwork& n
         accumulate_hidden_row_scalar(hidden, network.l1_weight.data() + row, value);
     }
 
-    return finalize_evaluation(output_sum_scalar(hidden, network.out_weight, network.out_bias));
+    return finalize_evaluation(output_sum_scalar(hidden, network, bucket));
 }
 
 int evaluate_state_simd(const thrawn::NnueState& state, const LoadedNetwork& network, int colour_to_move) {
     std::array<float, kExpectedHiddenSize> hidden = network.l1_bias;
+    const int bucket = output_bucket_index(state.piece_count);
 
     const auto& stm_acc = (colour_to_move == white) ? state.white_acc : state.black_acc;
     const auto& nstm_acc = (colour_to_move == white) ? state.black_acc : state.white_acc;
@@ -568,7 +522,7 @@ int evaluate_state_simd(const thrawn::NnueState& state, const LoadedNetwork& net
         accumulate_hidden_row(hidden, network.l1_weight.data() + row, value);
     }
 
-    return finalize_evaluation(output_sum(hidden, network.out_weight, network.out_bias));
+    return finalize_evaluation(output_sum_scalar(hidden, network, bucket));
 }
 
 int evaluate_state(const thrawn::NnueState& state, const LoadedNetwork& network, int colour_to_move) {
@@ -601,6 +555,7 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
     uint32_t num_features = 0;
     uint32_t ft_size = 0;
     uint32_t hidden_size = 0;
+    uint32_t output_buckets = 0;
     uint32_t output_perspective = 0;
     float ft_scale = 0.0f;
     float dense_scale = 0.0f;
@@ -617,6 +572,7 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
         !read_scalar(stream, num_features) ||
         !read_scalar(stream, ft_size) ||
         !read_scalar(stream, hidden_size) ||
+        !read_scalar(stream, output_buckets) ||
         !read_scalar(stream, output_perspective) ||
         !read_scalar(stream, ft_scale) ||
         !read_scalar(stream, dense_scale) ||
@@ -626,7 +582,7 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
         return false;
     }
 
-    if (version != kCurrentVersion && version != kLegacyVersion) {
+    if (version != kCurrentVersion) {
         error = "unsupported version";
         return false;
     }
@@ -640,6 +596,10 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
     }
     if (ft_size != kExpectedFtSize || hidden_size != kExpectedHiddenSize) {
         error = "unexpected network dimensions";
+        return false;
+    }
+    if (output_buckets != kExpectedOutputBuckets) {
+        error = "unexpected output bucket count";
         return false;
     }
     if (output_perspective != kExpectedOutputPerspective) {
@@ -664,19 +624,18 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
     std::vector<int16_t> ft_weight_q;
     std::vector<int32_t> l1_bias_q;
     std::vector<int8_t> l1_weight_q;
-    int32_t out_bias_q = 0;
 
     if (!read_vector(stream, ft_bias_q, kExpectedFtSize) ||
         !read_vector(stream, ft_weight_q, static_cast<std::size_t>(kExpectedNumFeatures) * kExpectedFtSize) ||
         !read_vector(stream, l1_bias_q, kExpectedHiddenSize) ||
-        !read_vector(stream, l1_weight_q, static_cast<std::size_t>(kExpectedFtSize) * 2 * kExpectedHiddenSize) ||
-        !read_scalar(stream, out_bias_q)) {
+        !read_vector(stream, l1_weight_q, static_cast<std::size_t>(kExpectedFtSize) * 2 * kExpectedHiddenSize)) {
         error = "failed while reading tensors";
         return false;
     }
 
     network = LoadedNetwork{};
     network.version = version;
+    network.output_buckets = output_buckets;
     network.inv_ft_scale = 1.0f / ft_scale;
     std::copy(ft_bias_q.begin(), ft_bias_q.end(), network.ft_bias.begin());
     network.ft_weight = std::move(ft_weight_q);
@@ -688,26 +647,19 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
         network.l1_weight[i] = static_cast<float>(l1_weight_q[i]) / dense_scale;
     }
 
-    network.out_bias = static_cast<float>(out_bias_q) / dense_scale;
+    std::vector<int32_t> out_bias_q;
+    std::vector<int16_t> out_weight_q;
+    if (!read_vector(stream, out_bias_q, kExpectedOutputBuckets) ||
+        !read_vector(stream, out_weight_q, static_cast<std::size_t>(kExpectedHiddenSize) * kExpectedOutputBuckets)) {
+        error = "failed while reading output layer";
+        return false;
+    }
 
-    if (version == kLegacyVersion) {
-        std::vector<int8_t> out_weight_q;
-        if (!read_vector(stream, out_weight_q, kExpectedHiddenSize)) {
-            error = "failed while reading output weights";
-            return false;
-        }
-        for (int i = 0; i < static_cast<int>(kExpectedHiddenSize); ++i) {
-            network.out_weight[i] = static_cast<float>(out_weight_q[i]) / dense_scale;
-        }
-    } else {
-        std::vector<int16_t> out_weight_q;
-        if (!read_vector(stream, out_weight_q, kExpectedHiddenSize)) {
-            error = "failed while reading output weights";
-            return false;
-        }
-        for (int i = 0; i < static_cast<int>(kExpectedHiddenSize); ++i) {
-            network.out_weight[i] = static_cast<float>(out_weight_q[i]) / dense_scale;
-        }
+    for (int i = 0; i < static_cast<int>(kExpectedOutputBuckets); ++i) {
+        network.out_bias[i] = static_cast<float>(out_bias_q[i]) / dense_scale;
+    }
+    for (std::size_t i = 0; i < network.out_weight.size(); ++i) {
+        network.out_weight[i] = static_cast<float>(out_weight_q[i]) / dense_scale;
     }
 
     if (!stream) {
@@ -742,7 +694,9 @@ void nnue_init(const char* evalFile) {
         LoadedNetwork loaded;
         std::string error;
         if (!load_network_from_file(candidate, loaded, error)) {
-            last_error = candidate + ": " + error;
+            if (last_error.empty() || error != "could not open file") {
+                last_error = candidate + ": " + error;
+            }
             continue;
         }
 
