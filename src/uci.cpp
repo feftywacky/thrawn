@@ -82,6 +82,24 @@ static std::string trim_option_value(const char* value) {
     return text.substr(start, end - start);
 }
 
+static void uci_report_raw_nnue(const char* command) {
+    if (!nnue_loaded()) {
+        std::cout << "info string NNUE not loaded\n";
+        return;
+    }
+
+    const std::string fen = trim_option_value(command + 7);
+    if (fen.empty()) {
+        std::cout << "info string usage: nnuefen <fen>\n";
+        return;
+    }
+
+    thrawn::Position scratch;
+    parse_fen(&scratch, fen.c_str());
+
+    std::cout << "info string raw nnue score " << nnue_evaluate(&scratch) << "\n";
+}
+
 /*
 TIME CONTROL
 */
@@ -472,6 +490,11 @@ void uci_loop(thrawn::Position* pos)
             }
             nnue_init(path.c_str());
             nnue_refresh_root(pos);
+        }
+
+        else if (strncmp(input, "nnuefen", 7) == 0)
+        {
+            uci_report_raw_nnue(input);
         }
 
         else if (strncmp(input, "perft", 5) == 0)

@@ -201,6 +201,11 @@ float clip_unit(float value) {
     return value;
 }
 
+float clipped_screlu(float value) {
+    const float clipped = clip_unit(value);
+    return clipped * clipped;
+}
+
 int finalize_evaluation(float output) {
     if (!std::isfinite(output)) {
         return 0;
@@ -473,7 +478,7 @@ int evaluate_state_scalar(const thrawn::NnueState& state, const LoadedNetwork& n
     const auto& nstm_acc = (colour_to_move == white) ? state.black_acc : state.white_acc;
 
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const float value = clip_unit(static_cast<float>(stm_acc[i]) * network.inv_ft_scale);
+        const float value = clipped_screlu(static_cast<float>(stm_acc[i]) * network.inv_ft_scale);
         if (value == 0.0f) {
             continue;
         }
@@ -483,7 +488,7 @@ int evaluate_state_scalar(const thrawn::NnueState& state, const LoadedNetwork& n
     }
 
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const float value = clip_unit(static_cast<float>(nstm_acc[i]) * network.inv_ft_scale);
+        const float value = clipped_screlu(static_cast<float>(nstm_acc[i]) * network.inv_ft_scale);
         if (value == 0.0f) {
             continue;
         }
@@ -503,7 +508,7 @@ int evaluate_state_simd(const thrawn::NnueState& state, const LoadedNetwork& net
     const auto& nstm_acc = (colour_to_move == white) ? state.black_acc : state.white_acc;
 
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const float value = clip_unit(static_cast<float>(stm_acc[i]) * network.inv_ft_scale);
+        const float value = clipped_screlu(static_cast<float>(stm_acc[i]) * network.inv_ft_scale);
         if (value == 0.0f) {
             continue;
         }
@@ -513,7 +518,7 @@ int evaluate_state_simd(const thrawn::NnueState& state, const LoadedNetwork& net
     }
 
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const float value = clip_unit(static_cast<float>(nstm_acc[i]) * network.inv_ft_scale);
+        const float value = clipped_screlu(static_cast<float>(nstm_acc[i]) * network.inv_ft_scale);
         if (value == 0.0f) {
             continue;
         }
