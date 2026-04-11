@@ -10,8 +10,8 @@ namespace thrawn {
 
 // Latest trainer export: a768_dual_v1, version 3.
 constexpr int NNUE_INPUT_FEATURES = 768;
-constexpr int NNUE_ACCUMULATOR_SIZE = 768;
-constexpr int NNUE_HIDDEN_SIZE = 128;
+constexpr int NNUE_ACCUMULATOR_SIZE = 256;
+constexpr int NNUE_HIDDEN_SIZE = 32;
 constexpr int NNUE_OUTPUT_BUCKETS = 8;
 constexpr int NNUE_FT_SIZE = NNUE_ACCUMULATOR_SIZE;
 constexpr int NNUE_MAX_PIECES = 32;

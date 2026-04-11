@@ -2,7 +2,9 @@
 # Compiler and base flags
 ###############################################################################
 CXX      := g++
-CXXFLAGS := -std=c++17 
+CXXFLAGS := -std=c++17
+CPPFLAGS :=
+LDFLAGS  :=
 
 ###############################################################################
 # Determine OS and set OS-specific variables
@@ -41,39 +43,43 @@ BUILD ?= release
 
 OPT_FLAGS  := -O3 -flto -march=native
 ARCH_FLAGS :=
+MACOS_MIN_VERSION := 10.15
 
 ifeq ($(OS_NAME),Linux)
     ARCH_DETECTED := $(shell uname -m)
     ifeq ($(ARCH_DETECTED),x86_64)
-        ARCH_FLAGS += -mavx2 -msse4.1 -msse3 -msse2 -mmmx -msse \
-                      -DUSE_AVX2 -DUSE_SSE41 -DUSE_SSE3 -DUSE_SSE2 -DUSE_SSE
+        CPPFLAGS += -DUSE_AVX2
+        ARCH_FLAGS += -mavx2
     else ifeq ($(ARCH_DETECTED),aarch64)
-        ARCH_FLAGS += -DARM64 -DUSE_NEON -DUSE_NEON_DOTPROD -flax-vector-conversions
+        CPPFLAGS += -DUSE_NEON
     endif
 else ifeq ($(OS_NAME),macOS)
-    ARCH_FLAGS += -mmacosx-version-min=10.15
     ARCH_DETECTED := $(shell uname -m)
     ifeq ($(ARCH_DETECTED),arm64)
-        ARCH_FLAGS += -DARM64 -DUSE_NEON -DUSE_NEON_DOTPROD -flax-vector-conversions
+        MACOS_MIN_VERSION := 11.0
+        CPPFLAGS += -DUSE_NEON
     else
-        ARCH_FLAGS += -mavx2 -msse4.1 -msse3 -msse2 -mmmx -msse \
-                      -DUSE_AVX2 -DUSE_SSE41 -DUSE_SSE3 -DUSE_SSE2 -DUSE_SSE
+        CPPFLAGS += -DUSE_AVX2
+        ARCH_FLAGS += -mavx2
     endif
+    ARCH_FLAGS += -mmacosx-version-min=$(MACOS_MIN_VERSION)
 else ifeq ($(OS_NAME),Windows)
     ARCH_DETECTED := $(PROCESSOR_ARCHITECTURE)
-    ARCH_FLAGS    += -DWIN32
+    CPPFLAGS += -DWIN32
     ifeq ($(ARCH_DETECTED),AMD64)
-        ARCH_FLAGS += -mavx2 -msse4.1 -msse3 -msse2 -mmmx -msse \
-                      -DUSE_AVX2 -DUSE_SSE41 -DUSE_SSE3 -DUSE_SSE2 -DUSE_SSE
+        CPPFLAGS += -DUSE_AVX2
+        ARCH_FLAGS += -mavx2
     else ifeq ($(ARCH_DETECTED),ARM64)
-        ARCH_FLAGS += -DARM64 -DUSE_NEON -DUSE_NEON_DOTPROD -flax-vector-conversions
+        CPPFLAGS += -DUSE_NEON
     endif
 endif
 
 ifeq ($(BUILD),debug)
-    CXXFLAGS += -g $(ARCH_FLAGS) -DDEBUG_BUILD -DDLL_EXPORT
+    CPPFLAGS += -DDEBUG_BUILD
+    CXXFLAGS += -g $(ARCH_FLAGS)
 else ifeq ($(BUILD),release)
-    CXXFLAGS += $(OPT_FLAGS) $(ARCH_FLAGS) -DRELEASE_BUILD -DDLL_EXPORT
+    CPPFLAGS += -DRELEASE_BUILD
+    CXXFLAGS += $(OPT_FLAGS) $(ARCH_FLAGS)
 endif
 
 ###############################################################################
@@ -91,10 +97,10 @@ debug:
 	$(MAKE) BUILD=debug clean $(EXE)
 
 $(EXE): $(OBJECTS)
-	$(CXX) $(CXXFLAGS) $(STACK_FLAG) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $(STACK_FLAG) -o $@ $^
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
 
 clean:
 	$(RM) $(OBJECTS) $(EXE)

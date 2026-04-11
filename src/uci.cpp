@@ -7,6 +7,7 @@
 #include "fen.h"
 #include "perft.h"
 #include "search.h"
+#include "evaluation.h"
 #include "misc.h"
 #include "globals.h"
 #include "nnue.h"
@@ -97,7 +98,149 @@ static void uci_report_raw_nnue(const char* command) {
     thrawn::Position scratch;
     parse_fen(&scratch, fen.c_str());
 
-    std::cout << "info string raw nnue score " << nnue_evaluate(&scratch) << "\n";
+    std::cout << "info string raw nnue score " << nnue_evaluate_raw(&scratch) << "\n";
+}
+
+static void uci_report_engine_nnue(const char* command) {
+    if (!nnue_loaded()) {
+        std::cout << "info string NNUE not loaded\n";
+        return;
+    }
+
+    const std::string fen = trim_option_value(command + 13);
+    if (fen.empty()) {
+        std::cout << "info string usage: nnuefenengine <fen>\n";
+        return;
+    }
+
+    thrawn::Position scratch;
+    parse_fen(&scratch, fen.c_str());
+
+    std::cout << "info string engine nnue score " << evaluate(&scratch) << "\n";
+}
+
+static std::string uci_move_to_string(int move) {
+    std::string text;
+    text += square_to_coordinates[get_move_source(move)];
+    text += square_to_coordinates[get_move_target(move)];
+
+    const int promoted_piece = get_promoted_piece(move);
+    if (promoted_piece != 0) {
+        text += static_cast<char>(std::tolower(ascii_pieces[promoted_piece]));
+    }
+    return text;
+}
+
+static bool uci_nnue_verify_recursive(thrawn::Position* pos,
+                                      int depth,
+                                      int max_nodes,
+                                      int& visited_nodes,
+                                      std::string& error) {
+    if (!nnue_verify_position(pos, &error)) {
+        return false;
+    }
+
+    if (depth <= 0 || visited_nodes >= max_nodes || pos->ply >= MAX_DEPTH - 1) {
+        return true;
+    }
+
+    ++visited_nodes;
+
+    const bool in_check = is_square_under_attack(
+        pos,
+        (pos->colour_to_move == white)
+            ? get_lsb_index(pos->piece_bitboards[K])
+            : get_lsb_index(pos->piece_bitboards[k]),
+        pos->colour_to_move ^ 1
+    );
+
+    if (!in_check && !noMajorsOrMinorsPieces(pos)) {
+        copyBoard(pos);
+
+        pos->ply++;
+        nnue_copy_parent_to_child(pos, pos->ply);
+        pos->repetition_index++;
+        pos->repetition_table[pos->repetition_index] = pos->zobristKey;
+
+        if (pos->enpassant != null_sq) {
+            pos->zobristKey ^= pos->enpassant_hashkey[pos->enpassant];
+        }
+        pos->enpassant = null_sq;
+
+        pos->colour_to_move ^= 1;
+        pos->zobristKey ^= pos->colour_to_move_hashkey;
+
+        if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, error)) {
+            error = "after null move: " + error;
+            pos->ply--;
+            pos->repetition_index--;
+            restoreBoard(pos);
+            return false;
+        }
+
+        pos->ply--;
+        pos->repetition_index--;
+        restoreBoard(pos);
+    }
+
+    std::vector<int> moves = generate_moves(pos);
+    for (int move : moves) {
+        if (visited_nodes >= max_nodes) {
+            break;
+        }
+
+        copyBoard(pos);
+        pos->ply++;
+        pos->repetition_index++;
+        pos->repetition_table[pos->repetition_index] = pos->zobristKey;
+
+        if (!make_move(pos, move, all_moves, pos->ply)) {
+            pos->ply--;
+            pos->repetition_index--;
+            continue;
+        }
+
+        if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, error)) {
+            error = "after move " + uci_move_to_string(move) + ": " + error;
+            pos->ply--;
+            pos->repetition_index--;
+            restoreBoard(pos);
+            return false;
+        }
+
+        pos->ply--;
+        pos->repetition_index--;
+        restoreBoard(pos);
+    }
+
+    return true;
+}
+
+static void uci_verify_nnue_search(const char* command, thrawn::Position* pos) {
+    if (!nnue_loaded()) {
+        std::cout << "info string NNUE not loaded\n";
+        return;
+    }
+
+    int depth = 3;
+    const std::string args = trim_option_value(command + 10);
+    if (!args.empty()) {
+        depth = std::max(0, std::atoi(args.c_str()));
+    }
+
+    constexpr int kMaxVerifyNodes = 5000;
+    int visited_nodes = 0;
+    std::string error;
+    const bool ok = uci_nnue_verify_recursive(pos, depth, kMaxVerifyNodes, visited_nodes, error);
+
+    if (ok) {
+        std::cout << "info string NNUE verify ok depth " << depth
+                  << " nodes " << visited_nodes << "\n";
+    } else {
+        std::cout << "info string NNUE verify failed depth " << depth
+                  << " nodes " << visited_nodes
+                  << " reason " << error << "\n";
+    }
 }
 
 /*
@@ -492,9 +635,19 @@ void uci_loop(thrawn::Position* pos)
             nnue_refresh_root(pos);
         }
 
+        else if (strncmp(input, "nnuefenengine", 13) == 0)
+        {
+            uci_report_engine_nnue(input);
+        }
+
         else if (strncmp(input, "nnuefen", 7) == 0)
         {
             uci_report_raw_nnue(input);
+        }
+
+        else if (strncmp(input, "nnueverify", 10) == 0)
+        {
+            uci_verify_nnue_search(input, pos);
         }
 
         else if (strncmp(input, "perft", 5) == 0)

@@ -543,10 +543,10 @@ int evaluate_HCE(thrawn::Position* pos)
 
 int evaluate(thrawn::Position* pos)
 {   
-    if (!nnue_loaded() || !pos->nnue_stack[pos->ply].valid)
+    if (!nnue_loaded())
         return evaluate_HCE(pos);
 
     // (100-fifty_move) / 100 
     // taken from Cfish for fifty move scaling
-    return nnue_evaluate(pos) * (100-pos->fifty_move) / 100;
+    return nnue_evaluate(pos);
 }

@@ -6,7 +6,6 @@
 #include <array>
 #include <atomic>
 #include <cctype>
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -36,17 +35,22 @@ constexpr uint32_t kExpectedHiddenSize = thrawn::NNUE_HIDDEN_SIZE;
 constexpr uint32_t kExpectedOutputBuckets = thrawn::NNUE_OUTPUT_BUCKETS;
 constexpr uint32_t kExpectedOutputPerspective = 1;
 constexpr const char* kExpectedFeatureSet = "a768_dual_v1";
+constexpr int32_t kExpectedFtScale = 127;
+constexpr int32_t kExpectedDenseScale = 96;
+constexpr int32_t kNormalizationConstant = 50;
+constexpr int32_t kRawScaleInt = kExpectedDenseScale * kExpectedDenseScale;
+constexpr int64_t kCpScaleDenominator = static_cast<int64_t>(kRawScaleInt) * kNormalizationConstant;
+constexpr float kRawScale = static_cast<float>(kRawScaleInt);
 
 struct LoadedNetwork {
     uint32_t version = 0;
     uint32_t output_buckets = 0;
-    float inv_ft_scale = 0.0f;
     std::array<int16_t, kExpectedFtSize> ft_bias{};
     std::vector<int16_t> ft_weight;
-    std::array<float, kExpectedHiddenSize> l1_bias{};
-    std::array<float, kExpectedFtSize * 2 * kExpectedHiddenSize> l1_weight{};
-    std::array<float, kExpectedOutputBuckets> out_bias{};
-    std::array<float, kExpectedHiddenSize * kExpectedOutputBuckets> out_weight{};
+    std::array<int32_t, kExpectedHiddenSize> l1_bias{};
+    std::vector<int8_t> l1_weight;
+    std::array<int32_t, kExpectedOutputBuckets> out_bias{};
+    std::vector<int16_t> out_weight;
     std::string loaded_path;
 };
 
@@ -55,19 +59,46 @@ std::shared_ptr<const LoadedNetwork> g_network_owner;
 std::atomic<const LoadedNetwork*> g_network_raw{nullptr};
 
 template <typename T>
-bool read_scalar(std::ifstream& stream, T& value) {
-    stream.read(reinterpret_cast<char*>(&value), sizeof(T));
-    return static_cast<bool>(stream);
+bool read_scalar_le(std::ifstream& stream, T& value) {
+    std::array<unsigned char, sizeof(T)> bytes{};
+    stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!stream) {
+        return false;
+    }
+
+    const uint16_t endian_probe = 0x0102;
+    const bool host_is_little_endian = *reinterpret_cast<const unsigned char*>(&endian_probe) == 0x02;
+    if (host_is_little_endian) {
+        std::memcpy(&value, bytes.data(), sizeof(T));
+        return true;
+    }
+
+    std::array<unsigned char, sizeof(T)> reversed{};
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        reversed[i] = bytes[bytes.size() - 1 - i];
+    }
+    std::memcpy(&value, reversed.data(), sizeof(T));
+    return true;
 }
 
 template <typename T>
-bool read_vector(std::ifstream& stream, std::vector<T>& values, std::size_t count) {
+bool read_vector_le(std::ifstream& stream, std::vector<T>& values, std::size_t count) {
     values.resize(count);
     if (count == 0) {
         return true;
     }
-    stream.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(count * sizeof(T)));
-    return static_cast<bool>(stream);
+
+    if constexpr (sizeof(T) == 1) {
+        stream.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(count));
+        return static_cast<bool>(stream);
+    } else {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!read_scalar_le(stream, values[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
 }
 
 std::string trim_copy(const std::string& value) {
@@ -191,90 +222,55 @@ void clear_state(thrawn::NnueState& state) {
     state.valid = false;
 }
 
-float clip_unit(float value) {
-    if (value <= 0.0f) {
-        return 0.0f;
-    }
-    if (value >= 1.0f) {
-        return 1.0f;
-    }
-    return value;
+void copy_ft_bias(std::array<int16_t, kExpectedFtSize>& accumulator,
+                  const std::array<int16_t, kExpectedFtSize>& bias) {
+    accumulator = bias;
 }
 
-float clipped_screlu(float value) {
-    const float clipped = clip_unit(value);
-    return clipped * clipped;
-}
+int output_bucket_index(int piece_count, int output_buckets) {
+    constexpr int kMinPieceCount = 2;
+    constexpr int kMaxPieceCount = 32;
 
-int finalize_evaluation(float output) {
-    if (!std::isfinite(output)) {
+    if (output_buckets <= 1) {
         return 0;
     }
 
-    if (output > static_cast<float>(std::numeric_limits<int>::max())) {
-        return std::numeric_limits<int>::max();
-    }
-    if (output < static_cast<float>(std::numeric_limits<int>::min())) {
-        return std::numeric_limits<int>::min();
-    }
-
-    return static_cast<int>(std::lround(output));
-}
-
-int output_bucket_index(int piece_count) {
-    constexpr int kMinPieceCount = 2;
-    constexpr int kMaxPieceCount = 32;
-    constexpr int kPhaseSpan = kMaxPieceCount - kMinPieceCount + 1;
-
     const int clamped_piece_count = std::min(kMaxPieceCount, std::max(kMinPieceCount, piece_count));
     const int phase_progress = kMaxPieceCount - clamped_piece_count;
-    return std::min(
-        static_cast<int>(kExpectedOutputBuckets) - 1,
-        (phase_progress * static_cast<int>(kExpectedOutputBuckets)) / kPhaseSpan
-    );
+    return std::min(output_buckets - 1, (phase_progress * output_buckets) / 31);
 }
 
 enum class AccumulatorUpdateOp { Add, Subtract };
 
 #if defined(USE_AVX2)
-using AccumulatorVec = __m256i;
-constexpr int kAccumulatorSimdWidth = 16;
-static_assert(kExpectedFtSize % kAccumulatorSimdWidth == 0, "AVX2 accumulator width mismatch");
-
-inline AccumulatorVec accumulator_load(const int16_t* data) {
-    return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
+void update_accumulator_row_avx2(std::array<int16_t, kExpectedFtSize>& accumulator,
+                                 const int16_t* row,
+                                 AccumulatorUpdateOp op) {
+    int16_t* acc = accumulator.data();
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        __m256i acc_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
+        const __m256i row_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + i));
+        acc_vec = (op == AccumulatorUpdateOp::Add)
+            ? _mm256_add_epi16(acc_vec, row_vec)
+            : _mm256_sub_epi16(acc_vec, row_vec);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), acc_vec);
+    }
 }
+#endif
 
-inline void accumulator_store(int16_t* data, AccumulatorVec value) {
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(data), value);
-}
-
-inline AccumulatorVec accumulator_add(AccumulatorVec lhs, AccumulatorVec rhs) {
-    return _mm256_add_epi16(lhs, rhs);
-}
-
-inline AccumulatorVec accumulator_subtract(AccumulatorVec lhs, AccumulatorVec rhs) {
-    return _mm256_sub_epi16(lhs, rhs);
-}
-#elif defined(USE_NEON)
-using AccumulatorVec = int16x8_t;
-constexpr int kAccumulatorSimdWidth = 8;
-static_assert(kExpectedFtSize % kAccumulatorSimdWidth == 0, "NEON accumulator width mismatch");
-
-inline AccumulatorVec accumulator_load(const int16_t* data) {
-    return vld1q_s16(data);
-}
-
-inline void accumulator_store(int16_t* data, AccumulatorVec value) {
-    vst1q_s16(data, value);
-}
-
-inline AccumulatorVec accumulator_add(AccumulatorVec lhs, AccumulatorVec rhs) {
-    return vaddq_s16(lhs, rhs);
-}
-
-inline AccumulatorVec accumulator_subtract(AccumulatorVec lhs, AccumulatorVec rhs) {
-    return vsubq_s16(lhs, rhs);
+#if defined(USE_NEON)
+void update_accumulator_row_neon(std::array<int16_t, kExpectedFtSize>& accumulator,
+                                 const int16_t* row,
+                                 AccumulatorUpdateOp op) {
+    int16_t* acc = accumulator.data();
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
+        int16x8_t acc_vec = vld1q_s16(acc + i);
+        const int16x8_t row_vec = vld1q_s16(row + i);
+        acc_vec = (op == AccumulatorUpdateOp::Add)
+            ? vaddq_s16(acc_vec, row_vec)
+            : vsubq_s16(acc_vec, row_vec);
+        vst1q_s16(acc + i, acc_vec);
+    }
 }
 #endif
 
@@ -292,23 +288,15 @@ bool update_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
     }
 
     const int16_t* row = weights.data() + offset;
-    int16_t* acc = accumulator.data();
-
-#if defined(USE_AVX2) || defined(USE_NEON)
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += kAccumulatorSimdWidth) {
-        const AccumulatorVec acc_vec = accumulator_load(acc + i);
-        const AccumulatorVec row_vec = accumulator_load(row + i);
-        const AccumulatorVec out_vec = (op == AccumulatorUpdateOp::Add)
-            ? accumulator_add(acc_vec, row_vec)
-            : accumulator_subtract(acc_vec, row_vec);
-        accumulator_store(acc + i, out_vec);
-    }
+#if defined(USE_AVX2)
+    update_accumulator_row_avx2(accumulator, row, op);
+#elif defined(USE_NEON)
+    update_accumulator_row_neon(accumulator, row, op);
 #else
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const int updated = (op == AccumulatorUpdateOp::Add)
-            ? (accumulator[i] + row[i])
-            : (accumulator[i] - row[i]);
-        accumulator[i] = static_cast<int16_t>(updated);
+        accumulator[i] = (op == AccumulatorUpdateOp::Add)
+            ? static_cast<int16_t>(accumulator[i] + row[i])
+            : static_cast<int16_t>(accumulator[i] - row[i]);
     }
 #endif
 
@@ -327,75 +315,10 @@ bool subtract_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
     return update_accumulator_row(accumulator, weights, feature, AccumulatorUpdateOp::Subtract);
 }
 
-void accumulate_hidden_row_scalar(std::array<float, kExpectedHiddenSize>& hidden,
-                                  const float* row_weights,
-                                  float value) {
-    for (int j = 0; j < static_cast<int>(kExpectedHiddenSize); ++j) {
-        hidden[j] += value * row_weights[j];
-    }
-}
-
-#if defined(USE_AVX2)
-void accumulate_hidden_row_avx2(std::array<float, kExpectedHiddenSize>& hidden,
-                                const float* row_weights,
-                                float value) {
-    const __m256 value_vec = _mm256_set1_ps(value);
-    float* hidden_data = hidden.data();
-
-    for (int j = 0; j < static_cast<int>(kExpectedHiddenSize); j += 8) {
-        const __m256 hidden_vec = _mm256_loadu_ps(hidden_data + j);
-        const __m256 weight_vec = _mm256_loadu_ps(row_weights + j);
-        const __m256 product_vec = _mm256_mul_ps(value_vec, weight_vec);
-        const __m256 updated_vec = _mm256_add_ps(hidden_vec, product_vec);
-        _mm256_storeu_ps(hidden_data + j, updated_vec);
-    }
-}
-#endif
-
-#if defined(USE_NEON)
-void accumulate_hidden_row_neon(std::array<float, kExpectedHiddenSize>& hidden,
-                                const float* row_weights,
-                                float value) {
-    const float32x4_t value_vec = vdupq_n_f32(value);
-    float* hidden_data = hidden.data();
-
-    for (int j = 0; j < static_cast<int>(kExpectedHiddenSize); j += 4) {
-        const float32x4_t hidden_vec = vld1q_f32(hidden_data + j);
-        const float32x4_t weight_vec = vld1q_f32(row_weights + j);
-        const float32x4_t product_vec = vmulq_f32(value_vec, weight_vec);
-        const float32x4_t updated_vec = vaddq_f32(hidden_vec, product_vec);
-        vst1q_f32(hidden_data + j, updated_vec);
-    }
-}
-#endif
-
-void accumulate_hidden_row(std::array<float, kExpectedHiddenSize>& hidden,
-                           const float* row_weights,
-                           float value) {
-#if defined(USE_AVX2)
-    accumulate_hidden_row_avx2(hidden, row_weights, value);
-#elif defined(USE_NEON)
-    accumulate_hidden_row_neon(hidden, row_weights, value);
-#else
-    accumulate_hidden_row_scalar(hidden, row_weights, value);
-#endif
-}
-
-float output_sum_scalar(const std::array<float, kExpectedHiddenSize>& hidden,
-                        const LoadedNetwork& network,
-                        int bucket) {
-    float output = network.out_bias[bucket];
-    for (int j = 0; j < static_cast<int>(kExpectedHiddenSize); ++j) {
-        output += clip_unit(hidden[j]) * network.out_weight[j * kExpectedOutputBuckets + bucket];
-    }
-    return output;
-}
-
 bool add_piece_to_state(thrawn::NnueState& state, const LoadedNetwork& network, int piece, int square) {
     if (square < 0 || square >= BOARD_SIZE || state.piece_count >= thrawn::NNUE_MAX_PIECES) {
         return false;
     }
-
     if (state.index_by_square[square] != -1) {
         return false;
     }
@@ -421,7 +344,7 @@ bool remove_piece_from_state(thrawn::NnueState& state, const LoadedNetwork& netw
     }
 
     const int index = state.index_by_square[square];
-    if (index < 0 || index >= state.piece_count || state.piece_list[index] != piece) {
+    if (index < 0 || index >= static_cast<int>(state.piece_count) || state.piece_list[index] != piece) {
         return false;
     }
 
@@ -432,7 +355,7 @@ bool remove_piece_from_state(thrawn::NnueState& state, const LoadedNetwork& netw
         return false;
     }
 
-    const int last_index = state.piece_count - 1;
+    const int last_index = static_cast<int>(state.piece_count) - 1;
     state.index_by_square[square] = -1;
 
     if (index != last_index) {
@@ -451,8 +374,8 @@ bool remove_piece_from_state(thrawn::NnueState& state, const LoadedNetwork& netw
 
 bool build_state_from_board(const thrawn::Position* pos, const LoadedNetwork& network, thrawn::NnueState& out_state) {
     clear_state(out_state);
-    out_state.white_acc = network.ft_bias;
-    out_state.black_acc = network.ft_bias;
+    copy_ft_bias(out_state.white_acc, network.ft_bias);
+    copy_ft_bias(out_state.black_acc, network.ft_bias);
 
     for (int piece = P; piece <= k; ++piece) {
         uint64_t bitboard = pos->piece_bitboards[piece];
@@ -470,72 +393,116 @@ bool build_state_from_board(const thrawn::Position* pos, const LoadedNetwork& ne
     return true;
 }
 
-int evaluate_state_scalar(const thrawn::NnueState& state, const LoadedNetwork& network, int colour_to_move) {
-    std::array<float, kExpectedHiddenSize> hidden = network.l1_bias;
-    const int bucket = output_bucket_index(state.piece_count);
-
-    const auto& stm_acc = (colour_to_move == white) ? state.white_acc : state.black_acc;
-    const auto& nstm_acc = (colour_to_move == white) ? state.black_acc : state.white_acc;
-
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const float value = clipped_screlu(static_cast<float>(stm_acc[i]) * network.inv_ft_scale);
-        if (value == 0.0f) {
-            continue;
+const thrawn::NnueState* state_for_evaluation(const thrawn::Position* pos,
+                                              const LoadedNetwork& network,
+                                              thrawn::NnueState& refreshed_state) {
+    if (pos->ply >= 0 && pos->ply <= MAX_DEPTH) {
+        const thrawn::NnueState& live_state = pos->nnue_stack[pos->ply];
+        if (live_state.valid) {
+            return &live_state;
         }
-
-        const std::size_t row = static_cast<std::size_t>(i) * kExpectedHiddenSize;
-        accumulate_hidden_row_scalar(hidden, network.l1_weight.data() + row, value);
     }
 
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const float value = clipped_screlu(static_cast<float>(nstm_acc[i]) * network.inv_ft_scale);
-        if (value == 0.0f) {
-            continue;
-        }
-
-        const std::size_t row = static_cast<std::size_t>(kExpectedFtSize + i) * kExpectedHiddenSize;
-        accumulate_hidden_row_scalar(hidden, network.l1_weight.data() + row, value);
+    if (!build_state_from_board(pos, network, refreshed_state)) {
+        return nullptr;
     }
-
-    return finalize_evaluation(output_sum_scalar(hidden, network, bucket));
+    return &refreshed_state;
 }
 
-int evaluate_state_simd(const thrawn::NnueState& state, const LoadedNetwork& network, int colour_to_move) {
-    std::array<float, kExpectedHiddenSize> hidden = network.l1_bias;
-    const int bucket = output_bucket_index(state.piece_count);
+int32_t evaluate_state_raw_qb2(const thrawn::NnueState& state, const LoadedNetwork& network, int colour_to_move) {
+    std::array<int32_t, kExpectedFtSize * 2> screlu{};
+    std::array<int32_t, kExpectedHiddenSize> hidden{};
 
-    const auto& stm_acc = (colour_to_move == white) ? state.white_acc : state.black_acc;
-    const auto& nstm_acc = (colour_to_move == white) ? state.black_acc : state.white_acc;
-
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const float value = clipped_screlu(static_cast<float>(stm_acc[i]) * network.inv_ft_scale);
-        if (value == 0.0f) {
-            continue;
-        }
-
-        const std::size_t row = static_cast<std::size_t>(i) * kExpectedHiddenSize;
-        accumulate_hidden_row(hidden, network.l1_weight.data() + row, value);
-    }
+    const auto& us = (colour_to_move == white) ? state.white_acc : state.black_acc;
+    const auto& them = (colour_to_move == white) ? state.black_acc : state.white_acc;
 
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const float value = clipped_screlu(static_cast<float>(nstm_acc[i]) * network.inv_ft_scale);
-        if (value == 0.0f) {
-            continue;
-        }
-
-        const std::size_t row = static_cast<std::size_t>(kExpectedFtSize + i) * kExpectedHiddenSize;
-        accumulate_hidden_row(hidden, network.l1_weight.data() + row, value);
+        const int32_t us_clamped = std::clamp(static_cast<int32_t>(us[i]), 0, kExpectedFtScale);
+        const int32_t them_clamped = std::clamp(static_cast<int32_t>(them[i]), 0, kExpectedFtScale);
+        screlu[i] = us_clamped * us_clamped;
+        screlu[kExpectedFtSize + i] = them_clamped * them_clamped;
     }
 
-    return finalize_evaluation(output_sum_scalar(hidden, network, bucket));
+    constexpr int64_t ft_scale_sq = static_cast<int64_t>(kExpectedFtScale) * kExpectedFtScale;
+    for (int j = 0; j < static_cast<int>(kExpectedHiddenSize); ++j) {
+        int64_t sum = static_cast<int64_t>(network.l1_bias[j]) * ft_scale_sq;
+        for (int i = 0; i < static_cast<int>(kExpectedFtSize) * 2; ++i) {
+            sum += static_cast<int64_t>(screlu[i]) *
+                   static_cast<int64_t>(network.l1_weight[static_cast<std::size_t>(i) * kExpectedHiddenSize + j]);
+        }
+        sum /= ft_scale_sq;
+        hidden[j] = static_cast<int32_t>(std::clamp<int64_t>(sum, 0, kExpectedDenseScale));
+    }
+
+    const int bucket = output_bucket_index(state.piece_count, static_cast<int>(network.output_buckets));
+    int64_t output = 0;
+    for (int j = 0; j < static_cast<int>(kExpectedHiddenSize); ++j) {
+        output += static_cast<int64_t>(hidden[j]) *
+                  static_cast<int64_t>(network.out_weight[static_cast<std::size_t>(j) * network.output_buckets + bucket]);
+    }
+    output += static_cast<int64_t>(network.out_bias[bucket]) * kExpectedDenseScale;
+
+    if (output > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return std::numeric_limits<int32_t>::max();
+    }
+    if (output < static_cast<int64_t>(std::numeric_limits<int32_t>::min())) {
+        return std::numeric_limits<int32_t>::min();
+    }
+    return static_cast<int32_t>(output);
 }
 
-int evaluate_state(const thrawn::NnueState& state, const LoadedNetwork& network, int colour_to_move) {
-#if defined(USE_AVX2) || defined(USE_NEON)
-    return evaluate_state_simd(state, network, colour_to_move);
-#else
-    return evaluate_state_scalar(state, network, colour_to_move);
-#endif
+bool verify_state_against_board(const thrawn::Position* pos,
+                                const LoadedNetwork& network,
+                                std::string* error) {
+    auto fail = [&](const std::string& message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+
+    if (pos->ply < 0 || pos->ply > MAX_DEPTH) {
+        return fail("invalid ply");
+    }
+
+    thrawn::NnueState rebuilt;
+    if (!build_state_from_board(pos, network, rebuilt)) {
+        return fail("failed full refresh");
+    }
+
+    const thrawn::NnueState& incremental = pos->nnue_stack[pos->ply];
+    if (!incremental.valid) {
+        return fail("incremental state invalid");
+    }
+
+    if (incremental.piece_count != rebuilt.piece_count) {
+        return fail("piece count mismatch");
+    }
+    if (incremental.white_acc != rebuilt.white_acc) {
+        return fail("white accumulator mismatch");
+    }
+    if (incremental.black_acc != rebuilt.black_acc) {
+        return fail("black accumulator mismatch");
+    }
+
+    for (int square = 0; square < BOARD_SIZE; ++square) {
+        const int inc_index = incremental.index_by_square[square];
+        const int ref_index = rebuilt.index_by_square[square];
+        if ((inc_index == -1) != (ref_index == -1)) {
+            return fail("piece presence mismatch");
+        }
+        if (inc_index != -1 && incremental.piece_list[inc_index] != rebuilt.piece_list[ref_index]) {
+            return fail("piece identity mismatch");
+        }
+    }
+
+    const int32_t incremental_raw = evaluate_state_raw_qb2(incremental, network, pos->colour_to_move);
+    const int32_t rebuilt_raw = evaluate_state_raw_qb2(rebuilt, network, pos->colour_to_move);
+    if (incremental_raw != rebuilt_raw) {
+        return fail("raw evaluation mismatch");
+    }
+
+    return true;
 }
 
 bool load_network_from_file(const std::string& path, LoadedNetwork& network, std::string& error) {
@@ -567,22 +534,22 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
     float wdl_scale = 0.0f;
     uint32_t description_length = 0;
 
-    if (!read_scalar(stream, version)) {
+    if (!read_scalar_le(stream, version)) {
         error = "failed while reading version";
         return false;
     }
 
     const std::string feature_set = read_feature_set(stream);
     if (!stream ||
-        !read_scalar(stream, num_features) ||
-        !read_scalar(stream, ft_size) ||
-        !read_scalar(stream, hidden_size) ||
-        !read_scalar(stream, output_buckets) ||
-        !read_scalar(stream, output_perspective) ||
-        !read_scalar(stream, ft_scale) ||
-        !read_scalar(stream, dense_scale) ||
-        !read_scalar(stream, wdl_scale) ||
-        !read_scalar(stream, description_length)) {
+        !read_scalar_le(stream, num_features) ||
+        !read_scalar_le(stream, ft_size) ||
+        !read_scalar_le(stream, hidden_size) ||
+        !read_scalar_le(stream, output_buckets) ||
+        !read_scalar_le(stream, output_perspective) ||
+        !read_scalar_le(stream, ft_scale) ||
+        !read_scalar_le(stream, dense_scale) ||
+        !read_scalar_le(stream, wdl_scale) ||
+        !read_scalar_le(stream, description_length)) {
         error = "failed while reading header";
         return false;
     }
@@ -611,8 +578,9 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
         error = "unexpected output perspective";
         return false;
     }
-    if (ft_scale <= 0.0f || dense_scale <= 0.0f) {
-        error = "invalid quantization scales";
+    if (ft_scale != static_cast<float>(kExpectedFtScale) ||
+        dense_scale != static_cast<float>(kExpectedDenseScale)) {
+        error = "unexpected quantization scales";
         return false;
     }
 
@@ -629,42 +597,17 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
     std::vector<int16_t> ft_weight_q;
     std::vector<int32_t> l1_bias_q;
     std::vector<int8_t> l1_weight_q;
-
-    if (!read_vector(stream, ft_bias_q, kExpectedFtSize) ||
-        !read_vector(stream, ft_weight_q, static_cast<std::size_t>(kExpectedNumFeatures) * kExpectedFtSize) ||
-        !read_vector(stream, l1_bias_q, kExpectedHiddenSize) ||
-        !read_vector(stream, l1_weight_q, static_cast<std::size_t>(kExpectedFtSize) * 2 * kExpectedHiddenSize)) {
-        error = "failed while reading tensors";
-        return false;
-    }
-
-    network = LoadedNetwork{};
-    network.version = version;
-    network.output_buckets = output_buckets;
-    network.inv_ft_scale = 1.0f / ft_scale;
-    std::copy(ft_bias_q.begin(), ft_bias_q.end(), network.ft_bias.begin());
-    network.ft_weight = std::move(ft_weight_q);
-
-    for (int i = 0; i < static_cast<int>(kExpectedHiddenSize); ++i) {
-        network.l1_bias[i] = static_cast<float>(l1_bias_q[i]) / dense_scale;
-    }
-    for (std::size_t i = 0; i < network.l1_weight.size(); ++i) {
-        network.l1_weight[i] = static_cast<float>(l1_weight_q[i]) / dense_scale;
-    }
-
     std::vector<int32_t> out_bias_q;
     std::vector<int16_t> out_weight_q;
-    if (!read_vector(stream, out_bias_q, kExpectedOutputBuckets) ||
-        !read_vector(stream, out_weight_q, static_cast<std::size_t>(kExpectedHiddenSize) * kExpectedOutputBuckets)) {
-        error = "failed while reading output layer";
-        return false;
-    }
 
-    for (int i = 0; i < static_cast<int>(kExpectedOutputBuckets); ++i) {
-        network.out_bias[i] = static_cast<float>(out_bias_q[i]) / dense_scale;
-    }
-    for (std::size_t i = 0; i < network.out_weight.size(); ++i) {
-        network.out_weight[i] = static_cast<float>(out_weight_q[i]) / dense_scale;
+    if (!read_vector_le(stream, ft_bias_q, kExpectedFtSize) ||
+        !read_vector_le(stream, ft_weight_q, static_cast<std::size_t>(kExpectedNumFeatures) * kExpectedFtSize) ||
+        !read_vector_le(stream, l1_bias_q, kExpectedHiddenSize) ||
+        !read_vector_le(stream, l1_weight_q, static_cast<std::size_t>(kExpectedFtSize) * 2 * kExpectedHiddenSize) ||
+        !read_vector_le(stream, out_bias_q, kExpectedOutputBuckets) ||
+        !read_vector_le(stream, out_weight_q, static_cast<std::size_t>(kExpectedHiddenSize) * kExpectedOutputBuckets)) {
+        error = "failed while reading tensors";
+        return false;
     }
 
     if (!stream) {
@@ -672,6 +615,15 @@ bool load_network_from_file(const std::string& path, LoadedNetwork& network, std
         return false;
     }
 
+    network = LoadedNetwork{};
+    network.version = version;
+    network.output_buckets = output_buckets;
+    std::copy(ft_bias_q.begin(), ft_bias_q.end(), network.ft_bias.begin());
+    network.ft_weight = std::move(ft_weight_q);
+    std::copy(l1_bias_q.begin(), l1_bias_q.end(), network.l1_bias.begin());
+    network.l1_weight = std::move(l1_weight_q);
+    std::copy(out_bias_q.begin(), out_bias_q.end(), network.out_bias.begin());
+    network.out_weight = std::move(out_weight_q);
     network.loaded_path = path;
     (void)wdl_scale;
     (void)description;
@@ -739,12 +691,31 @@ int nnue_evaluate(thrawn::Position* pos) {
         return 0;
     }
 
-    const thrawn::NnueState& state = pos->nnue_stack[pos->ply];
-    if (!state.valid) {
+    thrawn::NnueState refreshed_state;
+    const thrawn::NnueState* state = state_for_evaluation(pos, *network, refreshed_state);
+    if (state == nullptr) {
         return 0;
     }
 
-    return evaluate_state(state, *network, pos->colour_to_move);
+    return static_cast<int>(
+        (static_cast<int64_t>(evaluate_state_raw_qb2(*state, *network, pos->colour_to_move)) * 100) /
+        kCpScaleDenominator
+    );
+}
+
+float nnue_evaluate_raw(const thrawn::Position* pos) {
+    const LoadedNetwork* network = current_network();
+    if (network == nullptr) {
+        return 0.0f;
+    }
+
+    thrawn::NnueState refreshed_state;
+    const thrawn::NnueState* state = state_for_evaluation(pos, *network, refreshed_state);
+    if (state == nullptr) {
+        return 0.0f;
+    }
+
+    return static_cast<float>(evaluate_state_raw_qb2(*state, *network, pos->colour_to_move)) / kRawScale;
 }
 
 void nnue_refresh_root(thrawn::Position* pos) {
@@ -765,7 +736,6 @@ void nnue_copy_parent_to_child(thrawn::Position* pos, int child_ply) {
     if (child_ply <= 0 || child_ply > MAX_DEPTH) {
         return;
     }
-
     pos->nnue_stack[child_ply] = pos->nnue_stack[child_ply - 1];
 }
 
@@ -779,7 +749,6 @@ void nnue_add_piece(thrawn::Position* pos, int ply, int piece, int square) {
     if (!state.valid) {
         return;
     }
-
     if (!add_piece_to_state(state, *network, piece, square)) {
         state.valid = false;
     }
@@ -795,63 +764,29 @@ void nnue_remove_piece(thrawn::Position* pos, int ply, int piece, int square) {
     if (!state.valid) {
         return;
     }
-
     if (!remove_piece_from_state(state, *network, piece, square)) {
         state.valid = false;
     }
+}
+
+bool nnue_verify_position(const thrawn::Position* pos, std::string* error) {
+    const LoadedNetwork* network = current_network();
+    if (network == nullptr) {
+        if (error != nullptr) {
+            *error = "NNUE not loaded";
+        }
+        return false;
+    }
+    return verify_state_against_board(pos, *network, error);
 }
 
 void nnue_debug_check(const thrawn::Position* pos) {
 #ifndef DEBUG_BUILD
     (void)pos;
 #else
-    const LoadedNetwork* network = current_network();
-    if (network == nullptr) {
-        return;
+    std::string error;
+    if (!nnue_verify_position(pos, &error)) {
+        parity_failure(error.c_str(), pos);
     }
-
-    if (pos->ply < 0 || pos->ply > MAX_DEPTH) {
-        parity_failure("invalid ply", pos);
-    }
-
-    thrawn::NnueState rebuilt;
-    if (!build_state_from_board(pos, *network, rebuilt)) {
-        parity_failure("failed full refresh", pos);
-    }
-
-    const thrawn::NnueState& incremental = pos->nnue_stack[pos->ply];
-    if (!incremental.valid) {
-        parity_failure("incremental state invalid", pos);
-    }
-
-    if (incremental.piece_count != rebuilt.piece_count ||
-        incremental.white_acc != rebuilt.white_acc ||
-        incremental.black_acc != rebuilt.black_acc) {
-        parity_failure("accumulator mismatch", pos);
-    }
-
-    for (int square = 0; square < BOARD_SIZE; ++square) {
-        const int inc_index = incremental.index_by_square[square];
-        const int ref_index = rebuilt.index_by_square[square];
-        if ((inc_index == -1) != (ref_index == -1)) {
-            parity_failure("piece presence mismatch", pos);
-        }
-        if (inc_index != -1 && incremental.piece_list[inc_index] != rebuilt.piece_list[ref_index]) {
-            parity_failure("piece identity mismatch", pos);
-        }
-    }
-
-    const int incremental_eval = evaluate_state(incremental, *network, pos->colour_to_move);
-    const int rebuilt_eval = evaluate_state(rebuilt, *network, pos->colour_to_move);
-    if (incremental_eval != rebuilt_eval) {
-        parity_failure("evaluation mismatch", pos);
-    }
-
-#if defined(USE_AVX2) || defined(USE_NEON)
-    if (incremental_eval != evaluate_state_scalar(incremental, *network, pos->colour_to_move) ||
-        rebuilt_eval != evaluate_state_scalar(rebuilt, *network, pos->colour_to_move)) {
-        parity_failure("simd scalar mismatch", pos);
-    }
-#endif
 #endif
 }
