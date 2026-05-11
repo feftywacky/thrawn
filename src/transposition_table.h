@@ -1,6 +1,7 @@
 #ifndef TRANSPOSITION_TABLE_H
 #define TRANSPOSITION_TABLE_H
 
+#include <atomic>
 #include <cstdint>
 #include "position.h"
 
@@ -18,9 +19,9 @@ struct TTEntry
     // int score;         // Evaluation score.
     // int hash_flag;     // TT flag (EXACT, ALPHA, BETA)
     // int best_move;     // Best move (for move ordering)
-    uint64_t smp_key;  // This will be zobrist key xor data
-    uint64_t smp_data; // Encoding depth, score, hash_flag and best_move into a U64
-    int age;           // Age for replacement logic
+    std::atomic<uint64_t> smp_key{0};  // This will be zobrist key xor data
+    std::atomic<uint64_t> smp_data{0}; // Encoding depth, score, hash_flag and best_move into a U64
+    std::atomic<int> age{0};           // Age for replacement logic
 };
 
 class TranspositionTable
@@ -36,7 +37,7 @@ public:
     void reset();
 
     // Increments the current age (to be called at the start of a new search)
-    void incrementAge() { currentAge++; }
+    void incrementAge() { currentAge.fetch_add(1, std::memory_order_relaxed); }
 
     // Lookup a position in the tt
     bool probe(const thrawn::Position* pos, int& depth, int alpha, int beta, int& bestMove, int& score, int& flag);
@@ -54,7 +55,7 @@ public:
 private:
     TTEntry* table;      // Array of TT entries.
     int      numEntries; // Number of entries in the table.
-    int      currentAge; // Current age, updated once per search.
+    std::atomic<int> currentAge; // Current age, updated once per search.
 };
 
 #endif // TRANSPOSITION_TABLE_H

@@ -18,6 +18,7 @@
 #include <string>
 #include <chrono>
 #include <sstream>
+#include <atomic>
 #include <unistd.h>
 #include <stdio.h>
 #ifdef _WIN32
@@ -35,7 +36,7 @@ UCI PROTOCOL CODE REFERENCES TO VICE CHESS ENGINE BY RICHARD ALBERT
 */
 
 // exit from engine flag
-int quit = 0;
+std::atomic<int> quit{0};
 
 // UCI "movestogo" command moves counter
 int movestogo = 30;
@@ -59,7 +60,7 @@ int stoptime = 0;
 int timeset = 0;
 
 // variable to flag when the time is up
-int stopped = 0;
+std::atomic<int> stopped{0};
 
 // Number of threads use for search
 int numThreads = 4;
@@ -98,7 +99,7 @@ static void uci_report_raw_nnue(const char* command) {
     thrawn::Position scratch;
     parse_fen(&scratch, fen.c_str());
 
-    std::cout << "info string raw nnue score " << nnue_evaluate_raw(&scratch) << "\n";
+    std::cout << "info string nnue score_stm " << nnue_evaluate_raw(&scratch) << "\n";
 }
 
 static void uci_report_engine_nnue(const char* command) {
@@ -135,10 +136,16 @@ static bool uci_nnue_verify_recursive(thrawn::Position* pos,
                                       int depth,
                                       int max_nodes,
                                       int& visited_nodes,
+                                      float& max_parity_error_cp,
                                       std::string& error) {
     if (!nnue_verify_position(pos, &error)) {
         return false;
     }
+    float parity_error_cp = 0.0f;
+    if (!nnue_measure_evaluation_parity(pos, &parity_error_cp, &error)) {
+        return false;
+    }
+    max_parity_error_cp = std::max(max_parity_error_cp, parity_error_cp);
 
     if (depth <= 0 || visited_nodes >= max_nodes || pos->ply >= MAX_DEPTH - 1) {
         return true;
@@ -170,7 +177,7 @@ static bool uci_nnue_verify_recursive(thrawn::Position* pos,
         pos->colour_to_move ^= 1;
         pos->zobristKey ^= pos->colour_to_move_hashkey;
 
-        if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, error)) {
+        if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, max_parity_error_cp, error)) {
             error = "after null move: " + error;
             pos->ply--;
             pos->repetition_index--;
@@ -200,7 +207,7 @@ static bool uci_nnue_verify_recursive(thrawn::Position* pos,
             continue;
         }
 
-        if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, error)) {
+        if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, max_parity_error_cp, error)) {
             error = "after move " + uci_move_to_string(move) + ": " + error;
             pos->ply--;
             pos->repetition_index--;
@@ -230,12 +237,19 @@ static void uci_verify_nnue_search(const char* command, thrawn::Position* pos) {
 
     constexpr int kMaxVerifyNodes = 5000;
     int visited_nodes = 0;
+    float max_parity_error_cp = 0.0f;
     std::string error;
-    const bool ok = uci_nnue_verify_recursive(pos, depth, kMaxVerifyNodes, visited_nodes, error);
+    const bool ok = uci_nnue_verify_recursive(pos,
+                                              depth,
+                                              kMaxVerifyNodes,
+                                              visited_nodes,
+                                              max_parity_error_cp,
+                                              error);
 
     if (ok) {
         std::cout << "info string NNUE verify ok depth " << depth
-                  << " nodes " << visited_nodes << "\n";
+                  << " nodes " << visited_nodes
+                  << " parity_cp " << max_parity_error_cp << "\n";
     } else {
         std::cout << "info string NNUE verify failed depth " << depth
                   << " nodes " << visited_nodes
@@ -290,7 +304,7 @@ void read_input() {
     // "Listen" to STDIN
     if (input_waiting()) {
         // cout<<"input waiting"<<"\n";
-        stopped = 1;
+        stopped.store(1, std::memory_order_relaxed);
 
         // Loop to read bytes from STDIN
         do {
@@ -312,13 +326,14 @@ void read_input() {
             // Match UCI "quit" command
             if (!strncmp(input, "quit", 4)) {
                 // Tell the engine to terminate execution
-                quit = 1;
+                quit.store(1, std::memory_order_relaxed);
+                stopped.store(1, std::memory_order_relaxed);
             }
 
             // Match UCI "stop" command
             else if (!strncmp(input, "stop", 4)) {
                 // Tell the engine to terminate execution
-                quit = 1;
+                stopped.store(1, std::memory_order_relaxed);
             }
         }
     }
@@ -329,7 +344,7 @@ void communicate() {
 	// if time is up break here
     if(timeset == 1 && get_time_ms() > stoptime) {
          // cout<<"communicate set stopped = 1"<<"\n";
-		stopped = 1;
+			stopped.store(1, std::memory_order_relaxed);
 	}
 	
     // read GUI input
@@ -585,8 +600,11 @@ void uci_loop(thrawn::Position* pos)
             uci_parse_position(pos, "position startpos");
         }
         // parse UCI "go" command
-        else if (strncmp(input, "go", 2) == 0)
+        else if (strncmp(input, "go", 2) == 0) {
             uci_parse_go(pos, input);
+            if (quit.load(std::memory_order_relaxed) == 1)
+                break;
+        }
         
         // parse UCI "quit" command
         else if (strncmp(input, "quit", 4) == 0)
@@ -659,7 +677,7 @@ void uci_loop(thrawn::Position* pos)
 
 void reset_time_control()
 {
-    quit = 0;
+    quit.store(0, std::memory_order_relaxed);
     movestogo = 30;
     movetime = -1;
     uci_time = -1;
@@ -667,5 +685,5 @@ void reset_time_control()
     starttime = 0;
     stoptime = 0;
     timeset = 0;
-    stopped = 0;
+    stopped.store(0, std::memory_order_relaxed);
 }

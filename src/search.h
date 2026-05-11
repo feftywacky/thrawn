@@ -37,7 +37,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td, int alpha, int beta);
  */
 int score_move(thrawn::Position* pos, ThreadData* td, int move);
 void sort_moves(thrawn::Position* pos, ThreadData* td, std::vector<int>& moves, int bestMove);
-void score_pv(std::vector<int>& moves, ThreadData* td);
+void score_pv(thrawn::Position* pos, std::vector<int>& moves, ThreadData* td);
 
 /*
  * Repetition check
@@ -59,6 +59,6 @@ int futility_move_count(int depth);
 
 // some search constants
 static const int WindowDepth   = 4;
-static const int WindowSize    = 10;
+static const int WindowSize    = 24;
 
 #endif // SEARCH_H

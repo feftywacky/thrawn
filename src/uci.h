@@ -1,12 +1,13 @@
 #ifndef UCI_H
 #define UCI_H
 
+#include <atomic>
 #include <string>
 #include "position.h"
 
 using namespace std;
 
-extern int quit;
+extern std::atomic<int> quit;
 extern int movestogo;
 extern int movetime;
 extern int uci_time;
@@ -14,7 +15,7 @@ extern int inc;
 extern int starttime;
 extern int stoptime;
 extern int timeset;
-extern int stopped;
+extern std::atomic<int> stopped;
 extern int numThreads;
 
 // UCI PROTOCOL

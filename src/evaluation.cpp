@@ -546,7 +546,5 @@ int evaluate(thrawn::Position* pos)
     if (!nnue_loaded())
         return evaluate_HCE(pos);
 
-    // (100-fifty_move) / 100 
-    // taken from Cfish for fifty move scaling
     return nnue_evaluate(pos);
 }

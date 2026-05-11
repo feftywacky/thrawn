@@ -26,7 +26,114 @@ some notes for negamax
 std::atomic<uint64_t> total_nodes(0);
 
 std::array<int, 4> LateMovePruning_factors = {0, 8, 12, 24};
-int RFP_factor = 64;
+int RFP_factor = 110;
+
+namespace {
+
+constexpr int HistoryMax = 16384;
+constexpr int HistoryScoreCap = 6000;
+constexpr int CounterMoveScore = 7000;
+
+bool is_quiet_move(int move) {
+    return !get_is_capture_move(move) && !get_promoted_piece(move);
+}
+
+int reverse_futility_margin(int depth) {
+    static constexpr int margins[] = {0, 160, 300};
+    if (depth >= 0 && depth < static_cast<int>(sizeof(margins) / sizeof(margins[0]))) {
+        return margins[depth];
+    }
+    return RFP_factor * depth;
+}
+
+int razor_margin(int depth) {
+    static constexpr int margins[] = {0, 250, 450};
+    if (depth >= 0 && depth < static_cast<int>(sizeof(margins) / sizeof(margins[0]))) {
+        return margins[depth];
+    }
+    return 600;
+}
+
+int null_move_reduction(int depth, int static_eval, int beta) {
+    const int eval_margin = std::max(0, static_eval - beta);
+    int reduction = 2 + depth / 6 + std::min(1, eval_margin / 400);
+    return std::min(reduction, depth - 1);
+}
+
+int history_bonus(int depth) {
+    return std::min(HistoryMax / 2, depth * depth + 2 * depth);
+}
+
+int history_score(ThreadData* td, int move) {
+    return td->history_moves[get_move_piece(move)][get_move_target(move)];
+}
+
+void update_history(ThreadData* td, int move, int bonus) {
+    int& entry = td->history_moves[get_move_piece(move)][get_move_target(move)];
+    bonus = std::clamp(bonus, -HistoryMax, HistoryMax);
+    const int gravity = bonus >= 0 ? bonus : -bonus;
+    entry += bonus - entry * gravity / HistoryMax;
+    entry = std::clamp(entry, -HistoryMax, HistoryMax);
+}
+
+void update_quiet_history(ThreadData* td, int move, int depth) {
+    update_history(td, move, history_bonus(depth));
+}
+
+void penalize_quiet_history(ThreadData* td, const std::vector<int>& moves, int depth) {
+    const int penalty = -history_bonus(depth);
+    for (int move : moves) {
+        update_history(td, move, penalty);
+    }
+}
+
+int previous_ply_move(ThreadData* td, int ply) {
+    if (ply <= 0 || ply > MAX_DEPTH - 1) {
+        return 0;
+    }
+    return td->ply_moves[ply - 1];
+}
+
+bool is_counter_move(ThreadData* td, int ply, int move) {
+    const int previousMove = previous_ply_move(td, ply);
+    if (previousMove == 0) {
+        return false;
+    }
+    return td->counter_moves[get_move_piece(previousMove)][get_move_target(previousMove)] == move;
+}
+
+void update_counter_move(ThreadData* td, int ply, int move) {
+    const int previousMove = previous_ply_move(td, ply);
+    if (previousMove == 0) {
+        return;
+    }
+    td->counter_moves[get_move_piece(previousMove)][get_move_target(previousMove)] = move;
+}
+
+int late_move_reduction(int depth, int move_number, bool is_pv_node,
+                        bool is_counter, int quiet_history) {
+    int reduction = 1;
+    if (!is_pv_node && depth >= 5) {
+        ++reduction;
+    }
+    if (depth >= 6 && move_number > 8) {
+        ++reduction;
+    }
+    if (depth >= 8 && move_number > 16) {
+        ++reduction;
+    }
+
+    if (is_pv_node || is_counter || quiet_history > HistoryMax / 4) {
+        --reduction;
+    }
+    if (!is_counter && quiet_history < -HistoryMax / 4) {
+        ++reduction;
+    }
+
+    return std::clamp(reduction, 1, std::max(1, depth - 2));
+}
+
+} // namespace
 
 int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int beta)
 {
@@ -34,6 +141,12 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     int bestMove = 0;
     int hashFlag = BOUND_UPPER;
     int static_eval = 0;
+
+    // Keep PV and move-ordering arrays inside their fixed search horizon.
+    if (pos->ply >= MAX_DEPTH - 1)
+    {
+        return evaluate(pos);
+    }
 
     // init local pv
     td->pv_length[pos->ply] = pos->ply;
@@ -71,7 +184,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     }
 
     // For periodic UCI output / time check
-    if ((td->nodes & 2047) == 0)
+    if (td->thread_id == 0 && (td->nodes & 2047) == 0)
     {
         communicate();
     }
@@ -89,11 +202,11 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         pos->colour_to_move ^ 1
     );
 
-    // If in check, extend depth by 1
+    // Check extension: search check evasions, and replies to checking moves,
+    // one ply deeper than an ordinary node.
     if (inCheck)
     {
         depth++;
-        goto full_search;
     }
 
     // 3) Quiescence
@@ -103,13 +216,6 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         return quiescence(pos, td, alpha, beta);
     }
 
-    // 4) Check for max depth overflow
-    if (pos->ply > MAX_DEPTH - 1)
-    {
-        // fallback to a static evaluation
-        return evaluate(pos);
-    }
-
     // 7) Compute static evaluation
     static_eval = evaluate(pos);
 
@@ -117,9 +223,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // 8) Reverse Futility Pruning (RFP)
     //    Often called "static-nullmove" or "futility"
     // --------------------------------------
-    if (!inCheck && !isPvNode && depth < 3)
+    if (!inCheck && !isPvNode && depth <= 2)
     {
-        int eval_margin = 120 * depth;
+        int eval_margin = reverse_futility_margin(depth);
         // if static eval already big enough to exceed beta
         if (static_eval - eval_margin >= beta)
         {
@@ -130,20 +236,19 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // --------------------------------------
     // 9) Razoring (shallow depth, not in check, non-PV)
     // --------------------------------------
-    if (!inCheck && !isPvNode && depth <= 3)
+    if (!inCheck && !isPvNode && depth <= 2 && pos->ply > 0)
     {
-        score = evaluate(pos) + 125;
+        score = static_eval + razor_margin(depth);
         int razor_score;
         // If the position is very likely losing (or not better) vs beta, do a quick check
-        if (score < beta)
+        if (score <= alpha)
         {
             if (depth == 1)
             {
                 razor_score = quiescence(pos, td, alpha, beta);
                 return (razor_score > score) ? razor_score : score;
             }
-            score += 175;
-            if (score < beta && depth <= 2)
+            if (depth <= 2)
             {
                 razor_score = quiescence(pos,td, alpha, beta);
                 if (razor_score < beta) // quiescence says score fail-low node
@@ -155,12 +260,14 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // --------------------------------------
     // 10) Null-move pruning
     // --------------------------------------
-    if (!inCheck && depth >= 3 && !isPvNode && !noMajorsOrMinorsPieces(pos) && td->allowNullMovePruning)
+    if (!inCheck && depth >= 4 && !isPvNode && static_eval >= beta &&
+        !noMajorsOrMinorsPieces(pos) && td->allowNullMovePruning)
     {
         // we make a null move
         copyBoard(pos);
 
         pos->ply++;
+        td->ply_moves[pos->ply - 1] = 0;
         nnue_copy_parent_to_child(pos, pos->ply);
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
@@ -176,7 +283,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         nnue_debug_check(pos);
 
         // Null-move search with reduced depth
-        int reduction = 2;
+        int reduction = null_move_reduction(depth, static_eval, beta);
         td->allowNullMovePruning = false;
         score = -negamax(pos, td, depth - 1 - reduction, -beta, -beta + 1);
         td->allowNullMovePruning = true;
@@ -186,7 +293,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         
         restoreBoard(pos);
 
-        if (stopped == 1)
+        if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
 
         // If this "fake pass" search fails high, then cut
@@ -196,29 +303,28 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         }
     }
 
-    // No-hashmove reduction
-    // bestMove==0 means not in tt
-    if (!inCheck && !isPvNode && depth >= 3 && ttMove==0)
-        depth--;
-
-full_search:
-
     // 11) Generate moves
     std::vector<int> moves = generate_moves(pos);
 
     // 12) If we had a best move from TT, ensure it gets sorted first
     if (td->follow_pv_flag)
-        score_pv(moves, td);
+        score_pv(pos, moves, td);
 
     sort_moves(pos, td, moves, ttMove);
 
     // We are about to search each move
     int valid_moves = 0;
     int moves_searched = 0;
+    int quiet_moves_seen = 0;
+    std::vector<int> failed_quiet_moves;
+    failed_quiet_moves.reserve(moves.size());
 
     // 13) Search each move (LMR, LMP, PVS logic, etc.)
     for (int move : moves)
     {
+        const int parentPly = pos->ply;
+        const bool quietMove = is_quiet_move(move);
+
         copyBoard(pos);
         pos->ply++;
         pos->repetition_index++;
@@ -231,6 +337,11 @@ full_search:
             continue;
         }
         valid_moves++;
+        if (quietMove)
+        {
+            quiet_moves_seen++;
+        }
+        td->ply_moves[parentPly] = move;
 
         // -------------------------------------------
         // Principal Variation Search logic
@@ -253,7 +364,7 @@ full_search:
                                  pos->colour_to_move ^ 1);
 
             bool allowFutilityPrune = false;
-            if (pos->ply && !isPvNode && (depth <= 3))
+            if (pos->ply && !isPvNode && !inCheck && (depth <= 3))
             {
                 if ((static_eval + futility_margin(depth)) <= alpha)
                 {
@@ -261,10 +372,9 @@ full_search:
                 }
             }
 
-            if (allowFutilityPrune && !givesCheck &&
+            if (allowFutilityPrune && quietMove && !givesCheck &&
                 (get_move_piece(move) != P) && (get_move_piece(move) != p) &&
-                !get_promoted_piece(move) && !get_is_move_castling(move) &&
-                !get_is_capture_move(move))
+                !get_is_move_castling(move))
             {
                 restoreBoard(pos);
                 pos->ply--;
@@ -277,9 +387,9 @@ full_search:
             //     If depth is small, not in check, not a capture,
             //     and we've already searched "too many" quiet moves
             // -----------------------------
-            if (pos->ply && depth <= 3 && !isPvNode && !inCheck &&
-                !get_is_capture_move(move) &&
-                (valid_moves > LateMovePruning_factors[depth]))
+            if (pos->ply && depth <= 3 && !isPvNode && !inCheck && !givesCheck &&
+                quietMove && !get_is_move_castling(move) &&
+                (quiet_moves_seen > LateMovePruning_factors[depth]))
             {
                 restoreBoard(pos);
                 pos->ply--;
@@ -291,15 +401,21 @@ full_search:
             // -----------------------------
             // (C) Late Move Reductions (LMR)
             // -----------------------------
-            if (valid_moves >= full_depth_moves &&
+            const int quietHistory = quietMove ? history_score(td, move) : 0;
+            const bool counterMove = quietMove && is_counter_move(td, parentPly, move);
+
+            if (quiet_moves_seen >= full_depth_moves &&
                 depth >= reduction_limit &&
                 !inCheck &&
-                get_is_capture_move(move) == 0 &&
-                get_promoted_piece(move) == 0)
+                !givesCheck &&
+                quietMove &&
+                !get_is_move_castling(move))
             {
                 // Reduced search
-                int reduction = 2;
-                score = -negamax(pos, td, depth - reduction, -alpha - 1, -alpha);
+                int reduction = late_move_reduction(depth, moves_searched + 1,
+                                                    isPvNode, counterMove, quietHistory);
+                int reducedDepth = std::max(1, depth - 1 - reduction);
+                score = -negamax(pos, td, reducedDepth, -alpha - 1, -alpha);
             }
             else
             {
@@ -326,19 +442,23 @@ full_search:
         restoreBoard(pos);
         moves_searched++;
 
-        if (stopped == 1)
+        if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
 
+        if (pos->ply == 0)
+            td->recordRootMove(move, score, depth);
+
         // Check if this move improved alpha
+        const int oldAlpha = alpha;
         if (score > alpha)
         {
             bestMove = move;
             hashFlag = BOUND_EXACT; // PV node
 
             // Update history for quiet moves
-            if (get_is_capture_move(move) == 0)
+            if (quietMove)
             {
-                td->history_moves[get_move_piece(move)][get_move_target(move)] += depth;
+                update_quiet_history(td, move, depth);
             }
 
             alpha = score;
@@ -356,14 +476,21 @@ full_search:
             {
                 tt->store(pos, depth, beta, BOUND_LOWER, bestMove);
 
-                // killer move
-                if (get_is_capture_move(move) == 0)
+                // quiet move ordering updates
+                if (quietMove)
                 {
                     td->killer_moves[1][pos->ply] = td->killer_moves[0][pos->ply];
                     td->killer_moves[0][pos->ply] = move;
+                    update_counter_move(td, pos->ply, move);
+                    penalize_quiet_history(td, failed_quiet_moves, depth);
                 }
                 return beta;
             }
+        }
+
+        if (quietMove && score <= oldAlpha)
+        {
+            failed_quiet_moves.push_back(move);
         }
     } // end of move loop
 
@@ -386,7 +513,7 @@ full_search:
 int quiescence(thrawn::Position* pos, ThreadData* td,
                int alpha, int beta)
 {
-    if ((td->nodes & 2047) == 0)
+    if (td->thread_id == 0 && (td->nodes & 2047) == 0)
     {
         communicate();
     }
@@ -394,38 +521,55 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     td->nodes++;
     total_nodes.fetch_add(1, std::memory_order_relaxed);
 
+    const bool inCheck = is_square_under_attack(
+        pos,
+        (pos->colour_to_move == white)
+            ? get_lsb_index(pos->piece_bitboards[K])
+            : get_lsb_index(pos->piece_bitboards[k]),
+        pos->colour_to_move ^ 1
+    );
+
     // safety check for array bounds
-    if (pos->ply > MAX_DEPTH-1)
+    if (pos->ply >= MAX_DEPTH - 1)
     {
-        return evaluate(pos);
+        return inCheck ? -mateVal + pos->ply : evaluate(pos);
     }
 
-    int evaluation = evaluate(pos);
+    if (!inCheck)
+    {
+        int evaluation = evaluate(pos);
 
-    // fail-hard beta cutoff
-    if (evaluation >= beta)
-        return beta; // fails high
+        // fail-hard beta cutoff
+        if (evaluation >= beta)
+            return beta; // fails high
 
-    // found better move
-    if (evaluation > alpha)
-        alpha = evaluation; // principal variation PV node (best move)
+        // found better move
+        if (evaluation > alpha)
+            alpha = evaluation; // principal variation PV node (best move)
+    }
 
     std::vector<int> moves = generate_moves(pos);
     sort_moves(pos, td, moves, 0);
 
+    int valid_moves = 0;
+
     for (int move : moves)
     {
+        const int parentPly = pos->ply;
         copyBoard(pos);
         pos->ply++;
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
-        if (!make_move(pos, move, only_captures, pos->ply))
+        const int move_type = inCheck ? all_moves : only_captures;
+        if (!make_move(pos, move, move_type, pos->ply))
         {
             pos->ply--;
             pos->repetition_index--;
             continue;
         }
+        valid_moves++;
+        td->ply_moves[parentPly] = move;
 
         int score = -quiescence(pos, td, -beta, -alpha);
 
@@ -433,7 +577,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         pos->repetition_index--;
         restoreBoard(pos);
 
-        if (stopped == 1)
+        if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
 
         // found better move
@@ -446,6 +590,9 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
                 return beta; // fails high
         }
     }
+
+    if (inCheck && valid_moves == 0)
+        return -mateVal + pos->ply;
 
     // move fails low (<= alpha)
     return alpha;
@@ -495,15 +642,18 @@ int score_move(thrawn::Position* pos, ThreadData* td, int move)
             return 9000;
         else if (td->killer_moves[1][pos->ply] == move)
             return 8000;
+        else if (is_counter_move(td, pos->ply, move))
+            return CounterMoveScore +
+                   std::clamp(history_score(td, move) / 64, -250, 250);
         else if (get_promoted_piece(move) == Q || get_promoted_piece(move) == q)
             return mvv_lva[get_move_piece(move)][get_move_target(move)] + 100;
         else
-            return td->history_moves[get_move_piece(move)][get_move_target(move)];
+            return std::clamp(history_score(td, move), -HistoryScoreCap, HistoryScoreCap);
     }
     return 0;
 }
 
-void score_pv(std::vector<int> &moves, ThreadData* td)
+void score_pv(thrawn::Position* pos, std::vector<int> &moves, ThreadData* td)
 {
     td->follow_pv_flag = false;
     for (int move : moves)
@@ -575,6 +725,6 @@ int isRepetition(thrawn::Position* pos)
 
 int futility_margin(int depth)
 {
-    int margins[4] = {0, 120, 200, 300};
+    static constexpr int margins[4] = {0, 120, 220, 360};
     return margins[depth];
 }

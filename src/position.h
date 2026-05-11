@@ -8,24 +8,31 @@
 
 namespace thrawn {
 
-// Latest trainer export: a768_dual_v1, version 3.
-constexpr int NNUE_INPUT_FEATURES = 768;
-constexpr int NNUE_ACCUMULATOR_SIZE = 256;
-constexpr int NNUE_HIDDEN_SIZE = 32;
-constexpr int NNUE_OUTPUT_BUCKETS = 8;
+// Latest trainer export: halfkp_v1, version 7.
+constexpr int NNUE_INPUT_FEATURES = 40960;
+constexpr int NNUE_FACTOR_FEATURES = 640;
+constexpr int NNUE_MAX_ACTIVE_FEATURES = 30;
+constexpr int NNUE_ACCUMULATOR_SIZE = 1024;
+constexpr int NNUE_L1_SIZE = 256;
+constexpr int NNUE_L2_SIZE = 64;
+constexpr int NNUE_HIDDEN_SIZE = NNUE_L1_SIZE; // legacy alias
+constexpr int NNUE_OUTPUT_BUCKETS = 1;         // legacy alias
 constexpr int NNUE_FT_SIZE = NNUE_ACCUMULATOR_SIZE;
 constexpr int NNUE_MAX_PIECES = 32;
 constexpr int NNUE_SIMD_ALIGNMENT = 64;
 
 static_assert(NNUE_ACCUMULATOR_SIZE % 8 == 0, "NNUE accumulator must fit NEON lanes");
+static_assert(NNUE_ACCUMULATOR_SIZE % 16 == 0, "NNUE accumulator must fit AVX2 lanes");
 
-struct NnueState {
+struct alignas(NNUE_SIMD_ALIGNMENT) NnueState {
     alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> white_acc{};
     alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> black_acc{};
     std::array<uint8_t, NNUE_MAX_PIECES> piece_list{};
     std::array<uint8_t, NNUE_MAX_PIECES> square_list{};
     std::array<int8_t, BOARD_SIZE> index_by_square{};
     uint8_t piece_count = 0;
+    int8_t white_king_sq = -1;
+    int8_t black_king_sq = -1;
     bool valid = false;
 
     NnueState() {
