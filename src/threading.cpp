@@ -9,11 +9,24 @@
 #include <iostream>
 #include <atomic>
 #include <algorithm>
+#include <cstdint>
 
-static int globalSearchStartTime = 0;
+static std::int64_t globalSearchStartTime = 0;
+
+static int uci_mate_score(int score) {
+    if (score >= mateScore) {
+        return (mateVal - score + 1) / 2;
+    }
+
+    if (score <= -mateScore) {
+        return -((mateVal + score) / 2);
+    }
+
+    return 0;
+}
 
 RootMove::RootMove()
-    : move(0), score(-INFINITY), depth(0), pv_length(0), completed(false)
+    : move(0), score(-INFINITY), depth(0), bound(BOUND_NONE), pv_length(0), completed(false)
 {
     pv.fill(0);
 }
@@ -50,6 +63,7 @@ ThreadData::ThreadData() {
     thread_id = 0;
     final_depth = 0;
     final_score = 0;
+    final_bound = BOUND_NONE;
     root_moves.clear();
     iteration_root_moves.clear();
 }
@@ -78,11 +92,12 @@ void ThreadData::resetThreadData() {
     thread_id = 0;
     final_depth = 0;
     final_score = 0;
+    final_bound = BOUND_NONE;
     root_moves.clear();
     iteration_root_moves.clear();
 }
 
-void ThreadData::recordRootMove(int move, int score, int depth) {
+void ThreadData::recordRootMove(int move, int score, int depth, int bound) {
     RootMove* entry = nullptr;
     for (RootMove& rootMove : iteration_root_moves) {
         if (rootMove.move == move) {
@@ -99,6 +114,7 @@ void ThreadData::recordRootMove(int move, int score, int depth) {
 
     entry->score = score;
     entry->depth = depth;
+    entry->bound = bound;
     entry->completed = true;
     entry->pv.fill(0);
     entry->pv[0] = move;
@@ -135,16 +151,14 @@ static void print_result_info(const SearchResult& result) {
     if (!result.has_move)
         return;
 
-    int currentTime = get_time_ms() - globalSearchStartTime;
+    const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
     std::cout << "info depth " << result.depth
               << " nodes " << total_nodes.load(std::memory_order_relaxed)
               << " time " << currentTime
               << " score ";
 
-    if (result.score > mateScore) {
-        std::cout << "mate " << (mateVal - result.score) / 2 + 1;
-    } else if (result.score < -mateScore) {
-        std::cout << "mate " << -(result.score + mateVal) / 2 - 1;
+    if (result.score >= mateScore || result.score <= -mateScore) {
+        std::cout << "mate " << uci_mate_score(result.score);
     } else {
         std::cout << "cp " << result.score;
     }
@@ -256,23 +270,33 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         td->final_depth = curr_depth;
         td->final_score = score;
         td->root_moves = td->iteration_root_moves;
+        td->final_bound = BOUND_NONE;
+
+        if (td->pv_length[0] > 0) {
+            const int pvMove = td->pv_table[0][0];
+            for (const RootMove& rootMove : td->root_moves) {
+                if (rootMove.completed && rootMove.move == pvMove) {
+                    td->final_bound = rootMove.bound;
+                    break;
+                }
+            }
+
+            if (td->final_bound == BOUND_NONE)
+                td->final_bound = BOUND_EXACT;
+        }
         
         // print an info line from the master thread (thread 0)
         if (threadID == 0)
         {   
-            int currentTime = get_time_ms() - globalSearchStartTime;
+            const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
             std::cout << "info depth " << curr_depth
                       << " nodes " << total_nodes.load(std::memory_order_relaxed)
                       << " time " << currentTime;
             
             // Determine whether to report a mate score or a centipawn score
-            if (score > -mateVal && score < -mateScore)
+            if (score >= mateScore || score <= -mateScore)
             {
-                std::cout << " score mate " << -(score + mateVal) / 2 - 1;
-            }
-            else if (score > mateScore && score < mateVal)
-            {
-                std::cout << " score mate " << (mateVal - score) / 2 + 1;
+                std::cout << " score mate " << uci_mate_score(score);
             }
             else
             {
@@ -381,55 +405,68 @@ SearchResult select_best_thread(ThreadData threadDatas[], int numThreads) {
     SearchResult result;
     std::vector<MoveVote> moveVotes;
     int worstScore = INFINITY;
-    bool foundRootMove = false;
+    bool foundCandidate = false;
+    bool exactResultAvailable = false;
 
     for (int i = 0; i < numThreads; i++) {
-        if (threadDatas[i].final_depth <= 0)
+        if (threadDatas[i].final_depth <= 0 || threadDatas[i].pv_length[0] <= 0 ||
+            threadDatas[i].pv_table[0][0] == 0)
             continue;
 
-        for (const RootMove& rootMove : threadDatas[i].root_moves) {
-            if (!rootMove.completed || rootMove.move == 0)
-                continue;
-            worstScore = std::min(worstScore, rootMove.score);
-            foundRootMove = true;
-        }
+        if (threadDatas[i].final_bound == BOUND_EXACT)
+            exactResultAvailable = true;
     }
 
-    if (foundRootMove) {
+    for (int i = 0; i < numThreads; i++) {
+        if (threadDatas[i].final_depth <= 0 || threadDatas[i].pv_length[0] <= 0 ||
+            threadDatas[i].pv_table[0][0] == 0)
+            continue;
+
+        if (exactResultAvailable && threadDatas[i].final_bound != BOUND_EXACT)
+            continue;
+
+        worstScore = std::min(worstScore, threadDatas[i].final_score);
+        foundCandidate = true;
+    }
+
+    if (foundCandidate) {
         for (int i = 0; i < numThreads; i++) {
-            if (threadDatas[i].final_depth <= 0)
+            if (threadDatas[i].final_depth <= 0 || threadDatas[i].pv_length[0] <= 0)
                 continue;
 
-            for (const RootMove& rootMove : threadDatas[i].root_moves) {
-                if (!rootMove.completed || rootMove.move == 0)
-                    continue;
+            const int move = threadDatas[i].pv_table[0][0];
+            if (move == 0)
+                continue;
 
-                MoveVote* vote = nullptr;
-                for (MoveVote& existing : moveVotes) {
-                    if (existing.move == rootMove.move) {
-                        vote = &existing;
-                        break;
-                    }
+            if (exactResultAvailable && threadDatas[i].final_bound != BOUND_EXACT)
+                continue;
+
+            MoveVote* vote = nullptr;
+            for (MoveVote& existing : moveVotes) {
+                if (existing.move == move) {
+                    vote = &existing;
+                    break;
                 }
+            }
 
-                if (vote == nullptr) {
-                    moveVotes.emplace_back();
-                    vote = &moveVotes.back();
-                    vote->move = rootMove.move;
-                    vote->pv.fill(0);
-                }
+            if (vote == nullptr) {
+                moveVotes.emplace_back();
+                vote = &moveVotes.back();
+                vote->move = move;
+                vote->pv.fill(0);
+            }
 
-                const int scoreGap = std::max(1, rootMove.score - worstScore + 14);
-                vote->votes += static_cast<long long>(std::max(1, rootMove.depth)) * scoreGap;
+            const int scoreGap = std::max(1, threadDatas[i].final_score - worstScore + 14);
+            vote->votes += static_cast<long long>(std::max(1, threadDatas[i].final_depth)) * scoreGap;
 
-                if (rootMove.depth > vote->best_depth ||
-                    (rootMove.depth == vote->best_depth && rootMove.score > vote->best_score)) {
-                    vote->best_score = rootMove.score;
-                    vote->best_depth = rootMove.depth;
-                    vote->thread_id = i;
-                    vote->pv_length = rootMove.pv_length;
-                    vote->pv = rootMove.pv;
-                }
+            if (threadDatas[i].final_depth > vote->best_depth ||
+                (threadDatas[i].final_depth == vote->best_depth &&
+                 threadDatas[i].final_score > vote->best_score)) {
+                vote->best_score = threadDatas[i].final_score;
+                vote->best_depth = threadDatas[i].final_depth;
+                vote->thread_id = i;
+                vote->pv_length = threadDatas[i].pv_length[0];
+                vote->pv = threadDatas[i].pv_table[0];
             }
         }
 
@@ -459,6 +496,9 @@ SearchResult select_best_thread(ThreadData threadDatas[], int numThreads) {
 
     for (int i = 0; i < numThreads; i++) {
         if (threadDatas[i].final_depth <= 0 || threadDatas[i].pv_length[0] <= 0)
+            continue;
+
+        if (exactResultAvailable && threadDatas[i].final_bound != BOUND_EXACT)
             continue;
 
         if (!result.has_move ||

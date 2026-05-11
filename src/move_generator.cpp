@@ -681,7 +681,7 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply)
     
     else if (move_type == only_captures)
     {
-        if (get_is_capture_move(move)) {
+        if (get_is_capture_move(move) || get_promoted_piece(move)) {
             return make_move(pos, move, all_moves, ply);
         }
         else    

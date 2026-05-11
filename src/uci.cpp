@@ -21,6 +21,8 @@
 #include <atomic>
 #include <unistd.h>
 #include <stdio.h>
+#include <algorithm>
+#include <cstdint>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -51,10 +53,10 @@ int uci_time = -1;
 int inc = 0;
 
 // UCI "starttime" command time holder
-int starttime = 0;
+std::int64_t starttime = 0;
 
 // UCI "stoptime" command time holder
-int stoptime = 0;
+std::int64_t stoptime = 0;
 
 // variable to flag time control availability
 int timeset = 0;
@@ -260,7 +262,7 @@ static void uci_verify_nnue_search(const char* command, thrawn::Position* pos) {
 /*
 TIME CONTROL
 */
-int get_time_ms() {
+std::int64_t get_time_ms() {
     return chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
 }
 
@@ -371,13 +373,7 @@ int uci_parse_move(thrawn::Position* pos, const char *move_str)
 
             if (promoted_piece)
             {
-                if ((promoted_piece == Q || promoted_piece == q) && move_str[4] == 'q')
-                    return move;
-                else if ((promoted_piece == R || promoted_piece == r) && move_str[4] == 'r')
-                    return move;
-                else if ((promoted_piece == N || promoted_piece == n) && move_str[4] == 'b')
-                    return move;
-                else if ((promoted_piece == B || promoted_piece == b) && move_str[4] == 'n')
+                if (move_str[4] == promoted_pieces.at(promoted_piece))
                     return move;
                 continue;
             }
@@ -393,7 +389,6 @@ int uci_parse_move(thrawn::Position* pos, const char *move_str)
 
 void uci_parse_position(thrawn::Position* pos, const char *command) {
     // Create a non-const pointer for manipulation
-    cout<<command<<endl;
     const char *non_const_command = command;
 
     non_const_command += 9; // shift index to skip 'position' in command
@@ -521,18 +516,26 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
         // Set the timeset flag
         timeset = 1;
 
-        // Set up timing
-        uci_time /= movestogo;
-        uci_time -= 50; // lag compensation 
+        constexpr int moveOverheadMs = 100;
+        constexpr int incrementPercent = 75;
 
-        if (uci_time < 0)
-        {
-            uci_time = 0;
-            inc -= 50;
-            if (inc<0) 
-                inc = 1;
+        const int remainingTime = std::max(0, uci_time);
+        const int movesToGo = std::max(1, movestogo);
+        int allocatedTime = 0;
+
+        if (movetime != -1) {
+            allocatedTime = std::max(1, movetime - moveOverheadMs);
+        } else {
+            allocatedTime = remainingTime / movesToGo;
+            allocatedTime += inc * incrementPercent / 100;
+            allocatedTime -= moveOverheadMs;
+
+            const int maxSafeTime = std::max(1, remainingTime - moveOverheadMs);
+            allocatedTime = std::clamp(allocatedTime, 1, maxSafeTime);
         }
-        stoptime = starttime + uci_time + inc;
+
+        uci_time = allocatedTime;
+        stoptime = starttime + allocatedTime;
     }
 
     // If depth is not available, set depth to 64 plies
@@ -541,8 +544,9 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
     }
 
     // Print debug info
-    std::cout << "time:" << uci_time << " start:" << static_cast<unsigned int>(starttime) << " stop:" << static_cast<unsigned int>(stoptime)
-              << " depth:" << depth << " timeset:" << timeset << std::endl;
+    std::cout << "info string time " << uci_time << " start " << starttime
+              << " stop " << stoptime << " depth " << depth
+              << " timeset " << timeset << std::endl;
 
     std::cout << "info depth 0 nodes 0 time 0 score cp 0 pv none"<<endl;
     search_position_threaded(pos, depth, numThreads);  
@@ -573,7 +577,7 @@ void uci_loop(thrawn::Position* pos)
         
         // get user / GUI input
         if (!fgets(input, INPUT_BUFFER, stdin))
-            continue;
+            break;
         
         // make sure input is available
         if (input[0] == '\n')
@@ -589,7 +593,6 @@ void uci_loop(thrawn::Position* pos)
         // parse UCI "position" command
         else if (strncmp(input, "position", 8) == 0)
         {
-            tt->reset();
             uci_parse_position(pos, input);
         }
 
@@ -616,7 +619,7 @@ void uci_loop(thrawn::Position* pos)
             // print engine info
             cout << "id name Thrawn"<< version << "\n";
             cout << "id author Feiyu Lin\n";
-            cout << "option name Hash type spin default 256 min 4 max 1024" << max_hashmap_size << "\n";
+            cout << "option name Hash type spin default 256 min 4 max " << max_hashmap_size << "\n";
             cout << "option name Threads type spin default 4 min 1 max 16" << "\n";
             cout << "option name EvalFile type string default model.nnue" << "\n";
             cout << "uciok\n";

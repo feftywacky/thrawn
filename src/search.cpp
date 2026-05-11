@@ -142,6 +142,17 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     int hashFlag = BOUND_UPPER;
     int static_eval = 0;
 
+    if (stopped.load(std::memory_order_relaxed) == 1)
+        return alpha;
+
+    // Only the main worker consumes stdin; helpers just observe the shared stop flag.
+    if (td->thread_id == 0 && (td->nodes & 2047) == 0)
+    {
+        communicate();
+        if (stopped.load(std::memory_order_relaxed) == 1)
+            return alpha;
+    }
+
     // Keep PV and move-ordering arrays inside their fixed search horizon.
     if (pos->ply >= MAX_DEPTH - 1)
     {
@@ -181,12 +192,6 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         //     ttScore <= alpha &&
         //     ttScore + 141 <= alpha)
         //     return alpha;
-    }
-
-    // For periodic UCI output / time check
-    if (td->thread_id == 0 && (td->nodes & 2047) == 0)
-    {
-        communicate();
     }
 
     // 5) Increment node counter
@@ -445,11 +450,14 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
 
-        if (pos->ply == 0)
-            td->recordRootMove(move, score, depth);
-
         // Check if this move improved alpha
         const int oldAlpha = alpha;
+        if (pos->ply == 0) {
+            const int rootBound = score > oldAlpha ? (score >= beta ? BOUND_LOWER : BOUND_EXACT)
+                                                   : BOUND_UPPER;
+            td->recordRootMove(move, score, depth, rootBound);
+        }
+
         if (score > alpha)
         {
             bestMove = move;
@@ -469,7 +477,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             {
                 td->pv_table[pos->ply][nextPly] = td->pv_table[pos->ply + 1][nextPly];
             }
-            td->pv_length[pos->ply] = td->pv_length[pos->ply + 1];
+            td->pv_length[pos->ply] = std::max(td->pv_length[pos->ply + 1], pos->ply + 1);
 
             // Fail-hard beta cutoff
             if (alpha >= beta)
@@ -513,9 +521,14 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
 int quiescence(thrawn::Position* pos, ThreadData* td,
                int alpha, int beta)
 {
+    if (stopped.load(std::memory_order_relaxed) == 1)
+        return alpha;
+
     if (td->thread_id == 0 && (td->nodes & 2047) == 0)
     {
         communicate();
+        if (stopped.load(std::memory_order_relaxed) == 1)
+            return alpha;
     }
 
     td->nodes++;

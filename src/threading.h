@@ -12,6 +12,7 @@ struct RootMove {
     int move;
     int score;
     int depth;
+    int bound;
     int pv_length;
     bool completed;
     std::array<int, MAX_DEPTH> pv;
@@ -41,6 +42,7 @@ public:
     int thread_id;
     int final_depth;
     int final_score;
+    int final_bound;
     std::vector<RootMove> root_moves;
     std::vector<RootMove> iteration_root_moves;
 
@@ -50,7 +52,7 @@ public:
     // Reset the thread data between searches.
     void resetThreadData();
 
-    void recordRootMove(int move, int score, int depth);
+    void recordRootMove(int move, int score, int depth, int bound);
 };
 
 void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth);

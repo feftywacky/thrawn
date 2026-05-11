@@ -2,6 +2,7 @@
 #define UCI_H
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include "position.h"
 
@@ -12,8 +13,8 @@ extern int movestogo;
 extern int movetime;
 extern int uci_time;
 extern int inc;
-extern int starttime;
-extern int stoptime;
+extern std::int64_t starttime;
+extern std::int64_t stoptime;
 extern int timeset;
 extern std::atomic<int> stopped;
 extern int numThreads;
@@ -33,7 +34,7 @@ int input_waiting();
 
 void read_input();
 
-int get_time_ms();
+std::int64_t get_time_ms();
 
 void communicate();
 
