@@ -203,7 +203,8 @@ static bool uci_nnue_verify_recursive(thrawn::Position* pos,
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
-        if (!make_move(pos, move, all_moves, pos->ply)) {
+        if (!make_move_on_board(pos, move, all_moves, pos->ply)) {
+            restoreBoard(pos);
             pos->ply--;
             pos->repetition_index--;
             continue;
@@ -305,16 +306,19 @@ void read_input() {
 
     // "Listen" to STDIN
     if (input_waiting()) {
-        // cout<<"input waiting"<<"\n";
-        stopped.store(1, std::memory_order_relaxed);
-
         // Loop to read bytes from STDIN
         do {
-            bytes = read(fileno(stdin), input, 256);
+            bytes = read(fileno(stdin), input, sizeof(input) - 1);
         }
 
         // Until bytes are available
         while (bytes < 0);
+
+        if (bytes <= 0) {
+            return;
+        }
+
+        input[bytes] = '\0';
 
         // Searches for the first occurrence of '\n'
         endc = strchr(input, '\n');
@@ -323,7 +327,7 @@ void read_input() {
         if (endc)
             *endc = 0;
 
-        // If input is available
+        // If input is available, stop only for explicit UCI stop commands.
         if (strlen(input) > 0) {
             // Match UCI "quit" command
             if (!strncmp(input, "quit", 4)) {
@@ -516,10 +520,10 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
         // Set the timeset flag
         timeset = 1;
 
-        constexpr int moveOverheadMs = 100;
+        const int remainingTime = std::max(0, uci_time);
+        const int moveOverheadMs = std::clamp(remainingTime / 20, 1, 100);
         constexpr int incrementPercent = 75;
 
-        const int remainingTime = std::max(0, uci_time);
         const int movesToGo = std::max(1, movestogo);
         int allocatedTime = 0;
 

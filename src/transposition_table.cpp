@@ -1,9 +1,36 @@
 #include "transposition_table.h"
 #include "constants.h"
+#include <algorithm>
 #include <iostream>
 
+namespace {
+constexpr int TTClusterSize = 4;
+
+int relative_age(int currentAge, int entryAge) {
+    return std::max(0, currentAge - entryAge);
+}
+
+int packed_depth(uint64_t data) {
+    return static_cast<int>((data >> 24) & 0xFFFFULL);
+}
+
+int packed_flag(uint64_t data) {
+    return static_cast<int>((data >> 57) & 0x3ULL);
+}
+
+int replacement_value(uint64_t data, int entryAge, int currentAge) {
+    if (data == 0) {
+        return -1000000;
+    }
+
+    const int flag = packed_flag(data);
+    const int exactBonus = flag == BOUND_EXACT ? 2 : 0;
+    return packed_depth(data) + exactBonus - 8 * relative_age(currentAge, entryAge);
+}
+} // namespace
+
 TranspositionTable::TranspositionTable()
-    : table(nullptr), numEntries(0), currentAge(0)
+    : table(nullptr), numEntries(0), numClusters(0), currentAge(0)
 {
 }
 
@@ -18,7 +45,8 @@ TranspositionTable::~TranspositionTable()
 void TranspositionTable::initTable(int mb)
 {
     int bytes = mb * 0x100000;  // Convert MB to bytes
-    numEntries = bytes / sizeof(TTEntry);
+    numEntries = (bytes / sizeof(TTEntry) / TTClusterSize) * TTClusterSize;
+    numClusters = numEntries / TTClusterSize;
 
     if (table) {
         delete[] table;
@@ -51,71 +79,87 @@ void TranspositionTable::reset()
 
 bool TranspositionTable::probe(const thrawn::Position* pos, int& depth, int alpha, int beta, int& bestMove, int& score, int& flag)
 {
-    if (!table || numEntries <= 0)
+    if (!table || numClusters <= 0)
         return false;
 
-    int index = static_cast<int>(pos->zobristKey % numEntries);
+    int index = static_cast<int>((pos->zobristKey % numClusters) * TTClusterSize);
 
-    const TTEntry& entry = table[index];
-    const uint64_t entry_key = entry.smp_key.load(std::memory_order_relaxed);
-    const uint64_t entry_data = entry.smp_data.load(std::memory_order_relaxed);
-
-    uint64_t test_key = pos->zobristKey ^ entry_data;
-
-    if(test_key == entry_key)
+    for (int i = 0; i < TTClusterSize; i++)
     {
-        depth = extractTTDepth(entry_data);
-        bestMove = extractTTBestMove(entry_data);
-        flag = extractTTHashFlag(entry_data);
-        
-        score = extractTTScore(entry_data);
-        // adjusted mate
-        if (score < -mateScore)
-            score += pos->ply;
-        if (score > mateScore) 
-            score -= pos->ply;
+        const TTEntry& entry = table[index + i];
+        const uint64_t entry_key = entry.smp_key.load(std::memory_order_relaxed);
+        const uint64_t entry_data = entry.smp_data.load(std::memory_order_relaxed);
 
-        // if (entry_hash_flag == BOUND_EXACT) // pv node
-        //     return score;
-        // if (entry_hash_flag == BOUND_LOWER && score <= alpha) // fail-low score
-        //     return alpha;
-        // if (entry_hash_flag == BOUND_UPPER && score >= beta) // fail-high score
-        //     return beta;
+        uint64_t test_key = pos->zobristKey ^ entry_data;
 
-        return true;
+        if(test_key == entry_key)
+        {
+            depth = extractTTDepth(entry_data);
+            bestMove = extractTTBestMove(entry_data);
+            flag = extractTTHashFlag(entry_data);
+            
+            score = extractTTScore(entry_data);
+            // adjusted mate
+            if (score < -mateScore)
+                score += pos->ply;
+            if (score > mateScore) 
+                score -= pos->ply;
+
+            // if (entry_hash_flag == BOUND_EXACT) // pv node
+            //     return score;
+            // if (entry_hash_flag == BOUND_LOWER && score <= alpha) // fail-low score
+            //     return alpha;
+            // if (entry_hash_flag == BOUND_UPPER && score >= beta) // fail-high score
+            //     return beta;
+
+            return true;
+        }
     }
     return false;
 }
 
 void TranspositionTable::store(const thrawn::Position* pos, int depth, int score, int flag, int bestMove)
 {
-    if (!table || numEntries <= 0)
+    if (!table || numClusters <= 0)
         return;
 
-    int index = static_cast<int>(pos->zobristKey % numEntries);
-    TTEntry &entry = table[index];
-    const uint64_t old_data = entry.smp_data.load(std::memory_order_relaxed);
-    const uint64_t old_key = entry.smp_key.load(std::memory_order_relaxed);
+    int index = static_cast<int>((pos->zobristKey % numClusters) * TTClusterSize);
+    TTEntry* replace = &table[index];
+    uint64_t replace_data = replace->smp_data.load(std::memory_order_relaxed);
+    const int current = currentAge.load(std::memory_order_relaxed);
+    int worst_value = 1000000;
+    bool replacingSamePosition = false;
 
-    // bool shouldReplace = false;
-    // if (entry.smp_data == 0)
-    // {
-    //     shouldReplace = true;
-    // }
-    // else
-    // {
-    //     if (currentAge > entry.age)
-    //         shouldReplace = true;
-    //     else if ( depth >= extractTTDepth(entry.smp_data))
-    //         shouldReplace = true;
-    // }
+    for (int i = 0; i < TTClusterSize; i++)
+    {
+        TTEntry& candidate = table[index + i];
+        const uint64_t old_data = candidate.smp_data.load(std::memory_order_relaxed);
+        const uint64_t old_key = candidate.smp_key.load(std::memory_order_relaxed);
+        const bool samePosition = old_data != 0 && (old_data ^ old_key) == pos->zobristKey;
 
-    // if (!shouldReplace)
-    //     return;
+        if (samePosition)
+        {
+            if (flag != BOUND_EXACT && depth < extractTTDepth(old_data) - 2)
+                return;
 
-    // Don't overwrite an entry from the same position (a collision has occured and the stored entry is the same as current position), unless we have
-    // an exact bound or depth that is nearly as good as the old one
-    if(old_data!=0 && (old_data^old_key)==pos->zobristKey && flag!=BOUND_EXACT && depth < extractTTDepth(old_data)-2)
+            replace = &candidate;
+            replace_data = old_data;
+            replacingSamePosition = true;
+            break;
+        }
+
+        const int value = replacement_value(old_data,
+                                            candidate.age.load(std::memory_order_relaxed),
+                                            current);
+        if (value < worst_value)
+        {
+            worst_value = value;
+            replace = &candidate;
+            replace_data = old_data;
+        }
+    }
+
+    if (!replacingSamePosition && replace_data != 0 && flag != BOUND_EXACT && worst_value > depth + 2)
         return;
 
     // Adjust mate scores consistently:
@@ -127,9 +171,9 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
     uint64_t data = encodeTTData(bestMove, depth, score, flag);
     uint64_t key = pos->zobristKey ^ data;
     
-    entry.smp_data.store(data, std::memory_order_relaxed);
-    entry.smp_key.store(key, std::memory_order_relaxed);
-    entry.age.store(currentAge.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    replace->smp_data.store(data, std::memory_order_relaxed);
+    replace->smp_key.store(key, std::memory_order_relaxed);
+    replace->age.store(current, std::memory_order_relaxed);
 }
 
 // bit allocations:

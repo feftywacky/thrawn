@@ -55,6 +55,7 @@ public:
 private:
     TTEntry* table;      // Array of TT entries.
     int      numEntries; // Number of entries in the table.
+    int      numClusters;
     std::atomic<int> currentAge; // Current age, updated once per search.
 };
 

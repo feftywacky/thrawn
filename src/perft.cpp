@@ -39,8 +39,9 @@ void perft_search(thrawn::Position* pos, int depth) {
     for (int move : moves) {
         copyBoard(pos);
         pos->ply++;
-        if (!make_move(pos, move, all_moves, pos->ply))
+        if (!make_move_on_board(pos, move, all_moves, pos->ply))
         {
+            restoreBoard(pos);
             pos->ply--;
             continue;
         }
@@ -63,8 +64,9 @@ int perft_test(thrawn::Position* pos, int depth) {
     for (int move : moves) {
         copyBoard(pos);
         pos->ply++;
-        if (!make_move(pos, move, all_moves, pos->ply))
+        if (!make_move_on_board(pos, move, all_moves, pos->ply))
         {
+            restoreBoard(pos);
             pos->ply--;
             continue;
         }

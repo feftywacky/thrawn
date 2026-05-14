@@ -6,6 +6,8 @@
 #include "zobrist_hashing.h"
 #include "search.h"
 #include "position.h"
+#include <algorithm>
+#include <cstdlib>
 #include <string>
 
 using namespace std;
@@ -117,6 +119,16 @@ void parse_fen(thrawn::Position* pos, const char* fen)
     }
     else
         pos->enpassant = null_sq;
+
+    while (*fen && *fen != ' ')
+        fen++;
+
+    if (*fen == ' ')
+    {
+        fen++;
+        if (*fen >= '0' && *fen <= '9')
+            pos->fifty_move = std::max(0, std::atoi(fen));
+    }
     
     // setting white, black, and both occupancies
     pos->occupancies[0] = get_white_occupancy(pos);
