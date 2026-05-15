@@ -173,7 +173,7 @@ bool looks_like_absolute_path(const std::string& path) {
 std::vector<std::string> candidate_paths(const std::string& requested_path) {
     std::string path = trim_copy(requested_path);
     if (path.empty()) {
-        path = "model.nnue";
+        path = "model_v4.nnue";
     }
 
     std::vector<std::string> candidates{path};

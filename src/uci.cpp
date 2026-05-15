@@ -65,7 +65,7 @@ int timeset = 0;
 std::atomic<int> stopped{0};
 
 // Number of threads use for search
-int numThreads = 4;
+int numThreads = 1;
 
 static std::string trim_option_value(const char* value) {
     if (value == nullptr) {
@@ -625,7 +625,7 @@ void uci_loop(thrawn::Position* pos)
             cout << "id author Feiyu Lin\n";
             cout << "option name Hash type spin default 256 min 4 max " << max_hashmap_size << "\n";
             cout << "option name Threads type spin default 4 min 1 max 16" << "\n";
-            cout << "option name EvalFile type string default model.nnue" << "\n";
+            cout << "option name EvalFile type string default model_v4.nnue" << "\n";
             cout << "uciok\n";
         }
         
@@ -654,7 +654,7 @@ void uci_loop(thrawn::Position* pos)
         else if (!strncmp(input, "setoption name EvalFile value ", 30)) {
             std::string path = trim_option_value(input + 30);
             if (path.empty()) {
-                path = "model.nnue";
+                path = "model_v4.nnue";
             }
             nnue_init(path.c_str());
             nnue_refresh_root(pos);
