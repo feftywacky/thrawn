@@ -6,8 +6,6 @@
 #include <string>
 #include "position.h"
 
-using namespace std;
-
 extern std::atomic<int> quit;
 extern int movestogo;
 extern int movetime;

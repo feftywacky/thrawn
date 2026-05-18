@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "uci.h"
 #include "move_generator.h"
 #include "move_helpers.h"
@@ -24,9 +27,7 @@
 #include <stdio.h>
 #include <algorithm>
 #include <cstdint>
-#ifdef _WIN32
-#include <windows.h>
-#else
+#ifndef _WIN32
 #include <termios.h>
 #include <sys/ioctl.h>
 #endif
