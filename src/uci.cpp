@@ -11,6 +11,7 @@
 #include "misc.h"
 #include "globals.h"
 #include "nnue.h"
+#include "search_params.h"
 #include <stdlib.h>
 #include <vector>
 #include <cstring>
@@ -84,6 +85,46 @@ static std::string trim_option_value(const char* value) {
     }
 
     return text.substr(start, end - start);
+}
+
+static bool parse_uci_setoption(const char* command,
+                                std::string& name,
+                                std::string& value) {
+    const std::string text = trim_option_value(command);
+    const std::string prefix = "setoption name ";
+    if (text.rfind(prefix, 0) != 0) {
+        return false;
+    }
+
+    const std::string rest = text.substr(prefix.size());
+    const std::string value_marker = " value ";
+    const std::size_t value_pos = rest.find(value_marker);
+
+    if (value_pos == std::string::npos) {
+        name = trim_option_value(rest.c_str());
+        value.clear();
+    } else {
+        name = trim_option_value(rest.substr(0, value_pos).c_str());
+        value = trim_option_value(rest.substr(value_pos + value_marker.size()).c_str());
+    }
+
+    return !name.empty();
+}
+
+static bool option_name_equals(const std::string& lhs, const char* rhs) {
+    std::size_t rhs_len = std::strlen(rhs);
+    if (lhs.size() != rhs_len) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < lhs.size(); i++) {
+        if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
+            std::tolower(static_cast<unsigned char>(rhs[i]))) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static void uci_report_raw_nnue(const char* command) {
@@ -625,39 +666,61 @@ void uci_loop(thrawn::Position* pos)
             cout << "id author Feiyu Lin\n";
             cout << "option name Hash type spin default 256 min 4 max " << max_hashmap_size << "\n";
             cout << "option name Threads type spin default 4 min 1 max 16" << "\n";
-            cout << "option name EvalFile type string default model_v4.nnue" << "\n";
+            cout << "option name EvalFile type string default model_v6.nnue" << "\n";
+            cout << "option name ResetSearchParams type button" << "\n";
+            for (const SearchParameterMeta& meta : search_parameter_metas()) {
+                cout << "option name " << meta.name
+                     << " type spin default " << meta.defaultValue
+                     << " min " << meta.minValue
+                     << " max " << meta.maxValue << "\n";
+            }
             cout << "uciok\n";
         }
         
-        else if (!strncmp(input, "setoption name Hash value ", 26)) {			
-            // init MB
-            sscanf(input,"%*s %*s %*s %*s %d", &mb);
-            
-            // adjust MB if going beyond the aloowed bounds
-            if(mb < 4) mb = 4;
-            if(mb > max_hashmap_size) mb = max_hashmap_size;
-            
-            // set hash table size in MB
-            std::cout << "    Set hash table size to " << mb << "MB\n";
-            tt->initTable(mb);
-        }
-
-        else if (!strncmp(input, "setoption name Threads value ", 29)) {
-            int t = 1;
-            sscanf(input, "%*s %*s %*s %*s %d", &t);
-            if (t < 1) t = 1;
-            if (t > 16) t = 16;
-            numThreads = t;
-            std::cout << "info string Set threads = " << numThreads << std::endl;
-        }
-
-        else if (!strncmp(input, "setoption name EvalFile value ", 30)) {
-            std::string path = trim_option_value(input + 30);
-            if (path.empty()) {
-                path = "model_v4.nnue";
+        else if (!strncmp(input, "setoption name ", 15)) {
+            std::string optionName;
+            std::string optionValue;
+            if (!parse_uci_setoption(input, optionName, optionValue)) {
+                std::cout << "info string Ignored malformed setoption command\n";
+                continue;
             }
-            nnue_init(path.c_str());
-            nnue_refresh_root(pos);
+
+            if (option_name_equals(optionName, "Hash")) {
+                mb = optionValue.empty() ? mb : std::atoi(optionValue.c_str());
+                if(mb < 4) mb = 4;
+                if(mb > max_hashmap_size) mb = max_hashmap_size;
+
+                std::cout << "info string Set hash table size to " << mb << "MB\n";
+                tt->initTable(mb);
+            }
+            else if (option_name_equals(optionName, "Threads")) {
+                int t = optionValue.empty() ? numThreads : std::atoi(optionValue.c_str());
+                if (t < 1) t = 1;
+                if (t > 16) t = 16;
+                numThreads = t;
+                std::cout << "info string Set threads = " << numThreads << std::endl;
+            }
+            else if (option_name_equals(optionName, "EvalFile")) {
+                std::string path = optionValue;
+                if (path.empty()) {
+                    path = "model_v6.nnue";
+                }
+                nnue_init(path.c_str());
+                nnue_refresh_root(pos);
+            }
+            else if (option_name_equals(optionName, "ResetSearchParams")) {
+                reset_search_parameters();
+                std::cout << "info string Reset search parameters\n";
+            }
+            else {
+                int appliedValue = 0;
+                if (set_search_parameter(optionName, std::atoi(optionValue.c_str()), &appliedValue)) {
+                    std::cout << "info string Set " << optionName << " = "
+                              << appliedValue << std::endl;
+                } else {
+                    std::cout << "info string Unknown option " << optionName << std::endl;
+                }
+            }
         }
 
         else if (strncmp(input, "nnuefenengine", 13) == 0)

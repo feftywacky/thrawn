@@ -5,6 +5,7 @@
 #include "move_helpers.h"
 #include "transposition_table.h"
 #include "globals.h"
+#include "search_params.h"
 #include <thread>
 #include <iostream>
 #include <atomic>
@@ -198,9 +199,11 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         
         td->follow_pv_flag = true;
 
-        //  for depths beyond WindowDepth, derive the window from the previous score
-        int delta = WindowSize + (threadID % 4) * 2;
-        if(curr_depth>=WindowDepth)
+        // For configured aspiration depths, derive the window from the previous score.
+        const int threadCycle = std::max(1, searchParams.aspirationThreadCycle);
+        int delta = searchParams.aspirationWindowSize +
+                    (threadID % threadCycle) * searchParams.aspirationThreadDelta;
+        if(curr_depth>=searchParams.aspirationWindowDepth)
         {
             // Use the previous iteration’s best score (final_score) to set the window.
             // Here we “clamp” alpha to at least –mateVal and beta to at most mateVal.
@@ -264,8 +267,8 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             break;
 
         // Update the aspiration window.
-        alpha = score - WindowSize;
-        beta = score + WindowSize;
+        alpha = score - searchParams.aspirationWindowSize;
+        beta = score + searchParams.aspirationWindowSize;
 
         td->final_depth = curr_depth;
         td->final_score = score;
@@ -456,7 +459,9 @@ SearchResult select_best_thread(ThreadData threadDatas[], int numThreads) {
                 vote->pv.fill(0);
             }
 
-            const int scoreGap = std::max(1, threadDatas[i].final_score - worstScore + 14);
+            const int scoreGap = std::max(1,
+                                          threadDatas[i].final_score - worstScore +
+                                              searchParams.smpVoteScoreOffset);
             vote->votes += static_cast<long long>(std::max(1, threadDatas[i].final_depth)) * scoreGap;
 
             if (threadDatas[i].final_depth > vote->best_depth ||

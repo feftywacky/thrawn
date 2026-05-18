@@ -11,8 +11,6 @@ using namespace std;
 // ----------------------------------------
 // Some constants used in the search
 // ----------------------------------------
-#define full_depth_moves 4
-#define reduction_limit 3
 #define INFINITY 50000
 #define mateVal 49000
 #define mateScore 48000

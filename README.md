@@ -51,6 +51,12 @@ g++ -std=c++17 -Ofast -flto -o Thrawn *.cpp
 ## Testing:
 Open source CLI tool to run matches between chess engines: https://github.com/Disservin/fastchess
 
+### Search constant tuning
+
+Thrawn exposes its search constants as UCI `Search*` spin options for local
+SPSA tuning. Use `--engine` to point the tuner at any engine executable. See
+[`tools/README.md`](tools/README.md) for the fastchess tuning harness.
+
 ## Evaluation:
 - Thrawn v2.0 and newer uses NNUE
 - Thrawn v1.1 uses handcrafted evaluation

@@ -19,12 +19,6 @@ some notes for negamax
 extern std::atomic<uint64_t> total_nodes;
 
 /*
- Late Move Reductions or pruning factors
-*/
-extern std::array<int, 4> LateMovePruning_factors;
-extern int RFP_factor;
-
-/*
  * Negamax & Quiescence:
  * Now they accept a reference to ThreadData (td),
  * which holds PV arrays, killer moves, history, etc.
@@ -56,9 +50,5 @@ void quicksort_moves(std::vector<int> &moves,
  */
 int futility_margin(int depth);
 int futility_move_count(int depth);
-
-// some search constants
-static const int WindowDepth   = 4;
-static const int WindowSize    = 24;
 
 #endif // SEARCH_H

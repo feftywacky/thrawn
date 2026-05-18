@@ -9,6 +9,7 @@
 #include "uci.h" // for 'stopped' and 'communicate()'
 #include "globals.h"
 #include "constants.h"
+#include "search_params.h"
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -25,14 +26,7 @@ some notes for negamax
 
 std::atomic<uint64_t> total_nodes(0);
 
-std::array<int, 4> LateMovePruning_factors = {0, 8, 12, 24};
-int RFP_factor = 110;
-
 namespace {
-
-constexpr int HistoryMax = 16384;
-constexpr int HistoryScoreCap = 6000;
-constexpr int CounterMoveScore = 7000;
 
 bool is_quiet_move(int move) {
     return !get_is_capture_move(move) && !get_promoted_piece(move);
@@ -43,25 +37,38 @@ bool is_mate_score(int score) {
 }
 
 int reverse_futility_margin(int depth) {
-    static constexpr int margins[] = {0, 160, 300};
-    if (depth >= 0 && depth < static_cast<int>(sizeof(margins) / sizeof(margins[0]))) {
-        return margins[depth];
+    if (depth <= 0) {
+        return 0;
     }
-    return RFP_factor * depth;
+    if (depth == 1) {
+        return searchParams.reverseFutilityMargin1;
+    }
+    if (depth == 2) {
+        return searchParams.reverseFutilityMargin2;
+    }
+    return searchParams.reverseFutilityDepthFactor * depth;
 }
 
 int razor_margin(int depth) {
-    static constexpr int margins[] = {0, 250, 450};
-    if (depth >= 0 && depth < static_cast<int>(sizeof(margins) / sizeof(margins[0]))) {
-        return margins[depth];
+    if (depth <= 0) {
+        return 0;
     }
-    return 600;
+    if (depth == 1) {
+        return searchParams.razorMargin1;
+    }
+    if (depth == 2) {
+        return searchParams.razorMargin2;
+    }
+    return searchParams.razorMarginDepthN;
 }
 
 int null_move_reduction(int depth, int static_eval, int beta) {
     const int eval_margin = std::max(0, static_eval - beta);
-    int reduction = 2 + depth / 6 + std::min(1, eval_margin / 400);
-    return std::min(reduction, depth - 1);
+    const int depth_divisor = std::max(1, searchParams.nullMoveDepthDivisor);
+    const int eval_divisor = std::max(1, searchParams.nullMoveEvalDivisor);
+    int reduction = searchParams.nullMoveBaseReduction + depth / depth_divisor;
+    reduction += std::min(searchParams.nullMoveEvalBonusMax, eval_margin / eval_divisor);
+    return std::clamp(reduction, 1, std::max(1, depth - 1));
 }
 
 int piece_value(int piece) {
@@ -226,12 +233,12 @@ int static_exchange_eval(thrawn::Position* pos, int move) {
 }
 
 bool qsearch_delta_prune(thrawn::Position* pos, int move, int static_eval, int alpha) {
-    constexpr int DeltaMargin = 200;
     if (is_mate_score(alpha) || noMajorsOrMinorsPieces(pos)) {
         return false;
     }
 
-    return static_eval + qsearch_move_gain_upper_bound(pos, move) + DeltaMargin <= alpha;
+    return static_eval + qsearch_move_gain_upper_bound(pos, move) +
+           searchParams.qsearchDeltaMargin <= alpha;
 }
 
 bool qsearch_see_prune(thrawn::Position* pos, int move) {
@@ -250,7 +257,10 @@ bool qsearch_see_prune(thrawn::Position* pos, int move) {
 }
 
 int history_bonus(int depth) {
-    return std::min(HistoryMax / 2, depth * depth + 2 * depth);
+    const int history_max = std::max(1, searchParams.historyMax);
+    const int bonus = searchParams.historyBonusDepthSquared * depth * depth +
+                      searchParams.historyBonusDepthLinear * depth;
+    return std::min(history_max / 2, bonus);
 }
 
 int history_score(ThreadData* td, int move) {
@@ -259,10 +269,11 @@ int history_score(ThreadData* td, int move) {
 
 void update_history(ThreadData* td, int move, int bonus) {
     int& entry = td->history_moves[get_move_piece(move)][get_move_target(move)];
-    bonus = std::clamp(bonus, -HistoryMax, HistoryMax);
+    const int history_max = std::max(1, searchParams.historyMax);
+    bonus = std::clamp(bonus, -history_max, history_max);
     const int gravity = bonus >= 0 ? bonus : -bonus;
-    entry += bonus - entry * gravity / HistoryMax;
-    entry = std::clamp(entry, -HistoryMax, HistoryMax);
+    entry += bonus - entry * gravity / history_max;
+    entry = std::clamp(entry, -history_max, history_max);
 }
 
 void update_quiet_history(ThreadData* td, int move, int depth) {
@@ -301,21 +312,27 @@ void update_counter_move(ThreadData* td, int ply, int move) {
 
 int late_move_reduction(int depth, int move_number, bool is_pv_node,
                         bool is_counter, int quiet_history) {
-    int reduction = 1;
-    if (!is_pv_node && depth >= 5) {
+    int reduction = searchParams.lmrBaseReduction;
+    if (!is_pv_node && depth >= searchParams.lmrNonPvDepth) {
         ++reduction;
     }
-    if (depth >= 6 && move_number > 8) {
+    if (depth >= searchParams.lmrMoveDepth1 &&
+        move_number > searchParams.lmrMoveNumber1) {
         ++reduction;
     }
-    if (depth >= 8 && move_number > 16) {
+    if (depth >= searchParams.lmrMoveDepth2 &&
+        move_number > searchParams.lmrMoveNumber2) {
         ++reduction;
     }
 
-    if (is_pv_node || is_counter || quiet_history > HistoryMax / 4) {
+    const int history_max = std::max(1, searchParams.historyMax);
+    const int good_history_divisor = std::max(1, searchParams.lmrGoodHistoryDivisor);
+    const int bad_history_divisor = std::max(1, searchParams.lmrBadHistoryDivisor);
+    if (is_pv_node || is_counter ||
+        quiet_history > history_max / good_history_divisor) {
         --reduction;
     }
-    if (!is_counter && quiet_history < -HistoryMax / 4) {
+    if (!is_counter && quiet_history < -history_max / bad_history_divisor) {
         ++reduction;
     }
 
@@ -436,7 +453,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // one ply deeper than an ordinary node.
     if (inCheck)
     {
-        depth++;
+        depth += searchParams.checkExtension;
     }
 
     // 3) Quiescence
@@ -454,7 +471,8 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // 8) Reverse Futility Pruning (RFP)
     //    Often called "static-nullmove" or "futility"
     // --------------------------------------
-    if (!inCheck && !isPvNode && !pawnOnlyEndgame && depth <= 2 &&
+    if (!inCheck && !isPvNode && !pawnOnlyEndgame &&
+        depth <= searchParams.reverseFutilityMaxDepth &&
         !is_mate_score(beta) && !is_mate_score(static_eval))
     {
         int eval_margin = reverse_futility_margin(depth);
@@ -468,7 +486,8 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // --------------------------------------
     // 9) Razoring (shallow depth, not in check, non-PV)
     // --------------------------------------
-    if (!inCheck && !isPvNode && !pawnOnlyEndgame && depth <= 2 && pos->ply > 0 &&
+    if (!inCheck && !isPvNode && !pawnOnlyEndgame &&
+        depth <= searchParams.razorMaxDepth && pos->ply > 0 &&
         !is_mate_score(alpha))
     {
         score = static_eval + razor_margin(depth);
@@ -493,7 +512,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // --------------------------------------
     // 10) Null-move pruning
     // --------------------------------------
-    if (!inCheck && depth >= 4 && !isPvNode && static_eval >= beta &&
+    if (!inCheck && depth >= searchParams.nullMoveMinDepth && !isPvNode && static_eval >= beta &&
         !pawnOnlyEndgame && td->allowNullMovePruning &&
         !is_mate_score(beta) && !is_mate_score(static_eval))
     {
@@ -533,7 +552,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         // If this "fake pass" search fails high, then cut
         if (score >= beta && !is_mate_score(score))
         {
-            if (depth >= 8)
+            if (depth >= searchParams.nullMoveVerificationDepth)
             {
                 const bool savedNullMoveState = td->allowNullMovePruning;
                 td->allowNullMovePruning = false;
@@ -631,7 +650,8 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
                                  pos->colour_to_move ^ 1);
 
             bool allowFutilityPrune = false;
-            if (pos->ply && !isPvNode && !inCheck && !pawnOnlyEndgame && (depth <= 3))
+            if (pos->ply && !isPvNode && !inCheck && !pawnOnlyEndgame &&
+                depth <= searchParams.futilityMaxDepth)
             {
                 if ((static_eval + futility_margin(depth)) <= alpha)
                 {
@@ -654,9 +674,10 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             //     If depth is small, not in check, not a capture,
             //     and we've already searched "too many" quiet moves
             // -----------------------------
-            if (pos->ply && depth <= 3 && !isPvNode && !inCheck && !pawnOnlyEndgame &&
+            if (pos->ply && depth <= searchParams.lateMovePruningMaxDepth &&
+                !isPvNode && !inCheck && !pawnOnlyEndgame &&
                 !givesCheck && quietMove && !pawnMove && !get_is_move_castling(move) &&
-                (quiet_moves_seen > LateMovePruning_factors[depth]))
+                (quiet_moves_seen > futility_move_count(depth)))
             {
                 restoreBoard(pos);
                 pos->ply--;
@@ -671,8 +692,8 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             const int quietHistory = quietMove ? history_score(td, move) : 0;
             const bool counterMove = quietMove && is_counter_move(td, parentPly, move);
 
-            if (quiet_moves_seen >= full_depth_moves &&
-                depth >= reduction_limit &&
+            if (quiet_moves_seen >= searchParams.lmrFullDepthMoves &&
+                depth >= searchParams.lmrReductionDepthLimit &&
                 !inCheck &&
                 !givesCheck &&
                 quietMove &&
@@ -936,14 +957,14 @@ int score_move(thrawn::Position* pos, ThreadData* td, int move)
         if (td->pv_table[0][pos->ply] == move)
         {
             td->score_pv_flag = false;
-            return 20000; // give pv move priority
+            return searchParams.pvMoveScore; // give pv move priority
         }
     }
 
     // handle promotions
     if (get_promoted_piece(move) == Q || get_promoted_piece(move) == q)
     {
-        return 10000 + 499;
+        return searchParams.queenPromotionScore;
     }
 
     // captures: use MVV-LVA
@@ -969,16 +990,21 @@ int score_move(thrawn::Position* pos, ThreadData* td, int move)
     else // quiet moves
     {
         if (td->killer_moves[0][pos->ply] == move)
-            return 9000;
+            return searchParams.killerMoveScore1;
         else if (td->killer_moves[1][pos->ply] == move)
-            return 8000;
+            return searchParams.killerMoveScore2;
         else if (is_counter_move(td, pos->ply, move))
-            return CounterMoveScore +
-                   std::clamp(history_score(td, move) / 64, -250, 250);
+            return searchParams.counterMoveScore +
+                   std::clamp(history_score(td, move) /
+                                  std::max(1, searchParams.counterMoveHistoryDivisor),
+                              -searchParams.counterMoveHistoryCap,
+                              searchParams.counterMoveHistoryCap);
         else if (get_promoted_piece(move) == Q || get_promoted_piece(move) == q)
             return mvv_lva[get_move_piece(move)][get_move_target(move)] + 100;
         else
-            return std::clamp(history_score(td, move), -HistoryScoreCap, HistoryScoreCap);
+            return std::clamp(history_score(td, move),
+                              -searchParams.historyScoreCap,
+                              searchParams.historyScoreCap);
     }
     return 0;
 }
@@ -1011,7 +1037,7 @@ void sort_moves(thrawn::Position* pos, ThreadData* td,
         {
             // If a move is the bestMove from TT, give it a high score
             if (moves[i] == bestMove)
-                scores[i] = 30000;
+                scores[i] = searchParams.ttMoveScore;
             else
                 scores[i] = score_move(pos, td, moves[i]);
         }
@@ -1023,7 +1049,7 @@ void sort_moves(thrawn::Position* pos, ThreadData* td,
     for (int i = 0; i < n; i++)
     {
         if (moves[i] == bestMove)
-            scores[i] = 30000;
+            scores[i] = searchParams.ttMoveScore;
         else
             scores[i] = score_move(pos, td, moves[i]);
     }
@@ -1072,6 +1098,28 @@ int isRepetition(thrawn::Position* pos)
 
 int futility_margin(int depth)
 {
-    static constexpr int margins[4] = {0, 120, 220, 360};
-    return margins[depth];
+    if (depth <= 0) {
+        return 0;
+    }
+    if (depth == 1) {
+        return searchParams.futilityMargin1;
+    }
+    if (depth == 2) {
+        return searchParams.futilityMargin2;
+    }
+    return searchParams.futilityMargin3;
+}
+
+int futility_move_count(int depth)
+{
+    if (depth <= 0) {
+        return 0;
+    }
+    if (depth == 1) {
+        return searchParams.lateMovePruningDepth1;
+    }
+    if (depth == 2) {
+        return searchParams.lateMovePruningDepth2;
+    }
+    return searchParams.lateMovePruningDepth3;
 }
