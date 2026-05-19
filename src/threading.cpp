@@ -13,6 +13,7 @@
 #include <cstdint>
 
 static std::int64_t globalSearchStartTime = 0;
+constexpr int NodeCounterBatch = 1024;
 
 static int uci_mate_score(int score) {
     if (score >= mateScore) {
@@ -24,6 +25,14 @@ static int uci_mate_score(int score) {
     }
 
     return 0;
+}
+
+static std::uint64_t exact_node_total(int numThreads) {
+    std::uint64_t nodes = 0;
+    for (int i = 0; i < numThreads; ++i) {
+        nodes += static_cast<std::uint64_t>(threadDatas[i].nodes);
+    }
+    return nodes;
 }
 
 RootMove::RootMove()
@@ -291,8 +300,11 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         if (threadID == 0)
         {   
             const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
+            const std::uint64_t reportedNodes =
+                total_nodes.load(std::memory_order_relaxed) +
+                static_cast<std::uint64_t>(td->nodes & (NodeCounterBatch - 1));
             std::cout << "info depth " << curr_depth
-                      << " nodes " << total_nodes.load(std::memory_order_relaxed)
+                      << " nodes " << reportedNodes
                       << " time " << currentTime;
             
             // Determine whether to report a mate score or a centipawn score
@@ -370,6 +382,8 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
     for (int i = 0; i < numThreads; i++) {
         delete positionCopies[i];
     }
+
+    total_nodes.store(exact_node_total(numThreads), std::memory_order_relaxed);
 
     // After all threads have finished, select the best result.
     SearchResult result = select_best_thread(threadDatas, numThreads);

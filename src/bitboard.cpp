@@ -5,32 +5,6 @@
 
 using namespace std;
 
-// GET OCCUPANCY BITBOARDS
-uint64_t get_white_occupancy(thrawn::Position* pos)
-{
-    uint64_t res = 0ULL;
-    for(int i=0;i<6;i++)
-        res |= pos->piece_bitboards[i];
-    return res;
-}
-
-uint64_t get_black_occupancy(thrawn::Position* pos)
-{
-    uint64_t res = 0ULL;
-    for(int i=6;i<12;i++)
-        res |= pos->piece_bitboards[i];
-    return res;
-}
-
-uint64_t get_both_occupancy(thrawn::Position* pos)
-{
-    uint64_t res = 0ULL;
-    res |= get_white_occupancy(pos);
-    res |= get_black_occupancy(pos);
-    return res;
-}
-
-
 // PRE-COMPUTE PIECE ATTACK BITBOARDS
 
 // pawns
@@ -374,11 +348,6 @@ bool is_square_under_attack(thrawn::Position* pos, int square, int side)
         return true;
 
     return false;
-}
-
-bool noMajorsOrMinorsPieces(thrawn::Position* pos)
-{
-    return !(count_bits(pos->occupancies[both]) - count_bits(pos->piece_bitboards[P]) - count_bits(pos->piece_bitboards[p]) - 2);
 }
 
 void init_sliding_attacks(thrawn::Position* pos, int isBishop)

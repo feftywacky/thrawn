@@ -28,6 +28,11 @@ std::atomic<uint64_t> total_nodes(0);
 
 namespace {
 
+constexpr std::array<int, 6> PieceValues = {100, 320, 330, 500, 900, 20000};
+constexpr int NodeCounterBatch = 1024;
+constexpr int SeePruneMaxDepth = 4;
+constexpr int SeePruneDepthMargin = 200;
+
 bool is_quiet_move(int move) {
     return !get_is_capture_move(move) && !get_promoted_piece(move);
 }
@@ -72,20 +77,101 @@ int null_move_reduction(int depth, int static_eval, int beta) {
 }
 
 int piece_value(int piece) {
-    switch (piece % 6) {
-        case PAWN:
-            return 100;
-        case KNIGHT:
-            return 320;
-        case BISHOP:
-            return 330;
-        case ROOK:
-            return 500;
-        case QUEEN:
-            return 900;
-        default:
-            return 20000;
+    return PieceValues[piece % 6];
+}
+
+void count_node(ThreadData* td) {
+    td->nodes++;
+    if ((td->nodes & (NodeCounterBatch - 1)) == 0) {
+        total_nodes.fetch_add(NodeCounterBatch, std::memory_order_relaxed);
     }
+}
+
+bool is_slider_piece(int piece) {
+    const int type = piece % 6;
+    return type == BISHOP || type == ROOK || type == QUEEN;
+}
+
+bool move_gives_check(thrawn::Position* pos, int move) {
+    const int side = pos->colour_to_move;
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    const int piece = get_move_piece(move);
+    const int promoted = get_promoted_piece(move);
+    const int checking_piece = promoted ? promoted : piece;
+    const uint64_t enemy_king = pos->piece_bitboards[side == white ? k : K];
+    if (!enemy_king) {
+        return false;
+    }
+
+    const int king_square = get_lsb_index(enemy_king);
+    const uint64_t source_bb = square_bb(source);
+    const uint64_t target_bb = square_bb(target);
+
+    uint64_t occupancy_after = pos->occupancies[both];
+    occupancy_after &= ~source_bb;
+    if (get_is_move_enpassant(move)) {
+        const int captured_square = side == white ? target + 8 : target - 8;
+        occupancy_after &= ~square_bb(captured_square);
+    }
+    occupancy_after |= target_bb;
+
+    switch (checking_piece % 6) {
+        case PAWN:
+            if (pos->pawn_attacks[side][target] & enemy_king)
+                return true;
+            break;
+        case KNIGHT:
+            if (pos->knight_attacks[target] & enemy_king)
+                return true;
+            break;
+        case BISHOP:
+            if (get_bishop_attacks(pos, target, occupancy_after) & enemy_king)
+                return true;
+            break;
+        case ROOK:
+            if (get_rook_attacks(pos, target, occupancy_after) & enemy_king)
+                return true;
+            break;
+        case QUEEN:
+            if (get_queen_attacks(pos, target, occupancy_after) & enemy_king)
+                return true;
+            break;
+        default:
+            if (pos->king_attacks[target] & enemy_king)
+                return true;
+            break;
+    }
+
+    uint64_t diagonal_sliders = side == white
+        ? (pos->piece_bitboards[B] | pos->piece_bitboards[Q])
+        : (pos->piece_bitboards[b] | pos->piece_bitboards[q]);
+    uint64_t orthogonal_sliders = side == white
+        ? (pos->piece_bitboards[R] | pos->piece_bitboards[Q])
+        : (pos->piece_bitboards[r] | pos->piece_bitboards[q]);
+
+    if (is_slider_piece(piece)) {
+        diagonal_sliders &= ~source_bb;
+        orthogonal_sliders &= ~source_bb;
+    }
+
+    switch (checking_piece % 6) {
+        case BISHOP:
+            diagonal_sliders |= target_bb;
+            break;
+        case ROOK:
+            orthogonal_sliders |= target_bb;
+            break;
+        case QUEEN:
+            diagonal_sliders |= target_bb;
+            orthogonal_sliders |= target_bb;
+            break;
+        default:
+            break;
+    }
+
+    return (get_bishop_attacks(pos, king_square, occupancy_after) & diagonal_sliders) ||
+           (get_rook_attacks(pos, king_square, occupancy_after) & orthogonal_sliders);
 }
 
 int captured_piece(thrawn::Position* pos, int move) {
@@ -459,8 +545,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     }
 
     // Increment node counter
-    td->nodes++;
-    total_nodes.fetch_add(1, std::memory_order_relaxed);
+    count_node(td);
 
     // Compute static evaluation
     static_eval = evaluate(pos);
@@ -588,6 +673,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     int valid_moves = 0;
     int moves_searched = 0;
     int quiet_moves_seen = 0;
+    bool pruned_moves = false;
     std::vector<int> failed_quiet_moves;
     failed_quiet_moves.reserve(moves.size());
 
@@ -597,6 +683,60 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         const int parentPly = pos->ply;
         const bool quietMove = is_quiet_move(move);
         const bool pawnMove = get_move_piece(move) == P || get_move_piece(move) == p;
+        const bool firstMove = moves_searched == 0;
+        bool givesCheck = false;
+        bool givesCheckKnown = false;
+
+        auto gives_check = [&]() {
+            if (!givesCheckKnown) {
+                givesCheck = !inCheck && move_gives_check(pos, move);
+                givesCheckKnown = true;
+            }
+            return givesCheck;
+        };
+
+        if (quietMove)
+        {
+            quiet_moves_seen++;
+        }
+
+        if (!firstMove && pos->ply && !isPvNode && !inCheck && !pawnOnlyEndgame)
+        {
+            const bool castleMove = get_is_move_castling(move);
+
+            if (quietMove && !pawnMove && !castleMove &&
+                depth <= searchParams.futilityMaxDepth &&
+                static_eval + futility_margin(depth) <= alpha &&
+                !gives_check())
+            {
+                pruned_moves = true;
+                continue;
+            }
+
+            if (quietMove && !pawnMove && !castleMove &&
+                depth <= searchParams.lateMovePruningMaxDepth &&
+                quiet_moves_seen > futility_move_count(depth) &&
+                !gives_check())
+            {
+                pruned_moves = true;
+                continue;
+            }
+
+            if (get_is_capture_move(move) && !get_promoted_piece(move) &&
+                depth <= SeePruneMaxDepth &&
+                static_exchange_eval(pos, move) < -SeePruneDepthMargin * depth &&
+                !gives_check())
+            {
+                pruned_moves = true;
+                continue;
+            }
+        }
+
+        const bool needsLmrCheckInfo =
+            !firstMove && quietMove && !get_is_move_castling(move) &&
+            depth >= searchParams.lmrReductionDepthLimit && !inCheck;
+        if (needsLmrCheckInfo)
+            gives_check();
 
         copyBoard(pos);
         pos->ply++;
@@ -611,10 +751,6 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             continue;
         }
         valid_moves++;
-        if (quietMove)
-        {
-            quiet_moves_seen++;
-        }
         td->ply_moves[parentPly] = move;
 
         auto search_child = [&](int childDepth, int childAlpha, int childBeta) {
@@ -639,54 +775,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         else
         {
             // -----------------------------
-            // (A) Basic Futility on quiet moves
-            //     e.g. if depth is small, not giving check, not a capture, etc.
-            // -----------------------------
-            bool givesCheck = is_square_under_attack(
-                                 pos,
-                                 (pos->colour_to_move == white) ? get_lsb_index(pos->piece_bitboards[K])
-                                                               : get_lsb_index(pos->piece_bitboards[k]),
-                                 pos->colour_to_move ^ 1);
-
-            bool allowFutilityPrune = false;
-            if (pos->ply && !isPvNode && !inCheck && !pawnOnlyEndgame &&
-                depth <= searchParams.futilityMaxDepth)
-            {
-                if ((static_eval + futility_margin(depth)) <= alpha)
-                {
-                    allowFutilityPrune = true;
-                }
-            }
-
-            if (allowFutilityPrune && quietMove && !givesCheck &&
-                (get_move_piece(move) != P) && (get_move_piece(move) != p) &&
-                !get_is_move_castling(move))
-            {
-                restoreBoard(pos);
-                pos->ply--;
-                pos->repetition_index--;
-                continue;
-            }
-
-            // -----------------------------
-            // (B) Late Move Pruning (LMP)
-            //     If depth is small, not in check, not a capture,
-            //     and we've already searched "too many" quiet moves
-            // -----------------------------
-            if (pos->ply && depth <= searchParams.lateMovePruningMaxDepth &&
-                !isPvNode && !inCheck && !pawnOnlyEndgame &&
-                !givesCheck && quietMove && !pawnMove && !get_is_move_castling(move) &&
-                (quiet_moves_seen > futility_move_count(depth)))
-            {
-                restoreBoard(pos);
-                pos->ply--;
-                pos->repetition_index--;
-                //unmake_move(pos,pos->ply);
-                continue;
-            }
-
-            // -----------------------------
-            // (C) Late Move Reductions (LMR)
+            // Late Move Reductions (LMR)
             // -----------------------------
             const int quietHistory = quietMove ? history_score(td, move) : 0;
             const bool counterMove = quietMove && is_counter_move(td, parentPly, move);
@@ -792,6 +881,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // if no valid moves
     if (valid_moves == 0)
     {
+        if (pruned_moves)
+            return alpha;
+
         // (should not happen because we handle moves.empty() above,
         //  but just in case)
         if (inCheck)
@@ -829,8 +921,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
             return alpha;
     }
 
-    td->nodes++;
-    total_nodes.fetch_add(1, std::memory_order_relaxed);
+    count_node(td);
 
     const bool inCheck = is_square_under_attack(
         pos,
@@ -899,6 +990,11 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         const bool seePruned = !inCheck && !promotionMove &&
                                qsearch_see_prune(pos, move);
 
+        if ((deltaPruned || seePruned) && !move_gives_check(pos, move))
+        {
+            continue;
+        }
+
         const int parentPly = pos->ply;
         copyBoard(pos);
         pos->ply++;
@@ -914,22 +1010,6 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         }
         valid_moves++;
         td->ply_moves[parentPly] = move;
-
-        const bool givesCheck = is_square_under_attack(
-            pos,
-            (pos->colour_to_move == white)
-                ? get_lsb_index(pos->piece_bitboards[K])
-                : get_lsb_index(pos->piece_bitboards[k]),
-            pos->colour_to_move ^ 1
-        );
-
-        if (!inCheck && !givesCheck && (deltaPruned || seePruned))
-        {
-            pos->ply--;
-            pos->repetition_index--;
-            restoreBoard(pos);
-            continue;
-        }
 
         int score = -quiescence(pos, td, -beta, -alpha);
 
@@ -1115,7 +1195,11 @@ void quicksort_moves(std::vector<int> &moves, std::vector<int> &move_scores,
 // repetition check
 int isRepetition(thrawn::Position* pos)
 {
-    for (int i = 0; i <= pos->repetition_index; i++)
+    if (pos->fifty_move < 4)
+        return 0;
+
+    const int oldest_reversible = std::max(0, pos->repetition_index - pos->fifty_move);
+    for (int i = pos->repetition_index - 1; i >= oldest_reversible; i -= 2)
     {
         if (pos->repetition_table[i] == pos->zobristKey)
             return 1;

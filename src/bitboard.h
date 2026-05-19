@@ -14,9 +14,24 @@
 using namespace std;
 
 // get occupancy bitboard by colour
-uint64_t get_white_occupancy(thrawn::Position* pos);
-uint64_t get_black_occupancy(thrawn::Position* pos);
-uint64_t get_both_occupancy(thrawn::Position* pos);
+inline uint64_t get_white_occupancy(const thrawn::Position* pos)
+{
+    return pos->piece_bitboards[P] | pos->piece_bitboards[N] |
+           pos->piece_bitboards[B] | pos->piece_bitboards[R] |
+           pos->piece_bitboards[Q] | pos->piece_bitboards[K];
+}
+
+inline uint64_t get_black_occupancy(const thrawn::Position* pos)
+{
+    return pos->piece_bitboards[p] | pos->piece_bitboards[n] |
+           pos->piece_bitboards[b] | pos->piece_bitboards[r] |
+           pos->piece_bitboards[q] | pos->piece_bitboards[k];
+}
+
+inline uint64_t get_both_occupancy(const thrawn::Position* pos)
+{
+    return get_white_occupancy(pos) | get_black_occupancy(pos);
+}
 
 // pre-compute all attacks from a square methods
 
@@ -68,7 +83,13 @@ bool is_square_under_attack(thrawn::Position* pos,int square, int side);
 uint64_t find_magic_num(const int& square, int relevant_bits, int bishop);
 void init_magic_nums();
 
-bool noMajorsOrMinorsPieces(thrawn::Position* pos);
+inline bool noMajorsOrMinorsPieces(const thrawn::Position* pos)
+{
+    return !(pos->piece_bitboards[N] | pos->piece_bitboards[B] |
+             pos->piece_bitboards[R] | pos->piece_bitboards[Q] |
+             pos->piece_bitboards[n] | pos->piece_bitboards[b] |
+             pos->piece_bitboards[r] | pos->piece_bitboards[q]);
+}
 
 // init all piece attacks
 void init_leaping_attacks(thrawn::Position* pos);
