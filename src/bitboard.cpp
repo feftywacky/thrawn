@@ -267,8 +267,7 @@ uint64_t set_occupancy(const int& index, const int& bits_in_mask, uint64_t attac
 
     for (int i=0;i<bits_in_mask;i++)
     {
-        int square = get_lsb_index(attack_mask);
-        clear_bit(attack_mask, square);
+        int square = pop_lsb(attack_mask);
 
         // make sure occupancy is on board
         if (index & (1 << i))
@@ -346,31 +345,6 @@ void init_magic_nums()
     for (int square = 0; square < 64; square++)
         // init bishop magic numbers
         bishop_magic_nums[square] = find_magic_num(square, bishop_relevant_bits[square], bishop);
-}
-
-uint64_t get_bishop_attacks(thrawn::Position* pos, int square, uint64_t occupancy)
-{
-    // generate bishop attacks given current board occupancy
-    occupancy &= pos->bishop_masks[square];
-    occupancy *= bishop_magic_nums[square];
-    occupancy >>= 64-bishop_relevant_bits[square];
-
-    return pos->bishop_attacks[square][occupancy];
-}
-
-uint64_t get_rook_attacks(thrawn::Position* pos, int square, uint64_t occupancy)
-{
-    // generate rook attacks given current board occupancy
-    occupancy &= pos->rook_masks[square];
-    occupancy *= rook_magic_nums[square];
-    occupancy >>= 64-rook_relevant_bits[square];
-
-    return pos->rook_attacks[square][occupancy];
-}
-
-uint64_t get_queen_attacks(thrawn::Position* pos, int square, uint64_t occupancy)
-{
-    return get_bishop_attacks(pos, square, occupancy) | get_rook_attacks(pos, square, occupancy);
 }
 
 // is <square> under attacked by <side> pieces

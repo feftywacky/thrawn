@@ -10,30 +10,6 @@ using namespace std;
 // GLOBAL VARIABLES
 unsigned int random_state = 1804289383;
 
-void set_bit(uint64_t& bitboard, int bit) {
-    bitboard |= (1ULL << bit);
-}
-
-void clear_bit(uint64_t& bitboard, int bit) {
-    bitboard &= ~(1ULL << bit);
-}
-
-void pop_bit(uint64_t& bitboard, int square) {
-    bitboard &= ~(1ULL << square);
-}
-
-uint64_t get_bit(uint64_t bitboard, int bit){
-    return bitboard & (1ULL << bit);
-}
-
-bool is_bit_set(uint64_t bitboard, int bit) {
-    return (bitboard & (1ULL << bit)) != 0;
-}
-
-void toggle_bit(uint64_t& bitboard, int bit) {
-    bitboard ^= (1ULL << bit);
-}
-
 vector<int> get_squares_from_bb(uint16_t bitboard)
 {
     vector<int> squares;
@@ -45,29 +21,6 @@ vector<int> get_squares_from_bb(uint16_t bitboard)
             squares.push_back(i);
     }
     return squares;
-}
-
-// BIT MANIPULATION
-int count_bits(uint64_t bitboard)
-{
-    int count = 0;
-
-    while(bitboard)
-    {
-        count++;
-
-        // reset/remove/set to zero the lsb
-        bitboard &= bitboard - 1;
-    }
-
-    return count;
-}
-
-int get_lsb_index(uint64_t bitboard)
-{
-    if (bitboard)
-        return count_bits( (bitboard & -bitboard)-1 );
-    return -1;
 }
 
 // RANDOM NUMBER GEN
@@ -201,5 +154,4 @@ void print_bits(uint64_t num)
     }
     std::cout << std::endl;
 }
-
 

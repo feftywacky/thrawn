@@ -14,14 +14,8 @@ static const int BOUND_EXACT      = 3;
 
 struct TTEntry 
 {
-    // uint64_t key;      // The Zobrist key for the position.
-    // int depth;         // Search depth at which this entry was stored.
-    // int score;         // Evaluation score.
-    // int hash_flag;     // TT flag (EXACT, ALPHA, BETA)
-    // int best_move;     // Best move (for move ordering)
     std::atomic<uint64_t> smp_key{0};  // This will be zobrist key xor data
     std::atomic<uint64_t> smp_data{0}; // Encoding depth, score, hash_flag and best_move into a U64
-    std::atomic<int> age{0};           // Age for replacement logic
 };
 
 class TranspositionTable
@@ -56,6 +50,7 @@ private:
     TTEntry* table;      // Array of TT entries.
     int      numEntries; // Number of entries in the table.
     int      numClusters;
+    int      clusterMask;
     std::atomic<int> currentAge; // Current age, updated once per search.
 };
 

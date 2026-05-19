@@ -317,7 +317,7 @@ int evaluate_HCE(thrawn::Position* pos)
         
         while (bitboard)
         {            
-            square = get_lsb_index(bitboard);
+            square = pop_lsb(bitboard);
             
             opening_score += material_score[opening][piece];
             endgame_score += material_score[endgame][piece];
@@ -518,8 +518,6 @@ int evaluate_HCE(thrawn::Position* pos)
                     endgame_score -= count_bits(pos->king_attacks[square] & pos->occupancies[black]) * king_shield_bonus;
                     break;
             }
-
-            pop_bit(bitboard, square);
         }
     }
     

@@ -12,6 +12,35 @@
 
 using namespace std;
 
+namespace {
+
+inline void append_moves_from_attacks(int source,
+                                      int piece,
+                                      uint64_t attacks,
+                                      uint64_t enemies,
+                                      vector<int>& moves,
+                                      int move_type)
+{
+    uint64_t captures = attacks & enemies;
+    while (captures)
+    {
+        const int target = pop_lsb(captures);
+        moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
+    }
+
+    if (move_type == all_moves)
+    {
+        uint64_t quiets = attacks & ~enemies;
+        while (quiets)
+        {
+            const int target = pop_lsb(quiets);
+            moves.push_back(parse_move(source, target, piece, 0, 0, 0, 0, 0));
+        }
+    }
+}
+
+} // namespace
+
 
 vector<int> generate_moves(thrawn::Position* pos)
 {
@@ -21,97 +50,63 @@ vector<int> generate_moves(thrawn::Position* pos)
 vector<int> generate_moves(thrawn::Position* pos, int move_type)
 {
     vector<int> moves;
-    moves.reserve(64);
+    moves.reserve(128);
 
-    // the squares where the pieces started from, and where it will go
-    int source;
-    int target;
-
-    // bitboard of the current piece, and its attacks
-    uint64_t curr; 
-    uint64_t attacks;
-
-    // loop over all piece types for both black and white
-    for (int piece = P; piece<=k; piece++)
+    if (pos->colour_to_move == white)
     {
-        uint64_t curr = pos->piece_bitboards[piece];
+        uint64_t curr = pos->piece_bitboards[P];
+        parse_white_pawn_moves(pos, curr, moves, move_type);
 
-        // to distinguish betweem white and black specific moves
-        // includes pawns and castling
-        if (pos->colour_to_move == white)
-        {
-            // generate pawn moves
-            if (piece==P)
-            {
-                // double pawn moves, pawn promotion, enpassant
-                parse_white_pawn_moves(pos,curr, moves, move_type);
-            }
+        curr = pos->piece_bitboards[N];
+        parse_knight_moves(pos, curr, N, moves, move_type);
 
-            // castling
-            if (move_type == all_moves && piece == K)
-            {
-                parse_white_castle_moves(pos,moves);
-            }
-        }
+        curr = pos->piece_bitboards[B];
+        parse_bishop_moves(pos, curr, B, moves, move_type);
 
-        // for black pieces
-        else
-        {
-            if (piece==p)
-            {
-                parse_black_pawn_moves(pos,curr, moves, move_type);
-            }
+        curr = pos->piece_bitboards[R];
+        parse_rook_moves(pos, curr, R, moves, move_type);
 
-            // castling
-            if (move_type == all_moves && piece == k)
-            {
-               parse_black_castle_moves(pos,moves);
-            }
-        }
+        curr = pos->piece_bitboards[Q];
+        parse_queen_moves(pos, curr, Q, moves, move_type);
 
-        // generate for the rest of the pieces that are not colour specific
-        // knight
-        if ( (pos->colour_to_move == white) ? piece == N : piece == n )
-        {
-            parse_knight_moves(pos,curr, piece, moves, move_type);
-        }
+        if (move_type == all_moves)
+            parse_white_castle_moves(pos, moves);
 
-        // bishop
-        if ( (pos->colour_to_move == white) ? piece == B : piece == b )
-        {
-            parse_bishop_moves(pos,curr, piece, moves, move_type);
-        }
-        
-        // rook
-        if ( (pos->colour_to_move == white) ? piece == R : piece == r )
-        {
-           parse_rook_moves(pos,curr, piece, moves, move_type);
-        }
+        curr = pos->piece_bitboards[K];
+        parse_king_moves(pos, curr, K, moves, move_type);
+    }
+    else
+    {
+        uint64_t curr = pos->piece_bitboards[p];
+        parse_black_pawn_moves(pos, curr, moves, move_type);
 
-        // queen
-        if ( (pos->colour_to_move == white) ? piece == Q : piece == q )
-        {
-            parse_queen_moves(pos,curr, piece, moves, move_type);
-        }
+        curr = pos->piece_bitboards[n];
+        parse_knight_moves(pos, curr, n, moves, move_type);
 
-        // king
-        if ( (pos->colour_to_move == white) ? piece == K : piece == k )
-        {
-            parse_king_moves(pos,curr, piece, moves, move_type);
-        }
+        curr = pos->piece_bitboards[b];
+        parse_bishop_moves(pos, curr, b, moves, move_type);
 
-    } // end of looping through all pieces
+        curr = pos->piece_bitboards[r];
+        parse_rook_moves(pos, curr, r, moves, move_type);
+
+        curr = pos->piece_bitboards[q];
+        parse_queen_moves(pos, curr, q, moves, move_type);
+
+        if (move_type == all_moves)
+            parse_black_castle_moves(pos, moves);
+
+        curr = pos->piece_bitboards[k];
+        parse_king_moves(pos, curr, k, moves, move_type);
+    }
 
     return moves;
-
-
 }
 
 void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& moves, int move_type)
 {
     while (curr)
     {
-        int source = get_lsb_index(curr);
+        int source = pop_lsb(curr);
         int target = source - 8; // go up one square
 
         if (target>=a8 && !get_bit(pos->occupancies[both], target))
@@ -143,7 +138,7 @@ void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
 
         while (attacks) // while attacks squares are present on the board
         {   
-            target = get_lsb_index(attacks);
+            target = pop_lsb(attacks);
 
             if (source>=a7 && source<=h7) // pawn promotions by capturing a piece
             {
@@ -159,7 +154,6 @@ void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
                 moves.push_back(parse_move(source, target, P, 0, 1, 0, 0, 0));
             }
 
-            pop_bit(attacks, target);
         }
 
         // enpassant
@@ -173,9 +167,6 @@ void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
                 moves.push_back(parse_move(source, enpassant_target, P, 0, 1, 0, 1, 0));
             }
         }
-
-        // remove ls1b for looping through all the bits
-        pop_bit(curr, source);
     }
 }
 
@@ -207,7 +198,7 @@ void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
 {
     while(curr) // while white pawns are present on the board
     {
-        int source = get_lsb_index(curr);
+        int source = pop_lsb(curr);
         int target = source + 8; // go down one square
 
         if (target<=h1 && !get_bit(pos->occupancies[both], target))
@@ -237,7 +228,7 @@ void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
 
         while (attacks) // while attacks squares are present on the board
         {   
-            target = get_lsb_index(attacks);
+            target = pop_lsb(attacks);
 
             if (source>=a2 && source<=h2) // pawn promotion by capturing piece
             {
@@ -253,7 +244,6 @@ void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
                 moves.push_back(parse_move(source, target, p, 0, 1, 0, 0, 0));
             }
 
-            pop_bit(attacks, target);
         }
 
         // enpassant
@@ -266,9 +256,6 @@ void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
                 moves.push_back(parse_move(source, enpassant_target, p, 0, 1, 0, 1, 0));
             }
         }
-
-        // remove ls1b for looping through all the bits
-        pop_bit(curr, source);
     }
 }
 
@@ -298,152 +285,66 @@ void parse_black_castle_moves(thrawn::Position* pos, vector<int>& moves)
 
 void parse_knight_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
 {
+    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
+    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
+
     while (curr)
     {
-        int source = get_lsb_index(curr);
-
-        uint64_t attacks = pos->knight_attacks[source] & ( (pos->colour_to_move==white) ? ~pos->occupancies[white] : ~pos->occupancies[black]);
-
-        while (attacks)
-        {
-            int target = get_lsb_index(attacks);
-            
-            // non-capture move
-            if ( !get_bit( (pos->colour_to_move==white) ? pos->occupancies[black] : pos->occupancies[white], target ) )
-            {
-                if (move_type == all_moves)
-                    moves.push_back(parse_move(source, target, piece, 0, 0, 0, 0, 0));
-            }
-
-            else
-            {
-                moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
-            }
-
-            pop_bit(attacks, target);
-        }
-        pop_bit(curr, source);
+        const int source = pop_lsb(curr);
+        const uint64_t attacks = pos->knight_attacks[source] & ~friends;
+        append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     }
 }
 
 void parse_bishop_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
 {
+    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
+    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
+
     while(curr)
     {
-        int source = get_lsb_index(curr);
-
-        uint64_t attacks = get_bishop_attacks(pos, source, pos->occupancies[both]) & ( (pos->colour_to_move==white) ? ~pos->occupancies[white] : ~pos->occupancies[black]);
-        while (attacks)
-        {
-            
-            int target = get_lsb_index(attacks);
-            
-            // non-capture move
-            if ( !get_bit( (pos->colour_to_move==white) ? pos->occupancies[black] : pos->occupancies[white], target ) )
-            {
-                if (move_type == all_moves)
-                    moves.push_back(parse_move(source, target, piece, 0, 0, 0, 0, 0));
-            }
-
-            else
-            {
-                moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
-            }
-
-            pop_bit(attacks, target);
-            
-        }
-        pop_bit(curr, source);
+        const int source = pop_lsb(curr);
+        const uint64_t attacks = get_bishop_attacks(pos, source, pos->occupancies[both]) & ~friends;
+        append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     } 
 }
 
 void parse_rook_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
 {
+    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
+    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
+
     while(curr)
     {
-        int source = get_lsb_index(curr);
-
-        uint64_t attacks = get_rook_attacks(pos, source, pos->occupancies[both]) & ( (pos->colour_to_move==white) ? ~pos->occupancies[white] : ~pos->occupancies[black]);
-
-        while (attacks)
-        {
-            int target = get_lsb_index(attacks);
-            
-            // non-capture move
-            if ( !get_bit( (pos->colour_to_move==white) ? pos->occupancies[black] : pos->occupancies[white], target ) )
-            {
-                if (move_type == all_moves)
-                    moves.push_back(parse_move(source, target, piece, 0, 0, 0, 0, 0));
-            }
-
-            else
-            {
-                moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
-            }
-
-            pop_bit(attacks, target);
-        }
-        pop_bit(curr, source);
+        const int source = pop_lsb(curr);
+        const uint64_t attacks = get_rook_attacks(pos, source, pos->occupancies[both]) & ~friends;
+        append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     }
 }
 
 void parse_queen_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
 {
+    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
+    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
+
     while (curr)
     {
-        int source = get_lsb_index(curr);
-
-        uint64_t attacks = get_queen_attacks(pos, source, pos->occupancies[both]) & ( (pos->colour_to_move==white) ? ~pos->occupancies[white] : ~pos->occupancies[black]);
-
-        while (attacks)
-        {
-            int target = get_lsb_index(attacks);
-            
-            // non-capture move
-            if ( !get_bit( (pos->colour_to_move==white) ? pos->occupancies[black] : pos->occupancies[white], target ) )
-            {
-                if (move_type == all_moves)
-                    moves.push_back(parse_move(source, target, piece, 0, 0, 0, 0, 0));
-            }
-
-            else
-            {
-                moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
-            }
-
-            pop_bit(attacks, target);
-        }
-        pop_bit(curr, source);
+        const int source = pop_lsb(curr);
+        const uint64_t attacks = get_queen_attacks(pos, source, pos->occupancies[both]) & ~friends;
+        append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     }
 }
 
 void parse_king_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
 {
+    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
+    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
+
     while (curr)
     {
-        int source = get_lsb_index(curr);
-
-        uint64_t attacks = pos->king_attacks[source] & ( (pos->colour_to_move==white) ? ~pos->occupancies[white] : ~pos->occupancies[black]);
-
-        while (attacks)
-        {
-            int target = get_lsb_index(attacks);
-            
-            // non-capture move
-            if ( !get_bit( (pos->colour_to_move==white) ? pos->occupancies[black] : pos->occupancies[white], target ) )
-            {
-                if (move_type == all_moves)
-                    moves.push_back(parse_move(source, target, piece, 0, 0, 0, 0, 0));
-            }
-
-            else
-            {
-                moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
-            }
-
-            pop_bit(attacks, target);
-        }
-        pop_bit(curr, source);
+        const int source = pop_lsb(curr);
+        const uint64_t attacks = pos->king_attacks[source] & ~friends;
+        append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     }
 }
 

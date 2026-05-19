@@ -336,36 +336,48 @@ enum class AccumulatorUpdateOp { Add, Subtract };
 
 #if defined(USE_AVX2)
 static inline void acc_add_row_avx2(int16_t* acc, const int16_t* row) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
         const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
         const __m256i r = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + i));
+        const __m256i a2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i + 16));
+        const __m256i r2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + i + 16));
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), _mm256_add_epi16(a, r));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i + 16), _mm256_add_epi16(a2, r2));
     }
 }
 
 static inline void acc_sub_row_avx2(int16_t* acc, const int16_t* row) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
         const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
         const __m256i r = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + i));
+        const __m256i a2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i + 16));
+        const __m256i r2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + i + 16));
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), _mm256_sub_epi16(a, r));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i + 16), _mm256_sub_epi16(a2, r2));
     }
 }
 #endif
 
 #if defined(USE_NEON)
 static inline void acc_add_row_neon(int16_t* acc, const int16_t* row) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
         const int16x8_t a = vld1q_s16(acc + i);
         const int16x8_t r = vld1q_s16(row + i);
+        const int16x8_t a2 = vld1q_s16(acc + i + 8);
+        const int16x8_t r2 = vld1q_s16(row + i + 8);
         vst1q_s16(acc + i, vaddq_s16(a, r));
+        vst1q_s16(acc + i + 8, vaddq_s16(a2, r2));
     }
 }
 
 static inline void acc_sub_row_neon(int16_t* acc, const int16_t* row) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
         const int16x8_t a = vld1q_s16(acc + i);
         const int16x8_t r = vld1q_s16(row + i);
+        const int16x8_t a2 = vld1q_s16(acc + i + 8);
+        const int16x8_t r2 = vld1q_s16(row + i + 8);
         vst1q_s16(acc + i, vsubq_s16(a, r));
+        vst1q_s16(acc + i + 8, vsubq_s16(a2, r2));
     }
 }
 #endif
@@ -585,12 +597,11 @@ bool refresh_perspective_accumulator_from_board(const thrawn::Position* pos,
 
         uint64_t bitboard = pos->piece_bitboards[piece];
         while (bitboard) {
-            const int square = get_lsb_index(bitboard);
+            const int square = pop_lsb(bitboard);
             const int feature = halfkp_index(piece, square, our_king_square, white_perspective);
             if (feature < 0 || !add_accumulator_row(acc, network.ft_weight, feature)) {
                 return false;
             }
-            pop_bit(bitboard, square);
         }
     }
 
@@ -635,12 +646,11 @@ bool build_state_from_board(const thrawn::Position* pos,
     for (int piece = P; piece <= k; ++piece) {
         uint64_t bitboard = pos->piece_bitboards[piece];
         while (bitboard) {
-            const int square = get_lsb_index(bitboard);
+            const int square = pop_lsb(bitboard);
             if (!track_piece(out_state, piece, square)) {
                 clear_state(out_state);
                 return false;
             }
-            pop_bit(bitboard, square);
         }
     }
 
@@ -709,19 +719,43 @@ void pack_clipped_u8_avx2(uint8_t* out,
 }
 
 int32_t dot_u8_i8_avx2(const uint8_t* x, const int8_t* w, int count) {
-    __m256i acc = _mm256_setzero_si256();
     const __m256i ones = _mm256_set1_epi16(1);
+    __m256i acc0 = _mm256_setzero_si256();
+    __m256i acc1 = _mm256_setzero_si256();
+    __m256i acc2 = _mm256_setzero_si256();
+    __m256i acc3 = _mm256_setzero_si256();
 
-    for (int i = 0; i < count; i += 32) {
+    int i = 0;
+    for (; i + 127 < count; i += 128) {
+        const __m256i xv0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
+        const __m256i wv0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i));
+        const __m256i xv1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + 32));
+        const __m256i wv1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i + 32));
+        const __m256i xv2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + 64));
+        const __m256i wv2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i + 64));
+        const __m256i xv3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + 96));
+        const __m256i wv3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i + 96));
+
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, wv0), ones));
+        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(xv1, wv1), ones));
+        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(xv2, wv2), ones));
+        acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(xv3, wv3), ones));
+    }
+
+    acc0 = _mm256_add_epi32(acc0, acc1);
+    acc2 = _mm256_add_epi32(acc2, acc3);
+    acc0 = _mm256_add_epi32(acc0, acc2);
+
+    for (; i < count; i += 32) {
         const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
         const __m256i wv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i));
         const __m256i prod16 = _mm256_maddubs_epi16(xv, wv);
         const __m256i prod32 = _mm256_madd_epi16(prod16, ones);
-        acc = _mm256_add_epi32(acc, prod32);
+        acc0 = _mm256_add_epi32(acc0, prod32);
     }
 
     alignas(32) int32_t lanes[8];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc0);
 
     int32_t sum = 0;
     for (int i = 0; i < 8; ++i) {
@@ -756,28 +790,55 @@ int32_t dot_u8_i8_neon(const uint8_t* x_u8, const int8_t* w, int count) {
     const int8_t* x = reinterpret_cast<const int8_t*>(x_u8);
 
 #if defined(__ARM_FEATURE_DOTPROD)
-    int32x4_t acc = vdupq_n_s32(0);
-    for (int i = 0; i < count; i += 16) {
-        const int8x16_t xv = vld1q_s8(x + i);
-        const int8x16_t wv = vld1q_s8(w + i);
-        acc = vdotq_s32(acc, xv, wv);
-    }
-    return vaddvq_s32(acc);
-#else
-    int32x4_t acc = vdupq_n_s32(0);
-    for (int i = 0; i < count; i += 16) {
-        const int8x16_t xv = vld1q_s8(x + i);
-        const int8x16_t wv = vld1q_s8(w + i);
+    int32x4_t acc0 = vdupq_n_s32(0);
+    int32x4_t acc1 = vdupq_n_s32(0);
+    int32x4_t acc2 = vdupq_n_s32(0);
+    int32x4_t acc3 = vdupq_n_s32(0);
 
+    int i = 0;
+    for (; i + 63 < count; i += 64) {
+        acc0 = vdotq_s32(acc0, vld1q_s8(x + i), vld1q_s8(w + i));
+        acc1 = vdotq_s32(acc1, vld1q_s8(x + i + 16), vld1q_s8(w + i + 16));
+        acc2 = vdotq_s32(acc2, vld1q_s8(x + i + 32), vld1q_s8(w + i + 32));
+        acc3 = vdotq_s32(acc3, vld1q_s8(x + i + 48), vld1q_s8(w + i + 48));
+    }
+
+    acc0 = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+
+    for (; i < count; i += 16) {
+        acc0 = vdotq_s32(acc0, vld1q_s8(x + i), vld1q_s8(w + i));
+    }
+    return vaddvq_s32(acc0);
+#else
+    int32x4_t acc0 = vdupq_n_s32(0);
+    int32x4_t acc1 = vdupq_n_s32(0);
+    int32x4_t acc2 = vdupq_n_s32(0);
+    int32x4_t acc3 = vdupq_n_s32(0);
+
+    auto accumulate = [](int32x4_t acc, int8x16_t xv, int8x16_t wv) {
         const int16x8_t lo = vmull_s8(vget_low_s8(xv), vget_low_s8(wv));
         const int16x8_t hi = vmull_s8(vget_high_s8(xv), vget_high_s8(wv));
-
         const int32x4_t lo32 = vpaddlq_s16(lo);
         const int32x4_t hi32 = vpaddlq_s16(hi);
+        return vaddq_s32(acc, vaddq_s32(lo32, hi32));
+    };
 
-        acc = vaddq_s32(acc, vaddq_s32(lo32, hi32));
+    int i = 0;
+    for (; i + 63 < count; i += 64) {
+        acc0 = accumulate(acc0, vld1q_s8(x + i), vld1q_s8(w + i));
+        acc1 = accumulate(acc1, vld1q_s8(x + i + 16), vld1q_s8(w + i + 16));
+        acc2 = accumulate(acc2, vld1q_s8(x + i + 32), vld1q_s8(w + i + 32));
+        acc3 = accumulate(acc3, vld1q_s8(x + i + 48), vld1q_s8(w + i + 48));
     }
-    return vaddvq_s32(acc);
+
+    acc0 = vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3));
+
+    for (; i < count; i += 16) {
+        const int8x16_t xv = vld1q_s8(x + i);
+        const int8x16_t wv = vld1q_s8(w + i);
+        acc0 = accumulate(acc0, xv, wv);
+    }
+    return vaddvq_s32(acc0);
 #endif
 }
 #endif

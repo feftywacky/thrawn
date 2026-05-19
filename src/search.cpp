@@ -372,6 +372,7 @@ void quicksort_scored_moves(std::vector<int>& moves, int* move_scores,
 int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int beta)
 {
     int score = 0;
+    int bestScore = -INFINITY;
     int bestMove = 0;
     int hashFlag = BOUND_UPPER;
     int static_eval = 0;
@@ -412,7 +413,28 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
 
     int isPvNode = ((beta - alpha) > 1);
 
-    // 2) Transposition Table lookup
+    bool inCheck = is_square_under_attack(
+        pos,
+        (pos->colour_to_move == white ?
+            get_lsb_index(pos->piece_bitboards[K]) :
+            get_lsb_index(pos->piece_bitboards[k])),
+        pos->colour_to_move ^ 1
+    );
+
+    // Check extension: search check evasions, and replies to checking moves,
+    // one ply deeper than an ordinary node. Do this before TT cutoffs so the
+    // stored entry is deep enough for the actual node depth being searched.
+    if (inCheck)
+    {
+        depth += searchParams.checkExtension;
+    }
+
+    if (depth <= 0)
+    {
+        return quiescence(pos, td, alpha, beta);
+    }
+
+    // Transposition Table lookup
     int ttHit=0;
     int ttDepth = 0;
     int ttMove = 0;
@@ -436,55 +458,16 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         //     return alpha;
     }
 
-    // 5) Increment node counter
+    // Increment node counter
     td->nodes++;
     total_nodes.fetch_add(1, std::memory_order_relaxed);
 
-    // 6) Are we in check?
-    bool inCheck = is_square_under_attack(
-        pos,
-        (pos->colour_to_move == white ?
-            get_lsb_index(pos->piece_bitboards[K]) :
-            get_lsb_index(pos->piece_bitboards[k])),
-        pos->colour_to_move ^ 1
-    );
-
-    // Check extension: search check evasions, and replies to checking moves,
-    // one ply deeper than an ordinary node.
-    if (inCheck)
-    {
-        depth += searchParams.checkExtension;
-    }
-
-    // 3) Quiescence
-    if (depth == 0)
-    {
-        // call quiescence with local pos->ply
-        return quiescence(pos, td, alpha, beta);
-    }
-
-    // 7) Compute static evaluation
+    // Compute static evaluation
     static_eval = evaluate(pos);
     const bool pawnOnlyEndgame = noMajorsOrMinorsPieces(pos);
 
     // --------------------------------------
-    // 8) Reverse Futility Pruning (RFP)
-    //    Often called "static-nullmove" or "futility"
-    // --------------------------------------
-    if (!inCheck && !isPvNode && !pawnOnlyEndgame &&
-        depth <= searchParams.reverseFutilityMaxDepth &&
-        !is_mate_score(beta) && !is_mate_score(static_eval))
-    {
-        int eval_margin = reverse_futility_margin(depth);
-        // if static eval already big enough to exceed beta
-        if (static_eval - eval_margin >= beta)
-        {
-            return static_eval - eval_margin;
-        }
-    }
-
-    // --------------------------------------
-    // 9) Razoring (shallow depth, not in check, non-PV)
+    // Razoring (shallow depth, not in check, non-PV)
     // --------------------------------------
     if (!inCheck && !isPvNode && !pawnOnlyEndgame &&
         depth <= searchParams.razorMaxDepth && pos->ply > 0 &&
@@ -510,7 +493,23 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     }
 
     // --------------------------------------
-    // 10) Null-move pruning
+    // Reverse Futility Pruning (RFP)
+    //    Often called "static-nullmove" or "futility"
+    // --------------------------------------
+    if (!inCheck && !isPvNode && !pawnOnlyEndgame &&
+        depth <= searchParams.reverseFutilityMaxDepth &&
+        !is_mate_score(beta) && !is_mate_score(static_eval))
+    {
+        int eval_margin = reverse_futility_margin(depth);
+        // if static eval already big enough to exceed beta
+        if (static_eval - eval_margin >= beta)
+        {
+            return static_eval - eval_margin;
+        }
+    }
+
+    // --------------------------------------
+    // Null-move pruning
     // --------------------------------------
     if (!inCheck && depth >= searchParams.nullMoveMinDepth && !isPvNode && static_eval >= beta &&
         !pawnOnlyEndgame && td->allowNullMovePruning &&
@@ -573,10 +572,10 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         }
     }
 
-    // 11) Generate moves
+    // Generate moves
     std::vector<int> moves = generate_moves(pos);
 
-    // 12) If we had a best move from TT, ensure it gets sorted first
+    // If we had a best move from TT, ensure it gets sorted first
     const bool nodeFollowPv = td->follow_pv_flag;
     if (nodeFollowPv)
         score_pv(pos, moves, td);
@@ -592,7 +591,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     std::vector<int> failed_quiet_moves;
     failed_quiet_moves.reserve(moves.size());
 
-    // 13) Search each move (LMR, LMP, PVS logic, etc.)
+    // Search each move (LMR, LMP, PVS logic, etc.)
     for (int move : moves)
     {
         const int parentPly = pos->ply;
@@ -733,6 +732,12 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
 
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestMove = move;
+        }
+
         // Check if this move improved alpha
         const int oldAlpha = alpha;
         if (pos->ply == 0) {
@@ -743,7 +748,6 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
 
         if (score > alpha)
         {
-            bestMove = move;
             hashFlag = BOUND_EXACT; // PV node
 
             // Update history for quiet moves
@@ -796,7 +800,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             return 0;
     }
 
-    // 14) Store in TT and return
+    // Store in TT and return
     tt->store(pos, depth, alpha, hashFlag, bestMove);
     return alpha;
 }
@@ -885,17 +889,15 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
 
     int valid_moves = 0;
     int bestMove = 0;
+    int bestScore = inCheck ? -INFINITY : alpha;
 
     for (int move : moves)
     {
-        if (!inCheck)
-        {
-            if (qsearch_delta_prune(pos, move, static_eval, alpha))
-                continue;
-
-            if (qsearch_see_prune(pos, move))
-                continue;
-        }
+        const bool promotionMove = get_promoted_piece(move) != 0;
+        const bool deltaPruned = !inCheck && !promotionMove &&
+                                 qsearch_delta_prune(pos, move, static_eval, alpha);
+        const bool seePruned = !inCheck && !promotionMove &&
+                               qsearch_see_prune(pos, move);
 
         const int parentPly = pos->ply;
         copyBoard(pos);
@@ -913,6 +915,22 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         valid_moves++;
         td->ply_moves[parentPly] = move;
 
+        const bool givesCheck = is_square_under_attack(
+            pos,
+            (pos->colour_to_move == white)
+                ? get_lsb_index(pos->piece_bitboards[K])
+                : get_lsb_index(pos->piece_bitboards[k]),
+            pos->colour_to_move ^ 1
+        );
+
+        if (!inCheck && !givesCheck && (deltaPruned || seePruned))
+        {
+            pos->ply--;
+            pos->repetition_index--;
+            restoreBoard(pos);
+            continue;
+        }
+
         int score = -quiescence(pos, td, -beta, -alpha);
 
         pos->ply--;
@@ -922,10 +940,15 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
 
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestMove = move;
+        }
+
         // found better move
         if (score > alpha)
         {
-            bestMove = move;
             alpha = score; // principal variation PV node (best move)
 
             // fail-hard beta cutoff
@@ -961,34 +984,40 @@ int score_move(thrawn::Position* pos, ThreadData* td, int move)
         }
     }
 
-    // handle promotions
-    if (get_promoted_piece(move) == Q || get_promoted_piece(move) == q)
-    {
-        return searchParams.queenPromotionScore;
-    }
+    const int promotedPiece = get_promoted_piece(move);
 
-    // captures: use MVV-LVA
+    // Captures: start with MVV-LVA, then push SEE-losing captures behind
+    // useful quiet moves. This mirrors Stockfish's good-capture / quiet /
+    // bad-capture staging without replacing the current full sort.
     if (get_is_capture_move(move))
     {
-        // find target piece
-        int target = P;
-        int start_piece;
-        int end_piece;
-        (pos->colour_to_move == white) ? start_piece = p : start_piece = P;
-        (pos->colour_to_move == white) ? end_piece = k : end_piece = K;
+        int target = captured_piece(pos, move);
+        if (target == -1)
+            target = pos->colour_to_move == white ? p : P;
 
-        for (int i = start_piece; i <= end_piece; i++)
+        int captureScore = mvv_lva[get_move_piece(move)][target] + 10000;
+        if (promotedPiece == Q || promotedPiece == q)
+            captureScore += 800;
+
+        if (!promotedPiece)
         {
-            if (get_bit(pos->piece_bitboards[i], get_move_target(move)))
-            {
-                target = i;
-                break;
-            }
+            const int seeScore = static_exchange_eval(pos, move);
+            if (seeScore < 0)
+                return -5000 + (mvv_lva[get_move_piece(move)][target] / 10) +
+                       std::clamp(seeScore, -2000, 0);
+
+            captureScore += std::min(seeScore, 1000);
         }
-        return mvv_lva[get_move_piece(move)][target] + 10000;
+
+        return captureScore;
     }
     else // quiet moves
     {
+        if (promotedPiece == Q || promotedPiece == q)
+        {
+            return searchParams.queenPromotionScore;
+        }
+
         if (td->killer_moves[0][pos->ply] == move)
             return searchParams.killerMoveScore1;
         else if (td->killer_moves[1][pos->ply] == move)
@@ -999,8 +1028,6 @@ int score_move(thrawn::Position* pos, ThreadData* td, int move)
                                   std::max(1, searchParams.counterMoveHistoryDivisor),
                               -searchParams.counterMoveHistoryCap,
                               searchParams.counterMoveHistoryCap);
-        else if (get_promoted_piece(move) == Q || get_promoted_piece(move) == q)
-            return mvv_lva[get_move_piece(move)][get_move_target(move)] + 100;
         else
             return std::clamp(history_score(td, move),
                               -searchParams.historyScoreCap,

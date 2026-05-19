@@ -47,9 +47,8 @@ uint64_t gen_hashkey(thrawn::Position* pos)
         bitboard = pos->piece_bitboards[piece];
         while(bitboard)
         {
-            int sq = get_lsb_index(bitboard);
+            int sq = pop_lsb(bitboard);
             hashkey ^= pos->piece_hashkey[piece][sq];
-            pop_bit(bitboard, sq);
 
         }
     }

@@ -40,45 +40,56 @@ OBJECTS := $(SOURCES:.cpp=.o)
 # Build type and flags
 ###############################################################################
 BUILD ?= release
+ARCH  ?= native
 
-OPT_FLAGS  := -O3 -flto -march=native
+OPT_FLAGS  := -O3 -flto
 ARCH_FLAGS :=
 MACOS_MIN_VERSION := 10.15
 
 ifeq ($(OS_NAME),Linux)
     ARCH_DETECTED := $(shell uname -m)
-    ifeq ($(ARCH_DETECTED),x86_64)
-        CPPFLAGS += -DUSE_AVX2
-        ARCH_FLAGS += -mavx2
-    else ifeq ($(ARCH_DETECTED),aarch64)
-        CPPFLAGS += -DUSE_NEON
-    endif
 else ifeq ($(OS_NAME),macOS)
     ARCH_DETECTED := $(shell uname -m)
     ifeq ($(ARCH_DETECTED),arm64)
         MACOS_MIN_VERSION := 11.0
-        CPPFLAGS += -DUSE_NEON
-    else
-        CPPFLAGS += -DUSE_AVX2
-        ARCH_FLAGS += -mavx2
     endif
     ARCH_FLAGS += -mmacosx-version-min=$(MACOS_MIN_VERSION)
 else ifeq ($(OS_NAME),Windows)
     ARCH_DETECTED := $(PROCESSOR_ARCHITECTURE)
     CPPFLAGS += -DWIN32
-    ifeq ($(ARCH_DETECTED),AMD64)
+endif
+
+ifeq ($(ARCH),native)
+    ifeq ($(ARCH_DETECTED),x86_64)
         CPPFLAGS += -DUSE_AVX2
-        ARCH_FLAGS += -mavx2
+        ARCH_FLAGS += -march=native -mavx2 -mpopcnt -mbmi
+    else ifeq ($(ARCH_DETECTED),AMD64)
+        CPPFLAGS += -DUSE_AVX2
+        ARCH_FLAGS += -march=native -mavx2 -mpopcnt -mbmi
+    else ifeq ($(ARCH_DETECTED),arm64)
+        CPPFLAGS += -DUSE_NEON
+    else ifeq ($(ARCH_DETECTED),aarch64)
+        CPPFLAGS += -DUSE_NEON
     else ifeq ($(ARCH_DETECTED),ARM64)
         CPPFLAGS += -DUSE_NEON
     endif
+else ifeq ($(ARCH),x86-64-avx2)
+    CPPFLAGS += -DUSE_AVX2
+    ARCH_FLAGS += -mavx2 -mpopcnt -mbmi
+else ifeq ($(ARCH),arm64-neon)
+    CPPFLAGS += -DUSE_NEON
+else ifeq ($(ARCH),arm64-neon-dotprod)
+    CPPFLAGS += -DUSE_NEON
+    ARCH_FLAGS += -march=armv8.2-a+dotprod
+else
+    $(error Unsupported ARCH '$(ARCH)'. Use native, x86-64-avx2, arm64-neon, or arm64-neon-dotprod)
 endif
 
 ifeq ($(BUILD),debug)
     CPPFLAGS += -DDEBUG_BUILD
     CXXFLAGS += -g $(ARCH_FLAGS)
 else ifeq ($(BUILD),release)
-    CPPFLAGS += -DRELEASE_BUILD
+    CPPFLAGS += -DRELEASE_BUILD -DNDEBUG
     CXXFLAGS += $(OPT_FLAGS) $(ARCH_FLAGS)
 endif
 

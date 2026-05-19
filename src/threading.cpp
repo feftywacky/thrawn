@@ -244,19 +244,18 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
                 break;
             }
             
-            // If the search “fails low” (score too low), narrow the window:
+            // If the search fails low, shift the window around the returned score.
             if (score <= alpha) {
-                // Adjust beta downward (Here we simply take the midpoint)
-                beta = (alpha + beta) / 2;
-                // Expand the lower window boundary by subtracting delta
-                alpha = std::max(-mateVal, alpha - delta);
+                beta = alpha;
+                alpha = std::max(-mateVal, score - delta);
                 // Restore the previous PV since the current iteration did not complete properly
                 td->pv_table[0] = backup_pv;
                 td->pv_length[0] = backup_pv_length;
             }
-            // If the search “fails high” (score too high), widen the window upward
+            // If the search fails high, keep some overlap and expand upward.
             else if (score >= beta) {
-                beta = std::min(mateVal, beta + delta);
+                alpha = std::max(alpha, beta - delta);
+                beta = std::min(mateVal, score + delta);
             }
             
             // Increase delta for the next iteration of the aspiration loop

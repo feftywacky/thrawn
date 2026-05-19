@@ -665,7 +665,7 @@ void uci_loop(thrawn::Position* pos)
             cout << "id name Thrawn"<< version << "\n";
             cout << "id author Feiyu Lin\n";
             cout << "option name Hash type spin default 256 min 4 max " << max_hashmap_size << "\n";
-            cout << "option name Threads type spin default 4 min 1 max 16" << "\n";
+            cout << "option name Threads type spin default 1 min 1 max 16" << "\n";
             cout << "option name EvalFile type string default model_v6.nnue" << "\n";
             cout << "option name ResetSearchParams type button" << "\n";
             for (const SearchParameterMeta& meta : search_parameter_metas()) {

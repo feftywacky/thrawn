@@ -5,9 +5,12 @@
 
 namespace {
 constexpr int TTClusterSize = 4;
+constexpr int TTAgeBits = 5;
+constexpr int TTAgeShift = 59;
+constexpr int TTAgeMask = (1 << TTAgeBits) - 1;
 
 int relative_age(int currentAge, int entryAge) {
-    return std::max(0, currentAge - entryAge);
+    return (currentAge - entryAge) & TTAgeMask;
 }
 
 int packed_depth(uint64_t data) {
@@ -18,19 +21,23 @@ int packed_flag(uint64_t data) {
     return static_cast<int>((data >> 57) & 0x3ULL);
 }
 
-int replacement_value(uint64_t data, int entryAge, int currentAge) {
+int packed_age(uint64_t data) {
+    return static_cast<int>((data >> TTAgeShift) & TTAgeMask);
+}
+
+int replacement_value(uint64_t data, int currentAge) {
     if (data == 0) {
         return -1000000;
     }
 
     const int flag = packed_flag(data);
     const int exactBonus = flag == BOUND_EXACT ? 2 : 0;
-    return packed_depth(data) + exactBonus - 8 * relative_age(currentAge, entryAge);
+    return packed_depth(data) + exactBonus - 8 * relative_age(currentAge, packed_age(data));
 }
 } // namespace
 
 TranspositionTable::TranspositionTable()
-    : table(nullptr), numEntries(0), numClusters(0), currentAge(0)
+    : table(nullptr), numEntries(0), numClusters(0), clusterMask(0), currentAge(0)
 {
 }
 
@@ -45,19 +52,25 @@ TranspositionTable::~TranspositionTable()
 void TranspositionTable::initTable(int mb)
 {
     int bytes = mb * 0x100000;  // Convert MB to bytes
-    numEntries = (bytes / sizeof(TTEntry) / TTClusterSize) * TTClusterSize;
-    numClusters = numEntries / TTClusterSize;
+    const int clusterCapacity = bytes / static_cast<int>(sizeof(TTEntry)) / TTClusterSize;
 
     if (table) {
         delete[] table;
         table = nullptr;
     }
 
-    if (numEntries < 1) {
+    if (clusterCapacity < 1) {
         std::cerr << "TT init: table too small, forcing 4 MB.\n";
         initTable(4);
         return;
     }
+
+    numClusters = 1;
+    while (numClusters <= clusterCapacity / 2) {
+        numClusters *= 2;
+    }
+    clusterMask = numClusters - 1;
+    numEntries = numClusters * TTClusterSize;
 
     table = new TTEntry[numEntries];
     reset();
@@ -71,7 +84,6 @@ void TranspositionTable::reset()
         for (int i = 0; i < numEntries; i++) {
             table[i].smp_key.store(0, std::memory_order_relaxed);
             table[i].smp_data.store(0, std::memory_order_relaxed);
-            table[i].age.store(0, std::memory_order_relaxed);
         }
     }
     currentAge.store(0, std::memory_order_relaxed);
@@ -82,7 +94,7 @@ bool TranspositionTable::probe(const thrawn::Position* pos, int& depth, int alph
     if (!table || numClusters <= 0)
         return false;
 
-    int index = static_cast<int>((pos->zobristKey % numClusters) * TTClusterSize);
+    int index = static_cast<int>((pos->zobristKey & static_cast<uint64_t>(clusterMask)) * TTClusterSize);
 
     for (int i = 0; i < TTClusterSize; i++)
     {
@@ -123,7 +135,7 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
     if (!table || numClusters <= 0)
         return;
 
-    int index = static_cast<int>((pos->zobristKey % numClusters) * TTClusterSize);
+    int index = static_cast<int>((pos->zobristKey & static_cast<uint64_t>(clusterMask)) * TTClusterSize);
     TTEntry* replace = &table[index];
     uint64_t replace_data = replace->smp_data.load(std::memory_order_relaxed);
     const int current = currentAge.load(std::memory_order_relaxed);
@@ -148,9 +160,7 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
             break;
         }
 
-        const int value = replacement_value(old_data,
-                                            candidate.age.load(std::memory_order_relaxed),
-                                            current);
+        const int value = replacement_value(old_data, current & TTAgeMask);
         if (value < worst_value)
         {
             worst_value = value;
@@ -169,11 +179,11 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
         score += pos->ply;
 
     uint64_t data = encodeTTData(bestMove, depth, score, flag);
+    data |= (static_cast<uint64_t>(current & TTAgeMask) << TTAgeShift);
     uint64_t key = pos->zobristKey ^ data;
     
     replace->smp_data.store(data, std::memory_order_relaxed);
     replace->smp_key.store(key, std::memory_order_relaxed);
-    replace->age.store(current, std::memory_order_relaxed);
 }
 
 // bit allocations:
@@ -181,6 +191,7 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
 // depth:      16 bits (mask: 0xFFFF)
 // score:      17 bits (mask: 0x1FFFF) after adding an offset of 50000
 // hash_flag:   2 bits (mask: 0x3)
+// age:         5 bits (stored by store() in bits 59-63)
 //
 // Note: Score is encoded as score + INFINITY so that the range -50000...+50000 becomes 0...100000.
 
