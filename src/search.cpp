@@ -9,7 +9,6 @@
 #include "uci.h" // for 'stopped' and 'communicate()'
 #include "globals.h"
 #include "constants.h"
-#include "search_params.h"
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -28,10 +27,6 @@ std::atomic<uint64_t> total_nodes(0);
 
 namespace {
 
-constexpr std::array<int, 6> PieceValues = {100, 320, 330, 500, 900, 20000};
-constexpr int NodeCounterBatch = 1024;
-constexpr int SeePruneMaxDepth = 4;
-constexpr int SeePruneDepthMargin = 200;
 
 bool is_quiet_move(int move) {
     return !get_is_capture_move(move) && !get_promoted_piece(move);
@@ -55,12 +50,12 @@ int reverse_futility_margin(int depth) {
         return 0;
     }
     if (depth == 1) {
-        return searchParams.reverseFutilityMargin1;
+        return SEARCH_REVERSE_FUTILITY_MARGIN_1;
     }
     if (depth == 2) {
-        return searchParams.reverseFutilityMargin2;
+        return SEARCH_REVERSE_FUTILITY_MARGIN_2;
     }
-    return searchParams.reverseFutilityDepthFactor * depth;
+    return SEARCH_REVERSE_FUTILITY_DEPTH_FACTOR * depth;
 }
 
 int razor_margin(int depth) {
@@ -68,31 +63,31 @@ int razor_margin(int depth) {
         return 0;
     }
     if (depth == 1) {
-        return searchParams.razorMargin1;
+        return SEARCH_RAZOR_MARGIN_1;
     }
     if (depth == 2) {
-        return searchParams.razorMargin2;
+        return SEARCH_RAZOR_MARGIN_2;
     }
-    return searchParams.razorMarginDepthN;
+    return SEARCH_RAZOR_MARGIN_DEPTH_N;
 }
 
 int null_move_reduction(int depth, int static_eval, int beta) {
     const int eval_margin = std::max(0, static_eval - beta);
-    const int depth_divisor = std::max(1, searchParams.nullMoveDepthDivisor);
-    const int eval_divisor = std::max(1, searchParams.nullMoveEvalDivisor);
-    int reduction = searchParams.nullMoveBaseReduction + depth / depth_divisor;
-    reduction += std::min(searchParams.nullMoveEvalBonusMax, eval_margin / eval_divisor);
+    const int depth_divisor = std::max(1, SEARCH_NULL_MOVE_DEPTH_DIVISOR);
+    const int eval_divisor = std::max(1, SEARCH_NULL_MOVE_EVAL_DIVISOR);
+    int reduction = SEARCH_NULL_MOVE_BASE_REDUCTION + depth / depth_divisor;
+    reduction += std::min(SEARCH_NULL_MOVE_EVAL_BONUS_MAX, eval_margin / eval_divisor);
     return std::clamp(reduction, 1, std::max(1, depth - 1));
 }
 
 int piece_value(int piece) {
-    return PieceValues[piece % 6];
+    return PIECE_VALUES[piece % 6];
 }
 
 void count_node(ThreadData* td) {
     td->nodes++;
-    if ((td->nodes & (NodeCounterBatch - 1)) == 0) {
-        total_nodes.fetch_add(NodeCounterBatch, std::memory_order_relaxed);
+    if ((td->nodes & (NODE_COUNTER_BATCH - 1)) == 0) {
+        total_nodes.fetch_add(NODE_COUNTER_BATCH, std::memory_order_relaxed);
     }
 }
 
@@ -333,20 +328,20 @@ bool qsearch_delta_prune(thrawn::Position* pos, int move, int static_eval, int a
     }
 
     return static_eval + qsearch_move_gain_upper_bound(pos, move) +
-           searchParams.qsearchDeltaMargin <= alpha;
+           SEARCH_QSEARCH_DELTA_MARGIN <= alpha;
 }
 
 int history_bonus(int depth) {
-    const int history_max = std::max(1, searchParams.historyMax);
-    const int bonus = searchParams.historyBonusDepthSquared * depth * depth +
-                      searchParams.historyBonusDepthLinear * depth;
+    const int history_max = std::max(1, SEARCH_HISTORY_MAX);
+    const int bonus = SEARCH_HISTORY_BONUS_DEPTH_SQUARED * depth * depth +
+                      SEARCH_HISTORY_BONUS_DEPTH_LINEAR * depth;
     return std::min(history_max / 2, bonus);
 }
 
 int previous_ply_move(ThreadData* td, int ply);
 
 void update_history_entry(int& entry, int bonus) {
-    const int history_max = std::max(1, searchParams.historyMax);
+    const int history_max = std::max(1, SEARCH_HISTORY_MAX);
     bonus = std::clamp(bonus, -history_max, history_max);
     const int gravity = bonus >= 0 ? bonus : -bonus;
     entry += bonus - entry * gravity / history_max;
@@ -388,7 +383,7 @@ void update_quiet_history(ThreadData* td, int side, int ply, int move, int depth
     const int bonus = history_bonus(depth);
     update_history_entry(td->quiet_history[side][get_move_source(move)]
                                            [get_move_target(move)], bonus);
-    update_continuation_history(td, ply, move, bonus * 3 / 4);
+    update_continuation_history(td, ply, move, bonus * SEARCH_CONTINUATION_HISTORY_NUMERATOR / SEARCH_CONTINUATION_HISTORY_DENOMINATOR);
 }
 
 void penalize_quiet_history(ThreadData* td, int side, int ply,
@@ -397,7 +392,7 @@ void penalize_quiet_history(ThreadData* td, int side, int ply,
     for (int move : moves) {
         update_history_entry(td->quiet_history[side][get_move_source(move)]
                                                [get_move_target(move)], penalty);
-        update_continuation_history(td, ply, move, penalty * 3 / 4);
+        update_continuation_history(td, ply, move, penalty * SEARCH_CONTINUATION_HISTORY_NUMERATOR / SEARCH_CONTINUATION_HISTORY_DENOMINATOR);
     }
 }
 
@@ -473,25 +468,25 @@ void update_counter_move(ThreadData* td, int ply, int move) {
 
 int late_move_reduction(int depth, int move_number, bool is_pv_node,
                         bool is_counter, int quiet_history) {
-    int reduction = searchParams.lmrBaseReduction +
-                    floor_log2_int(depth) * floor_log2_int(move_number) / 5;
-    if (!is_pv_node && depth >= searchParams.lmrNonPvDepth) {
+    int reduction = SEARCH_LMR_BASE_REDUCTION +
+                    floor_log2_int(depth) * floor_log2_int(move_number) / SEARCH_LMR_LOG_DIVISOR;
+    if (!is_pv_node && depth >= SEARCH_LMR_NON_PV_DEPTH) {
         ++reduction;
     } else if (is_pv_node) {
         --reduction;
     }
-    if (depth >= searchParams.lmrMoveDepth1 &&
-        move_number > searchParams.lmrMoveNumber1) {
+    if (depth >= SEARCH_LMR_MOVE_DEPTH_1 &&
+        move_number > SEARCH_LMR_MOVE_NUMBER_1) {
         ++reduction;
     }
-    if (depth >= searchParams.lmrMoveDepth2 &&
-        move_number > searchParams.lmrMoveNumber2) {
+    if (depth >= SEARCH_LMR_MOVE_DEPTH_2 &&
+        move_number > SEARCH_LMR_MOVE_NUMBER_2) {
         ++reduction;
     }
 
-    const int history_max = std::max(1, searchParams.historyMax);
-    const int good_history_divisor = std::max(1, searchParams.lmrGoodHistoryDivisor);
-    const int bad_history_divisor = std::max(1, searchParams.lmrBadHistoryDivisor);
+    const int history_max = std::max(1, SEARCH_HISTORY_MAX);
+    const int good_history_divisor = std::max(1, SEARCH_LMR_GOOD_HISTORY_DIVISOR);
+    const int bad_history_divisor = std::max(1, SEARCH_LMR_BAD_HISTORY_DIVISOR);
     const int good_threshold = history_max / good_history_divisor;
     const int bad_threshold = history_max / bad_history_divisor;
 
@@ -729,19 +724,19 @@ bool move_is_pseudo_legal(thrawn::Position* pos, int move, int moveType) {
 
 int quiet_move_score(ThreadData* td, int side, int ply, int move) {
     if (td->killer_moves[0][ply] == move)
-        return searchParams.killerMoveScore1;
+        return SEARCH_KILLER_MOVE_SCORE_1;
     if (td->killer_moves[1][ply] == move)
-        return searchParams.killerMoveScore2;
+        return SEARCH_KILLER_MOVE_SCORE_2;
     if (is_counter_move(td, ply, move))
-        return searchParams.counterMoveScore +
+        return SEARCH_COUNTER_MOVE_SCORE +
                std::clamp(quiet_history_score(td, side, ply, move) /
-                              std::max(1, searchParams.counterMoveHistoryDivisor),
-                          -searchParams.counterMoveHistoryCap,
-                          searchParams.counterMoveHistoryCap);
+                              std::max(1, SEARCH_COUNTER_MOVE_HISTORY_DIVISOR),
+                          -SEARCH_COUNTER_MOVE_HISTORY_CAP,
+                          SEARCH_COUNTER_MOVE_HISTORY_CAP);
 
     return std::clamp(quiet_history_score(td, side, ply, move),
-                      -searchParams.historyScoreCap,
-                      searchParams.historyScoreCap);
+                      -SEARCH_HISTORY_SCORE_CAP,
+                      SEARCH_HISTORY_SCORE_CAP);
 }
 
 int tactical_move_score(thrawn::Position* pos, ThreadData* td, int move) {
@@ -751,20 +746,21 @@ int tactical_move_score(thrawn::Position* pos, ThreadData* td, int move) {
         if (target == -1)
             target = pos->colour_to_move == white ? p : P;
 
-        int score = 10000 + 8 * piece_value(target) -
-                    piece_value(get_move_piece(move)) / 8 +
-                    capture_history_score(td, pos, move) / 4;
+        int score = SEARCH_TACTICAL_CAPTURE_BASE_SCORE +
+                    SEARCH_TACTICAL_VICTIM_MULTIPLIER * piece_value(target) -
+                    piece_value(get_move_piece(move)) / SEARCH_TACTICAL_ATTACKER_DIVISOR +
+                    capture_history_score(td, pos, move) / SEARCH_TACTICAL_CAPTURE_HISTORY_DIVISOR;
         if (promotedPiece == Q || promotedPiece == q)
-            score += 800;
+            score += SEARCH_TACTICAL_QUEEN_PROMOTION_BONUS;
         else if (promotedPiece)
             score += piece_value(promotedPiece) / 2;
         return score;
     }
 
     if (promotedPiece == Q || promotedPiece == q)
-        return searchParams.queenPromotionScore;
+        return SEARCH_QUEEN_PROMOTION_SCORE;
     if (promotedPiece)
-        return searchParams.queenPromotionScore - 1000 + piece_value(promotedPiece);
+        return SEARCH_QUEEN_PROMOTION_SCORE - SEARCH_TACTICAL_UNDERPROMOTION_OFFSET + piece_value(promotedPiece);
 
     return 0;
 }
@@ -774,9 +770,10 @@ int bad_capture_score(thrawn::Position* pos, ThreadData* td, int move, int seeSc
     if (target == -1)
         target = pos->colour_to_move == white ? p : P;
 
-    return -5000 + piece_value(target) / 2 +
-           capture_history_score(td, pos, move) / 8 +
-           std::clamp(seeScore, -2000, 0);
+    return SEARCH_BAD_CAPTURE_BASE_SCORE +
+           piece_value(target) / SEARCH_BAD_CAPTURE_VICTIM_DIVISOR +
+           capture_history_score(td, pos, move) / SEARCH_BAD_CAPTURE_HISTORY_DIVISOR +
+           std::clamp(seeScore, SEARCH_BAD_CAPTURE_SEE_FLOOR, 0);
 }
 
 bool should_classify_capture_with_see(int move) {
@@ -1039,15 +1036,27 @@ private:
     }
 };
 
+int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
+                 int beta, int excludedMove);
+
 } // namespace
 
 int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int beta)
+{
+    return negamax_impl(pos, td, depth, alpha, beta, 0);
+}
+
+namespace {
+
+int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
+                 int beta, int excludedMove)
 {
     int score = 0;
     int bestScore = -INFINITY;
     int bestMove = 0;
     int hashFlag = BOUND_UPPER;
     int static_eval = 0;
+    const bool excludedNode = excludedMove != 0;
 
     if (stopped.load(std::memory_order_relaxed) == 1)
         return alpha;
@@ -1098,7 +1107,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // stored entry is deep enough for the actual node depth being searched.
     if (inCheck)
     {
-        depth += searchParams.checkExtension;
+        depth += SEARCH_CHECK_EXTENSION;
     }
 
     if (depth <= 0)
@@ -1114,7 +1123,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     int ttScore = 0;
     if ((ttHit = tt->probe(pos, ttDepth, alpha, beta, ttMove, ttScore, ttFlag)))
     {
-        if (ttDepth >= depth && !isPvNode)
+        if (!excludedNode && ttDepth >= depth && !isPvNode)
         {
             // Table is exact or produces a cutoff
             if ( ttFlag == BOUND_EXACT 
@@ -1140,8 +1149,8 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // --------------------------------------
     // Razoring (shallow depth, not in check, non-PV)
     // --------------------------------------
-    if (!inCheck && !isPvNode && !pawnOnlyEndgame &&
-        depth <= searchParams.razorMaxDepth && pos->ply > 0 &&
+    if (!excludedNode && !inCheck && !isPvNode && !pawnOnlyEndgame &&
+        depth <= SEARCH_RAZOR_MAX_DEPTH && pos->ply > 0 &&
         !is_mate_score(alpha))
     {
         score = static_eval + razor_margin(depth);
@@ -1167,8 +1176,8 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // Reverse Futility Pruning (RFP)
     //    Often called "static-nullmove" or "futility"
     // --------------------------------------
-    if (!inCheck && !isPvNode && !pawnOnlyEndgame &&
-        depth <= searchParams.reverseFutilityMaxDepth &&
+    if (!excludedNode && !inCheck && !isPvNode && !pawnOnlyEndgame &&
+        depth <= SEARCH_REVERSE_FUTILITY_MAX_DEPTH &&
         !is_mate_score(beta) && !is_mate_score(static_eval))
     {
         int eval_margin = reverse_futility_margin(depth);
@@ -1182,7 +1191,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // --------------------------------------
     // Null-move pruning
     // --------------------------------------
-    if (!inCheck && depth >= searchParams.nullMoveMinDepth && !isPvNode && static_eval >= beta &&
+    if (!excludedNode && !inCheck && depth >= SEARCH_NULL_MOVE_MIN_DEPTH && !isPvNode && static_eval >= beta &&
         !pawnOnlyEndgame && td->allowNullMovePruning &&
         !is_mate_score(beta) && !is_mate_score(static_eval))
     {
@@ -1195,7 +1204,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         // Null-move search with reduced depth
         int reduction = null_move_reduction(depth, static_eval, beta);
         td->allowNullMovePruning = false;
-        score = -negamax(pos, td, depth - 1 - reduction, -beta, -beta + 1);
+        score = -negamax_impl(pos, td, depth - 1 - reduction, -beta, -beta + 1, 0);
         td->allowNullMovePruning = true;
         
         unmake_null_move(pos, pos->ply);
@@ -1208,12 +1217,12 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         // If this "fake pass" search fails high, then cut
         if (score >= beta && !is_mate_score(score))
         {
-            if (depth >= searchParams.nullMoveVerificationDepth)
+            if (depth >= SEARCH_NULL_MOVE_VERIFICATION_DEPTH)
             {
                 const bool savedNullMoveState = td->allowNullMovePruning;
                 td->allowNullMovePruning = false;
                 const int verificationDepth = std::max(1, depth - reduction);
-                const int verification = negamax(pos, td, verificationDepth, beta - 1, beta);
+                const int verification = negamax_impl(pos, td, verificationDepth, beta - 1, beta, 0);
                 td->allowNullMovePruning = savedNullMoveState;
 
                 if (stopped.load(std::memory_order_relaxed) == 1)
@@ -1225,6 +1234,80 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             else
             {
                 return beta;
+            }
+        }
+    }
+
+    // --------------------------------------
+    // ProbCut
+    // --------------------------------------
+    const int probCutDepth = depth - 1 - SEARCH_PROBCUT_REDUCTION;
+    if (!excludedNode && !inCheck && !isPvNode && !pawnOnlyEndgame &&
+        depth >= SEARCH_PROBCUT_MIN_DEPTH && probCutDepth > 0 &&
+        !is_mate_score(beta) && beta < mateScore - SEARCH_PROBCUT_MARGIN)
+    {
+        const int probCutBeta = beta + SEARCH_PROBCUT_MARGIN;
+        const bool ttRefutesProbCut =
+            ttHit && ttDepth >= depth - SEARCH_PROBCUT_REDUCTION &&
+            (ttFlag == BOUND_EXACT || ttFlag == BOUND_UPPER) &&
+            ttScore < probCutBeta;
+
+        if (!ttRefutesProbCut)
+        {
+            MovePicker probCutPicker(pos, td, ttMove, false, only_captures);
+            PickedMove probCutPicked;
+            while (probCutPicker.next(probCutPicked))
+            {
+                const int move = probCutPicked.move;
+                if (!get_promoted_piece(move))
+                {
+                    const int seeScore = probCutPicked.seeKnown
+                        ? probCutPicked.seeScore
+                        : static_exchange_eval(pos, move);
+                    if (seeScore < SEARCH_PROBCUT_SEE_MARGIN)
+                        continue;
+                }
+
+                const int parentPly = pos->ply;
+                pos->ply++;
+                pos->repetition_index++;
+                pos->repetition_table[pos->repetition_index] = pos->zobristKey;
+
+                if (!make_move_on_board(pos, move, all_moves, pos->ply))
+                {
+                    pos->ply--;
+                    pos->repetition_index--;
+                    continue;
+                }
+                td->ply_moves[parentPly] = move;
+
+                const bool savedFollowPv = td->follow_pv_flag;
+                const bool savedScorePv = td->score_pv_flag;
+                td->follow_pv_flag = false;
+                td->score_pv_flag = false;
+
+                score = -quiescence(pos, td, -probCutBeta, -probCutBeta + 1);
+                if (score >= probCutBeta)
+                {
+                    score = -negamax_impl(pos, td, probCutDepth,
+                                          -probCutBeta, -probCutBeta + 1, 0);
+                }
+
+                td->follow_pv_flag = savedFollowPv;
+                td->score_pv_flag = savedScorePv;
+
+                unmake_move(pos, pos->ply);
+                pos->ply--;
+                pos->repetition_index--;
+
+                if (stopped.load(std::memory_order_relaxed) == 1)
+                    return alpha;
+
+                if (score >= probCutBeta)
+                {
+                    tt->store(pos, depth, beta, BOUND_LOWER, move);
+                    return beta;
+                }
             }
         }
     }
@@ -1248,6 +1331,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     while (movePicker.next(picked))
     {
         const int move = picked.move;
+        if (move == excludedMove)
+            continue;
+
         const int parentPly = pos->ply;
         const int parentSide = pos->colour_to_move;
         const bool quietMove = is_quiet_move(move);
@@ -1270,12 +1356,12 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             quiet_moves_seen++;
         }
 
-        if (!firstMove && pos->ply && !isPvNode && !inCheck && !pawnOnlyEndgame)
+        if (!excludedNode && !firstMove && pos->ply && !isPvNode && !inCheck && !pawnOnlyEndgame)
         {
             const bool castleMove = get_is_move_castling(move);
 
             if (quietMove && !pawnMove && !castleMove &&
-                depth <= searchParams.futilityMaxDepth &&
+                depth <= SEARCH_FUTILITY_MAX_DEPTH &&
                 static_eval + futility_margin(depth) <= alpha &&
                 !gives_check())
             {
@@ -1284,7 +1370,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             }
 
             if (quietMove && !pawnMove && !castleMove &&
-                depth <= searchParams.lateMovePruningMaxDepth &&
+                depth <= SEARCH_LATE_MOVE_PRUNING_MAX_DEPTH &&
                 quiet_moves_seen > futility_move_count(depth) &&
                 !gives_check())
             {
@@ -1293,12 +1379,12 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             }
 
             if (get_is_capture_move(move) && !get_promoted_piece(move) &&
-                depth <= SeePruneMaxDepth)
+                depth <= SEARCH_SEE_PRUNE_MAX_DEPTH)
             {
                 const int seeScore = picked.seeKnown
                     ? picked.seeScore
                     : static_exchange_eval(pos, move);
-                if (seeScore < -SeePruneDepthMargin * depth && !gives_check())
+                if (seeScore < -SEARCH_SEE_PRUNE_DEPTH_MARGIN * depth && !gives_check())
                 {
                     pruned_moves = true;
                     continue;
@@ -1308,9 +1394,48 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
 
         const bool needsLmrCheckInfo =
             !firstMove && quietMove && !get_is_move_castling(move) &&
-            depth >= searchParams.lmrReductionDepthLimit && !inCheck;
+            depth >= SEARCH_LMR_REDUCTION_DEPTH_LIMIT && !inCheck;
         if (needsLmrCheckInfo)
             gives_check();
+
+        int extension = 0;
+        if (!excludedNode && pos->ply > 0 && move == ttMove &&
+            SEARCH_SINGULAR_EXTENSION > 0 &&
+            depth >= SEARCH_SINGULAR_EXTENSION_MIN_DEPTH &&
+            ttHit && ttDepth >= depth - SEARCH_SINGULAR_EXTENSION_DEPTH_MARGIN &&
+            (ttFlag == BOUND_LOWER || ttFlag == BOUND_EXACT) &&
+            ttScore > alpha && !is_mate_score(ttScore) && !inCheck)
+        {
+            const int singularMargin =
+                SEARCH_SINGULAR_EXTENSION_BASE_MARGIN +
+                SEARCH_SINGULAR_EXTENSION_DEPTH_FACTOR * depth;
+            const int singularBeta =
+                std::max(-INFINITY + 1, std::min(INFINITY - 1,
+                                                 ttScore - singularMargin));
+            const int singularDepth = std::max(1, (depth - 1) / 2);
+
+            const bool savedFollowPv = td->follow_pv_flag;
+            const bool savedScorePv = td->score_pv_flag;
+            const int savedPvLength = td->pv_length[pos->ply];
+            const auto savedPvRow = td->pv_table[pos->ply];
+            td->follow_pv_flag = false;
+            td->score_pv_flag = false;
+
+            const int singularScore = negamax_impl(pos, td, singularDepth,
+                                                   singularBeta - 1,
+                                                   singularBeta, move);
+
+            td->follow_pv_flag = savedFollowPv;
+            td->score_pv_flag = savedScorePv;
+            td->pv_length[pos->ply] = savedPvLength;
+            td->pv_table[pos->ply] = savedPvRow;
+
+            if (stopped.load(std::memory_order_relaxed) == 1)
+                return alpha;
+
+            if (singularScore < singularBeta)
+                extension = SEARCH_SINGULAR_EXTENSION;
+        }
 
         pos->ply++;
         pos->repetition_index++;
@@ -1324,13 +1449,15 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         }
         valid_moves++;
         td->ply_moves[parentPly] = move;
+        const int childDepth = depth - 1 + extension;
 
-        auto search_child = [&](int childDepth, int childAlpha, int childBeta) {
+        auto search_child = [&](int searchDepth, int childAlpha, int childBeta) {
             const bool savedFollowPv = td->follow_pv_flag;
             const bool savedScorePv = td->score_pv_flag;
             td->follow_pv_flag = nodeFollowPv && td->pv_table[0][parentPly] == move;
             td->score_pv_flag = false;
-            const int childScore = -negamax(pos, td, childDepth, childAlpha, childBeta);
+            const int childScore = -negamax_impl(pos, td, searchDepth, childAlpha,
+                                                 childBeta, 0);
             td->follow_pv_flag = savedFollowPv;
             td->score_pv_flag = savedScorePv;
             return childScore;
@@ -1342,7 +1469,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         if (moves_searched == 0)
         {
             // First move: full-window search
-            score = search_child(depth - 1, -beta, -alpha);
+            score = search_child(childDepth, -beta, -alpha);
         }
         else
         {
@@ -1354,8 +1481,8 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
                 : 0;
             const bool counterMove = quietMove && is_counter_move(td, parentPly, move);
 
-            if (quiet_moves_seen >= searchParams.lmrFullDepthMoves &&
-                depth >= searchParams.lmrReductionDepthLimit &&
+            if (quiet_moves_seen >= SEARCH_LMR_FULL_DEPTH_MOVES &&
+                depth >= SEARCH_LMR_REDUCTION_DEPTH_LIMIT &&
                 !inCheck &&
                 !givesCheck &&
                 quietMove &&
@@ -1364,7 +1491,7 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
                 // Reduced search
                 int reduction = late_move_reduction(depth, moves_searched + 1,
                                                     isPvNode, counterMove, quietHistory);
-                int reducedDepth = std::max(1, depth - 1 - reduction);
+                int reducedDepth = std::max(1, childDepth - reduction);
                 score = search_child(reducedDepth, -alpha - 1, -alpha);
             }
             else
@@ -1377,12 +1504,12 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             if (score > alpha)
             {
                 // Do a PVS re-search with a narrow window
-                score = search_child(depth - 1, -alpha - 1, -alpha);
+                score = search_child(childDepth, -alpha - 1, -alpha);
 
                 // If it's still above alpha but not >= beta, do a full re-search
                 if (score > alpha && score < beta)
                 {
-                    score = search_child(depth - 1, -beta, -alpha);
+                    score = search_child(childDepth, -beta, -alpha);
                 }
             }
         }
@@ -1413,11 +1540,11 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         {
             hashFlag = BOUND_EXACT; // PV node
 
-            if (quietMove)
+            if (!excludedNode && quietMove)
             {
                 update_quiet_history(td, parentSide, pos->ply, move, depth);
             }
-            else if (captureMove)
+            else if (!excludedNode && captureMove)
             {
                 update_capture_history(td, pos, move, depth);
             }
@@ -1435,17 +1562,21 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             // Fail-hard beta cutoff
             if (alpha >= beta)
             {
-                tt->store(pos, depth, beta, BOUND_LOWER, bestMove);
+                if (!excludedNode)
+                    tt->store(pos, depth, beta, BOUND_LOWER, bestMove);
 
-                if (quietMove)
+                if (!excludedNode && quietMove)
                 {
                     td->killer_moves[1][pos->ply] = td->killer_moves[0][pos->ply];
                     td->killer_moves[0][pos->ply] = move;
                     update_counter_move(td, pos->ply, move);
                 }
-                penalize_quiet_history(td, parentSide, pos->ply,
-                                       failed_quiet_moves, depth);
-                penalize_capture_history(td, pos, failed_capture_moves, depth);
+                if (!excludedNode)
+                {
+                    penalize_quiet_history(td, parentSide, pos->ply,
+                                           failed_quiet_moves, depth);
+                    penalize_capture_history(td, pos, failed_capture_moves, depth);
+                }
                 return beta;
             }
         }
@@ -1463,6 +1594,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     // if no valid moves
     if (valid_moves == 0)
     {
+        if (excludedNode)
+            return alpha;
+
         if (pruned_moves)
             return alpha;
 
@@ -1475,9 +1609,12 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     }
 
     // Store in TT and return
-    tt->store(pos, depth, alpha, hashFlag, bestMove);
+    if (!excludedNode)
+        tt->store(pos, depth, alpha, hashFlag, bestMove);
     return alpha;
 }
+
+} // namespace
 
 int quiescence(thrawn::Position* pos, ThreadData* td,
                int alpha, int beta)
@@ -1668,12 +1805,12 @@ int futility_margin(int depth)
         return 0;
     }
     if (depth == 1) {
-        return searchParams.futilityMargin1;
+        return SEARCH_FUTILITY_MARGIN_1;
     }
     if (depth == 2) {
-        return searchParams.futilityMargin2;
+        return SEARCH_FUTILITY_MARGIN_2;
     }
-    return searchParams.futilityMargin3;
+    return SEARCH_FUTILITY_MARGIN_3;
 }
 
 int futility_move_count(int depth)
@@ -1682,10 +1819,10 @@ int futility_move_count(int depth)
         return 0;
     }
     if (depth == 1) {
-        return searchParams.lateMovePruningDepth1;
+        return SEARCH_LATE_MOVE_PRUNING_DEPTH_1;
     }
     if (depth == 2) {
-        return searchParams.lateMovePruningDepth2;
+        return SEARCH_LATE_MOVE_PRUNING_DEPTH_2;
     }
-    return searchParams.lateMovePruningDepth3;
+    return SEARCH_LATE_MOVE_PRUNING_DEPTH_3;
 }

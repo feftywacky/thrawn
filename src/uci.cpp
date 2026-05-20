@@ -14,7 +14,6 @@
 #include "misc.h"
 #include "globals.h"
 #include "nnue.h"
-#include "search_params.h"
 #include <stdlib.h>
 #include <vector>
 #include <cstring>
@@ -656,13 +655,6 @@ void uci_loop(thrawn::Position* pos)
             cout << "option name Hash type spin default 256 min 4 max " << max_hashmap_size << "\n";
             cout << "option name Threads type spin default 1 min 1 max 16" << "\n";
             cout << "option name EvalFile type string default model_v5.nnue" << "\n";
-            cout << "option name ResetSearchParams type button" << "\n";
-            for (const SearchParameterMeta& meta : search_parameter_metas()) {
-                cout << "option name " << meta.name
-                     << " type spin default " << meta.defaultValue
-                     << " min " << meta.minValue
-                     << " max " << meta.maxValue << "\n";
-            }
             cout << "uciok\n";
         }
         
@@ -697,18 +689,8 @@ void uci_loop(thrawn::Position* pos)
                 nnue_init(path.c_str());
                 nnue_refresh_root(pos);
             }
-            else if (option_name_equals(optionName, "ResetSearchParams")) {
-                reset_search_parameters();
-                std::cout << "info string Reset search parameters\n";
-            }
             else {
-                int appliedValue = 0;
-                if (set_search_parameter(optionName, std::atoi(optionValue.c_str()), &appliedValue)) {
-                    std::cout << "info string Set " << optionName << " = "
-                              << appliedValue << std::endl;
-                } else {
-                    std::cout << "info string Unknown option " << optionName << std::endl;
-                }
+                std::cout << "info string Unknown option " << optionName << std::endl;
             }
         }
 

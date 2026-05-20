@@ -5,7 +5,6 @@
 #include "move_helpers.h"
 #include "transposition_table.h"
 #include "globals.h"
-#include "search_params.h"
 #include <thread>
 #include <iostream>
 #include <atomic>
@@ -13,7 +12,6 @@
 #include <cstdint>
 
 static std::int64_t globalSearchStartTime = 0;
-constexpr int NodeCounterBatch = 1024;
 
 static int uci_mate_score(int score) {
     if (score >= mateScore) {
@@ -211,10 +209,10 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         td->follow_pv_flag = true;
 
         // For configured aspiration depths, derive the window from the previous score.
-        const int threadCycle = std::max(1, searchParams.aspirationThreadCycle);
-        int delta = searchParams.aspirationWindowSize +
-                    (threadID % threadCycle) * searchParams.aspirationThreadDelta;
-        if(curr_depth>=searchParams.aspirationWindowDepth)
+        const int threadCycle = std::max(1, SEARCH_ASPIRATION_THREAD_CYCLE);
+        int delta = SEARCH_ASPIRATION_WINDOW_SIZE +
+                    (threadID % threadCycle) * SEARCH_ASPIRATION_THREAD_DELTA;
+        if(curr_depth>=SEARCH_ASPIRATION_WINDOW_DEPTH)
         {
             // Use the previous iteration’s best score (final_score) to set the window.
             // Here we “clamp” alpha to at least –mateVal and beta to at most mateVal.
@@ -277,8 +275,8 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             break;
 
         // Update the aspiration window.
-        alpha = score - searchParams.aspirationWindowSize;
-        beta = score + searchParams.aspirationWindowSize;
+        alpha = score - SEARCH_ASPIRATION_WINDOW_SIZE;
+        beta = score + SEARCH_ASPIRATION_WINDOW_SIZE;
 
         td->final_depth = curr_depth;
         td->final_score = score;
@@ -304,7 +302,7 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
             const std::uint64_t reportedNodes =
                 total_nodes.load(std::memory_order_relaxed) +
-                static_cast<std::uint64_t>(td->nodes & (NodeCounterBatch - 1));
+                static_cast<std::uint64_t>(td->nodes & (NODE_COUNTER_BATCH - 1));
             std::cout << "info depth " << curr_depth
                       << " nodes " << reportedNodes
                       << " time " << currentTime;
@@ -476,7 +474,7 @@ SearchResult select_best_thread(ThreadData threadDatas[], int numThreads) {
 
             const int scoreGap = std::max(1,
                                           threadDatas[i].final_score - worstScore +
-                                              searchParams.smpVoteScoreOffset);
+                                              SEARCH_SMP_VOTE_SCORE_OFFSET);
             vote->votes += static_cast<long long>(std::max(1, threadDatas[i].final_depth)) * scoreGap;
 
             if (threadDatas[i].final_depth > vote->best_depth ||
