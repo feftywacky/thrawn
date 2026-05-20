@@ -27,23 +27,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
 int quiescence(thrawn::Position* pos, ThreadData* td, int alpha, int beta);
 
 /*
- * Move ordering utilities
- */
-int score_move(thrawn::Position* pos, ThreadData* td, int move);
-void sort_moves(thrawn::Position* pos, ThreadData* td, std::vector<int>& moves, int bestMove);
-void score_pv(thrawn::Position* pos, std::vector<int>& moves, ThreadData* td);
-
-/*
  * Repetition check
  */
 int isRepetition(thrawn::Position* pos);
-
-/*
- * A helper for quicksort-based move ordering
- */
-void quicksort_moves(std::vector<int> &moves,
-                     std::vector<int> &move_scores,
-                     int low, int high);
 
 /*
  * Some futility / LMP helpers

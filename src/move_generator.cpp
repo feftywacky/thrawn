@@ -21,14 +21,17 @@ inline void append_moves_from_attacks(int source,
                                       vector<int>& moves,
                                       int move_type)
 {
-    uint64_t captures = attacks & enemies;
-    while (captures)
+    if (move_type != only_quiets)
     {
-        const int target = pop_lsb(captures);
-        moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
+        uint64_t captures = attacks & enemies;
+        while (captures)
+        {
+            const int target = pop_lsb(captures);
+            moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
+        }
     }
 
-    if (move_type == all_moves)
+    if (move_type == all_moves || move_type == only_quiets)
     {
         uint64_t quiets = attacks & ~enemies;
         while (quiets)
@@ -50,7 +53,7 @@ vector<int> generate_moves(thrawn::Position* pos)
 vector<int> generate_moves(thrawn::Position* pos, int move_type)
 {
     vector<int> moves;
-    moves.reserve(128);
+    moves.reserve(move_type == only_captures ? 32 : 96);
 
     if (pos->colour_to_move == white)
     {
@@ -69,7 +72,7 @@ vector<int> generate_moves(thrawn::Position* pos, int move_type)
         curr = pos->piece_bitboards[Q];
         parse_queen_moves(pos, curr, Q, moves, move_type);
 
-        if (move_type == all_moves)
+        if (move_type == all_moves || move_type == only_quiets)
             parse_white_castle_moves(pos, moves);
 
         curr = pos->piece_bitboards[K];
@@ -92,7 +95,7 @@ vector<int> generate_moves(thrawn::Position* pos, int move_type)
         curr = pos->piece_bitboards[q];
         parse_queen_moves(pos, curr, q, moves, move_type);
 
-        if (move_type == all_moves)
+        if (move_type == all_moves || move_type == only_quiets)
             parse_black_castle_moves(pos, moves);
 
         curr = pos->piece_bitboards[k];
@@ -114,14 +117,17 @@ void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
             // pawn promotion by going up one square (NOT TAKING A PIECE)
             if (source>=a7 && source<=h7)
             {
-                moves.push_back(parse_move(source, target, P, Q, 0, 0, 0, 0));
-                moves.push_back(parse_move(source, target, P, R, 0, 0, 0, 0));
-                moves.push_back(parse_move(source, target, P, N, 0, 0, 0, 0));
-                moves.push_back(parse_move(source, target, P, B, 0, 0, 0, 0));
+                if (move_type != only_quiets)
+                {
+                    moves.push_back(parse_move(source, target, P, Q, 0, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, P, R, 0, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, P, N, 0, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, P, B, 0, 0, 0, 0));
+                }
             }
 
             // one square and two square pawn moves
-            else if (move_type == all_moves)
+            else if (move_type == all_moves || move_type == only_quiets)
             {
                 // one square
                 moves.push_back(parse_move(source, target, P, 0, 0, 0, 0, 0));
@@ -134,37 +140,40 @@ void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
             }
         }
 
-        uint64_t attacks = pos->pawn_attacks[pos->colour_to_move][source]  & pos->occupancies[black];
-
-        while (attacks) // while attacks squares are present on the board
-        {   
-            target = pop_lsb(attacks);
-
-            if (source>=a7 && source<=h7) // pawn promotions by capturing a piece
-            {
-                moves.push_back(parse_move(source, target, P, Q, 1, 0, 0, 0));
-                moves.push_back(parse_move(source, target, P, R, 1, 0, 0, 0));
-                moves.push_back(parse_move(source, target, P, N, 1, 0, 0, 0));
-                moves.push_back(parse_move(source, target, P, B, 1, 0, 0, 0));
-            }
-
-            // diagonal pawn capture
-            else
-            {
-                moves.push_back(parse_move(source, target, P, 0, 1, 0, 0, 0));
-            }
-
-        }
-
-        // enpassant
-        if (pos->enpassant!=null_sq)
+        if (move_type != only_quiets)
         {
-            
-            uint64_t enpassant_attacks = pos->pawn_attacks[pos->colour_to_move][source] & (1ULL << pos->enpassant);
-            if (enpassant_attacks)
+            uint64_t attacks = pos->pawn_attacks[pos->colour_to_move][source]  & pos->occupancies[black];
+
+            while (attacks) // while attacks squares are present on the board
+            {   
+                target = pop_lsb(attacks);
+
+                if (source>=a7 && source<=h7) // pawn promotions by capturing a piece
+                {
+                    moves.push_back(parse_move(source, target, P, Q, 1, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, P, R, 1, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, P, N, 1, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, P, B, 1, 0, 0, 0));
+                }
+
+                // diagonal pawn capture
+                else
+                {
+                    moves.push_back(parse_move(source, target, P, 0, 1, 0, 0, 0));
+                }
+
+            }
+
+            // enpassant
+            if (pos->enpassant!=null_sq)
             {
-                int enpassant_target = get_lsb_index(enpassant_attacks);
-                moves.push_back(parse_move(source, enpassant_target, P, 0, 1, 0, 1, 0));
+                
+                uint64_t enpassant_attacks = pos->pawn_attacks[pos->colour_to_move][source] & (1ULL << pos->enpassant);
+                if (enpassant_attacks)
+                {
+                    int enpassant_target = get_lsb_index(enpassant_attacks);
+                    moves.push_back(parse_move(source, enpassant_target, P, 0, 1, 0, 1, 0));
+                }
             }
         }
     }
@@ -206,14 +215,17 @@ void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
             // pawn promotion by going down one square (NOT TAKING A PIECE)
             if (source>=a2 && source<=h2)
             {
-                moves.push_back(parse_move(source, target, p, q, 0, 0, 0, 0));
-                moves.push_back(parse_move(source, target, p, r, 0, 0, 0, 0));
-                moves.push_back(parse_move(source, target, p, n, 0, 0, 0, 0));
-                moves.push_back(parse_move(source, target, p, b, 0, 0, 0, 0));
+                if (move_type != only_quiets)
+                {
+                    moves.push_back(parse_move(source, target, p, q, 0, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, p, r, 0, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, p, n, 0, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, p, b, 0, 0, 0, 0));
+                }
             }
 
             // one square and two square pawn moves
-            else if (move_type == all_moves)
+            else if (move_type == all_moves || move_type == only_quiets)
             {
                 // one square
                 moves.push_back(parse_move(source, target, p, 0, 0, 0, 0, 0));
@@ -224,36 +236,39 @@ void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
             }
         }
 
-        uint64_t attacks = pos->pawn_attacks[pos->colour_to_move][source] & pos->occupancies[white];
+        if (move_type != only_quiets)
+        {
+            uint64_t attacks = pos->pawn_attacks[pos->colour_to_move][source] & pos->occupancies[white];
 
-        while (attacks) // while attacks squares are present on the board
-        {   
-            target = pop_lsb(attacks);
+            while (attacks) // while attacks squares are present on the board
+            {   
+                target = pop_lsb(attacks);
 
-            if (source>=a2 && source<=h2) // pawn promotion by capturing piece
-            {
-                moves.push_back(parse_move(source, target, p, q, 1, 0, 0, 0));
-                moves.push_back(parse_move(source, target, p, r, 1, 0, 0, 0));
-                moves.push_back(parse_move(source, target, p, n, 1, 0, 0, 0));
-                moves.push_back(parse_move(source, target, p, b, 1, 0, 0, 0));
+                if (source>=a2 && source<=h2) // pawn promotion by capturing piece
+                {
+                    moves.push_back(parse_move(source, target, p, q, 1, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, p, r, 1, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, p, n, 1, 0, 0, 0));
+                    moves.push_back(parse_move(source, target, p, b, 1, 0, 0, 0));
+                }
+
+                // diagonal pawn capture
+                else
+                {
+                    moves.push_back(parse_move(source, target, p, 0, 1, 0, 0, 0));
+                }
+
             }
 
-            // diagonal pawn capture
-            else
-            {
-                moves.push_back(parse_move(source, target, p, 0, 1, 0, 0, 0));
-            }
-
-        }
-
-        // enpassant
-        if (pos->enpassant!=null_sq)
-        {   
-            uint64_t enpassant_attacks = pos->pawn_attacks[pos->colour_to_move][source] & (1ULL << pos->enpassant);
-            if (enpassant_attacks)
-            {
-                int enpassant_target = get_lsb_index(enpassant_attacks);
-                moves.push_back(parse_move(source, enpassant_target, p, 0, 1, 0, 1, 0));
+            // enpassant
+            if (pos->enpassant!=null_sq)
+            {   
+                uint64_t enpassant_attacks = pos->pawn_attacks[pos->colour_to_move][source] & (1ULL << pos->enpassant);
+                if (enpassant_attacks)
+                {
+                    int enpassant_target = get_lsb_index(enpassant_attacks);
+                    moves.push_back(parse_move(source, enpassant_target, p, 0, 1, 0, 1, 0));
+                }
             }
         }
     }
@@ -371,10 +386,14 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
         int double_pawn_move = get_is_double_pawn_move(move);
         int enpassant_move = get_is_move_enpassant(move);
         int castling = get_is_move_castling(move);
+        const int moving_side = pos->colour_to_move;
+        const int enemy_side = moving_side ^ 1;
+        const uint64_t source_bb = square_bb(source);
+        const uint64_t target_bb = square_bb(target);
         const int nnue_ply = (ply >= 0) ? ply : pos->ply;
         const bool use_nnue = nnue_loaded();
 
-        const int opponent_king = (pos->colour_to_move == white) ? k : K;
+        const int opponent_king = (moving_side == white) ? k : K;
         if (is_capture_move && get_bit(pos->piece_bitboards[opponent_king], target))
             return 0;
 
@@ -384,6 +403,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
         // move piece
         pop_bit(pos->piece_bitboards[piece], source);
         set_bit(pos->piece_bitboards[piece], target);
+        pos->occupancies[moving_side] ^= source_bb | target_bb;
         pos->zobristKey ^= pos->piece_hashkey[piece][source]; // update hash to exclude source
         pos->zobristKey ^= pos->piece_hashkey[piece][target]; // update hash to include target
         if (use_nnue)
@@ -416,6 +436,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
                         pos->undo_stack[ply].captured_piece = i;
 
                     pop_bit(pos->piece_bitboards[i], target);
+                    pos->occupancies[enemy_side] &= ~target_bb;
                     if (use_nnue)
                         nnue_remove_piece(pos, nnue_ply, i, target);
                     
@@ -459,6 +480,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
             if (pos->colour_to_move==white)
             {
                 pop_bit(pos->piece_bitboards[p], target + 8);
+                pos->occupancies[enemy_side] &= ~square_bb(target + 8);
                 pos->zobristKey ^= pos->piece_hashkey[p][target + 8];
                 if (use_nnue)
                     nnue_remove_piece(pos, nnue_ply, p, target + 8);
@@ -466,6 +488,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
             else
             {
                 pop_bit(pos->piece_bitboards[P], target - 8);
+                pos->occupancies[enemy_side] &= ~square_bb(target - 8);
                 pos->zobristKey ^= pos->piece_hashkey[P][target- 8];
                 if (use_nnue)
                     nnue_remove_piece(pos, nnue_ply, P, target - 8);
@@ -502,6 +525,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[R], h1);
                 set_bit(pos->piece_bitboards[R], f1);
+                pos->occupancies[white] ^= square_bb(h1) | square_bb(f1);
                 if (use_nnue)
                 {
                     nnue_remove_piece(pos, nnue_ply, R, h1);
@@ -515,6 +539,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[R], a1);
                 set_bit(pos->piece_bitboards[R], d1);
+                pos->occupancies[white] ^= square_bb(a1) | square_bb(d1);
                 if (use_nnue)
                 {
                     nnue_remove_piece(pos, nnue_ply, R, a1);
@@ -528,6 +553,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[r], h8);
                 set_bit(pos->piece_bitboards[r], f8);
+                pos->occupancies[black] ^= square_bb(h8) | square_bb(f8);
                 if (use_nnue)
                 {
                     nnue_remove_piece(pos, nnue_ply, r, h8);
@@ -541,6 +567,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
             {
                 pop_bit(pos->piece_bitboards[r], a8);
                 set_bit(pos->piece_bitboards[r], d8);
+                pos->occupancies[black] ^= square_bb(a8) | square_bb(d8);
                 if (use_nnue)
                 {
                     nnue_remove_piece(pos, nnue_ply, r, a8);
@@ -559,10 +586,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
 
         pos->zobristKey ^= pos->castling_hashkey[pos->castle_rights]; // update castling right hash
 
-        // update colour occupancies
-        pos->occupancies[white] = get_white_occupancy(pos);
-        pos->occupancies[black] = get_black_occupancy(pos);
-        pos->occupancies[both]  = get_both_occupancy(pos);
+        pos->occupancies[both] = pos->occupancies[white] | pos->occupancies[black];
 
         // change sides
         pos->colour_to_move ^= 1;
@@ -624,7 +648,10 @@ int make_root_move(thrawn::Position* pos, int move, int move_type)
         return 0;
     }
 
-    pos->nnue_stack[0] = pos->nnue_stack[1];
+    if (nnue_loaded())
+        pos->nnue_stack[0] = pos->nnue_stack[1];
+    else
+        pos->nnue_stack[0].valid = false;
     pos->ply = 0;
     nnue_debug_check(pos);
     return 1;

@@ -23,5 +23,5 @@ void init_all()
 
     init_eval_masks();
 
-    nnue_init("model_v6.nnue");
+    nnue_init("model_v5.nnue");
 }

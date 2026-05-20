@@ -32,7 +32,7 @@ enum {P, N, B, R, Q, K, p, n, b, r, q, k};
 
 enum {rook, bishop};
 
-enum {all_moves, only_captures, only_checks};
+enum {all_moves, only_captures, only_quiets, only_checks};
 
 enum {wks=1, wqs=2, bks=4, bqs=8};
 

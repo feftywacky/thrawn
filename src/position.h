@@ -2,8 +2,10 @@
 #define POSITION_H
 
 #include <array>
-#include <vector>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <vector>
 #include "constants.h"
 
 namespace thrawn {
@@ -40,6 +42,23 @@ struct alignas(NNUE_SIMD_ALIGNMENT) NnueState {
     }
 };
 
+class NnueStack {
+public:
+    NnueStack();
+    NnueStack(const NnueStack& other);
+    NnueStack& operator=(const NnueStack& other);
+    NnueStack(NnueStack&& other) noexcept = default;
+    NnueStack& operator=(NnueStack&& other) noexcept = default;
+
+    NnueState& operator[](std::size_t index);
+    const NnueState& operator[](std::size_t index) const;
+
+    void copy_up_to(const NnueStack& other, int ply);
+
+private:
+    std::unique_ptr<std::array<NnueState, MAX_DEPTH + 1>> states;
+};
+
 // Holds all data needed to restore a position
 struct UndoData {
     int move;             // the packed move itself: source, target, etc.
@@ -66,29 +85,31 @@ public:
     int repetition_index;
 
     int ply;
-    std::array<NnueState, MAX_DEPTH + 1> nnue_stack;
+    NnueStack nnue_stack;
 
     //============= ATTACK AND HASHING TABLES =============//
 
-    std::array<std::array<uint64_t, 64>, 2> pawn_attacks;
-    std::array<uint64_t, 64> knight_attacks;
-    std::array<uint64_t, 64> king_attacks;
+    static std::array<std::array<uint64_t, 64>, 2> pawn_attacks;
+    static std::array<uint64_t, 64> knight_attacks;
+    static std::array<uint64_t, 64> king_attacks;
 
-    std::array<uint64_t, 64> bishop_masks;
-    std::array<std::array<uint64_t, 512>, 64> bishop_attacks;
-    std::array<uint64_t, 64> rook_masks;
-    std::array<std::array<uint64_t, 4096>, 64> rook_attacks;
+    static std::array<uint64_t, 64> bishop_masks;
+    static std::array<std::array<uint64_t, 512>, 64> bishop_attacks;
+    static std::array<uint64_t, 64> rook_masks;
+    static std::array<std::array<uint64_t, 4096>, 64> rook_attacks;
 
-    uint64_t piece_hashkey[12][64];
-    uint64_t enpassant_hashkey[64];
-    uint64_t castling_hashkey[16];
-    uint64_t colour_to_move_hashkey;
+    static uint64_t piece_hashkey[12][64];
+    static uint64_t enpassant_hashkey[64];
+    static uint64_t castling_hashkey[16];
+    static uint64_t colour_to_move_hashkey;
 
     //============= UNDO STACK =============//
     UndoData undo_stack[MAX_DEPTH];
 
     //============= CONSTRUCTORS & METHODS =============//
     Position();
+    Position(const Position& other);
+    Position& operator=(const Position& other);
 };
 
 // copying and restoring for move take backs

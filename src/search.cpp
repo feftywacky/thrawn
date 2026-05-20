@@ -327,21 +327,6 @@ bool qsearch_delta_prune(thrawn::Position* pos, int move, int static_eval, int a
            searchParams.qsearchDeltaMargin <= alpha;
 }
 
-bool qsearch_see_prune(thrawn::Position* pos, int move) {
-    if (!get_is_capture_move(move) || get_promoted_piece(move) ||
-        get_move_piece(move) == K || get_move_piece(move) == k) {
-        return false;
-    }
-
-    const int target = get_move_target(move);
-    const uint64_t enemyKing = pos->piece_bitboards[pos->colour_to_move == white ? k : K];
-    if (pos->king_attacks[target] & enemyKing) {
-        return false;
-    }
-
-    return static_exchange_eval(pos, move) < 0;
-}
-
 int history_bonus(int depth) {
     const int history_max = std::max(1, searchParams.historyMax);
     const int bonus = searchParams.historyBonusDepthSquared * depth * depth +
@@ -425,33 +410,530 @@ int late_move_reduction(int depth, int move_number, bool is_pv_node,
     return std::clamp(reduction, 1, std::max(1, depth - 2));
 }
 
-void quicksort_scored_moves(std::vector<int>& moves, int* move_scores,
-                            int low, int high)
-{
-    if (low < high)
-    {
-        int pivot = move_scores[high];
-        int i = low - 1;
+bool is_side_piece(int piece, int side) {
+    return side == white ? piece >= P && piece <= K : piece >= p && piece <= k;
+}
 
-        for (int j = low; j <= high - 1; j++)
-        {
-            if (move_scores[j] > pivot)
-            {
-                i++;
-                std::swap(move_scores[i], move_scores[j]);
-                std::swap(moves[i], moves[j]);
+bool valid_promotion_piece(int side, int promoted) {
+    if (!promoted) {
+        return true;
+    }
+
+    if (!is_side_piece(promoted, side)) {
+        return false;
+    }
+
+    const int type = promoted % 6;
+    return type == KNIGHT || type == BISHOP || type == ROOK || type == QUEEN;
+}
+
+bool is_promotion_rank(int side, int source, int target) {
+    return side == white ? (source >= a7 && source <= h7 && target >= a8 && target <= h8)
+                         : (source >= a2 && source <= h2 && target >= a1 && target <= h1);
+}
+
+bool castle_move_is_pseudo_legal(thrawn::Position* pos, int move) {
+    if (get_is_capture_move(move) || get_promoted_piece(move) ||
+        get_is_double_pawn_move(move) || get_is_move_enpassant(move)) {
+        return false;
+    }
+
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    const int side = pos->colour_to_move;
+    const int enemy = side ^ 1;
+
+    if (side == white && get_move_piece(move) == K && source == e1) {
+        if (target == g1 && (pos->castle_rights & wks)) {
+            return !get_bit(pos->occupancies[both], f1) &&
+                   !get_bit(pos->occupancies[both], g1) &&
+                   !is_square_under_attack(pos, e1, enemy) &&
+                   !is_square_under_attack(pos, f1, enemy);
+        }
+        if (target == c1 && (pos->castle_rights & wqs)) {
+            return !get_bit(pos->occupancies[both], b1) &&
+                   !get_bit(pos->occupancies[both], c1) &&
+                   !get_bit(pos->occupancies[both], d1) &&
+                   !is_square_under_attack(pos, e1, enemy) &&
+                   !is_square_under_attack(pos, d1, enemy);
+        }
+    }
+
+    if (side == black && get_move_piece(move) == k && source == e8) {
+        if (target == g8 && (pos->castle_rights & bks)) {
+            return !get_bit(pos->occupancies[both], f8) &&
+                   !get_bit(pos->occupancies[both], g8) &&
+                   !is_square_under_attack(pos, e8, enemy) &&
+                   !is_square_under_attack(pos, f8, enemy);
+        }
+        if (target == c8 && (pos->castle_rights & bqs)) {
+            return !get_bit(pos->occupancies[both], b8) &&
+                   !get_bit(pos->occupancies[both], c8) &&
+                   !get_bit(pos->occupancies[both], d8) &&
+                   !is_square_under_attack(pos, e8, enemy) &&
+                   !is_square_under_attack(pos, d8, enemy);
+        }
+    }
+
+    return false;
+}
+
+bool pawn_move_is_pseudo_legal(thrawn::Position* pos, int move) {
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    const int side = pos->colour_to_move;
+    const int promoted = get_promoted_piece(move);
+    const bool capture = get_is_capture_move(move);
+    const bool doublePush = get_is_double_pawn_move(move);
+    const bool enPassant = get_is_move_enpassant(move);
+    const uint64_t targetBb = square_bb(target);
+
+    if (!valid_promotion_piece(side, promoted)) {
+        return false;
+    }
+    if (promoted && !is_promotion_rank(side, source, target)) {
+        return false;
+    }
+    if (!promoted && (side == white ? target >= a8 && target <= h8
+                                    : target >= a1 && target <= h1)) {
+        return false;
+    }
+
+    if (capture) {
+        if (!(pos->pawn_attacks[side][source] & targetBb)) {
+            return false;
+        }
+        if (doublePush) {
+            return false;
+        }
+        if (enPassant) {
+            if (target != pos->enpassant || promoted) {
+                return false;
+            }
+            const int capturedSquare = side == white ? target + 8 : target - 8;
+            const int capturedPawn = side == white ? p : P;
+            return capturedSquare >= a8 && capturedSquare <= h1 &&
+                   get_bit(pos->piece_bitboards[capturedPawn], capturedSquare);
+        }
+        return get_bit(pos->occupancies[side ^ 1], target);
+    }
+
+    if (enPassant) {
+        return false;
+    }
+
+    const int singleTarget = side == white ? source - 8 : source + 8;
+    if (target == singleTarget && !get_bit(pos->occupancies[both], target)) {
+        return !doublePush;
+    }
+
+    const bool onStartRank = side == white ? (source >= a2 && source <= h2)
+                                           : (source >= a7 && source <= h7);
+    const int doubleTarget = side == white ? source - 16 : source + 16;
+    if (doublePush && onStartRank && target == doubleTarget) {
+        return !get_bit(pos->occupancies[both], singleTarget) &&
+               !get_bit(pos->occupancies[both], target);
+    }
+
+    return false;
+}
+
+bool move_type_allows(int moveType, int move) {
+    if (moveType == all_moves) {
+        return true;
+    }
+    if (moveType == only_captures) {
+        return get_is_capture_move(move) || get_promoted_piece(move);
+    }
+    if (moveType == only_quiets) {
+        return is_quiet_move(move);
+    }
+    return true;
+}
+
+bool move_is_pseudo_legal(thrawn::Position* pos, int move, int moveType) {
+    if (!move || !move_type_allows(moveType, move)) {
+        return false;
+    }
+
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    const int piece = get_move_piece(move);
+    if (source < a8 || source > h1 || target < a8 || target > h1 ||
+        piece < P || piece > k) {
+        return false;
+    }
+
+    const int side = pos->colour_to_move;
+    if (!is_side_piece(piece, side) || !get_bit(pos->piece_bitboards[piece], source)) {
+        return false;
+    }
+
+    const uint64_t targetBb = square_bb(target);
+    if (pos->occupancies[side] & targetBb) {
+        return false;
+    }
+
+    const bool capture = get_is_capture_move(move);
+    const bool enPassant = get_is_move_enpassant(move);
+    const bool castling = get_is_move_castling(move);
+    if (castling) {
+        return castle_move_is_pseudo_legal(pos, move);
+    }
+
+    if (get_is_double_pawn_move(move) && piece % 6 != PAWN) {
+        return false;
+    }
+    if (enPassant && (piece % 6 != PAWN || !capture)) {
+        return false;
+    }
+    if (get_promoted_piece(move) && piece % 6 != PAWN) {
+        return false;
+    }
+
+    if (capture && !enPassant && !(pos->occupancies[side ^ 1] & targetBb)) {
+        return false;
+    }
+    if (!capture && (pos->occupancies[side ^ 1] & targetBb)) {
+        return false;
+    }
+
+    switch (piece % 6) {
+        case PAWN:
+            return pawn_move_is_pseudo_legal(pos, move);
+        case KNIGHT:
+            return !get_is_double_pawn_move(move) && !enPassant &&
+                   !get_promoted_piece(move) &&
+                   (pos->knight_attacks[source] & targetBb);
+        case BISHOP:
+            return !get_is_double_pawn_move(move) && !enPassant &&
+                   !get_promoted_piece(move) &&
+                   (get_bishop_attacks(pos, source, pos->occupancies[both]) & targetBb);
+        case ROOK:
+            return !get_is_double_pawn_move(move) && !enPassant &&
+                   !get_promoted_piece(move) &&
+                   (get_rook_attacks(pos, source, pos->occupancies[both]) & targetBb);
+        case QUEEN:
+            return !get_is_double_pawn_move(move) && !enPassant &&
+                   !get_promoted_piece(move) &&
+                   (get_queen_attacks(pos, source, pos->occupancies[both]) & targetBb);
+        case KING:
+            return !get_is_double_pawn_move(move) && !enPassant &&
+                   !get_promoted_piece(move) &&
+                   (pos->king_attacks[source] & targetBb);
+        default:
+            return false;
+    }
+}
+
+int quiet_move_score(ThreadData* td, int ply, int move) {
+    if (td->killer_moves[0][ply] == move)
+        return searchParams.killerMoveScore1;
+    if (td->killer_moves[1][ply] == move)
+        return searchParams.killerMoveScore2;
+    if (is_counter_move(td, ply, move))
+        return searchParams.counterMoveScore +
+               std::clamp(history_score(td, move) /
+                              std::max(1, searchParams.counterMoveHistoryDivisor),
+                          -searchParams.counterMoveHistoryCap,
+                          searchParams.counterMoveHistoryCap);
+
+    return std::clamp(history_score(td, move),
+                      -searchParams.historyScoreCap,
+                      searchParams.historyScoreCap);
+}
+
+int tactical_move_score(thrawn::Position* pos, int move) {
+    const int promotedPiece = get_promoted_piece(move);
+    if (get_is_capture_move(move)) {
+        int target = captured_piece(pos, move);
+        if (target == -1)
+            target = pos->colour_to_move == white ? p : P;
+
+        int score = mvv_lva[get_move_piece(move)][target] + 10000;
+        if (promotedPiece == Q || promotedPiece == q)
+            score += 800;
+        else if (promotedPiece)
+            score += piece_value(promotedPiece) / 2;
+        return score;
+    }
+
+    if (promotedPiece == Q || promotedPiece == q)
+        return searchParams.queenPromotionScore;
+    if (promotedPiece)
+        return searchParams.queenPromotionScore - 1000 + piece_value(promotedPiece);
+
+    return 0;
+}
+
+int bad_capture_score(thrawn::Position* pos, int move, int seeScore) {
+    int target = captured_piece(pos, move);
+    if (target == -1)
+        target = pos->colour_to_move == white ? p : P;
+
+    return -5000 + (mvv_lva[get_move_piece(move)][target] / 10) +
+           std::clamp(seeScore, -2000, 0);
+}
+
+bool should_classify_capture_with_see(int move) {
+    const int piece = get_move_piece(move);
+    return get_is_capture_move(move) && !get_promoted_piece(move) &&
+           piece != K && piece != k;
+}
+
+struct PickedMove {
+    int move = 0;
+    int seeScore = 0;
+    bool seeKnown = false;
+};
+
+struct ScoredMove {
+    int move = 0;
+    int score = 0;
+    int seeScore = 0;
+    bool seeKnown = false;
+};
+
+class MovePicker {
+public:
+    MovePicker(thrawn::Position* pos, ThreadData* td, int ttMove,
+               bool followPv, int moveType)
+        : pos(pos),
+          td(td),
+          ttMove(ttMove),
+          pvMove(followPv && pos->ply < MAX_DEPTH ? td->pv_table[0][pos->ply] : 0),
+          moveType(moveType),
+          stage(Stage::TtMove) {}
+
+    bool next(PickedMove& picked) {
+        while (stage != Stage::Done) {
+            switch (stage) {
+                case Stage::TtMove:
+                    stage = Stage::PvMove;
+                    if (try_special(ttMove, picked)) {
+                        return true;
+                    }
+                    break;
+                case Stage::PvMove:
+                    stage = moveType == only_quiets ? Stage::GenerateQuiets
+                                                    : Stage::GenerateTacticals;
+                    if (try_special(pvMove, picked)) {
+                        return true;
+                    }
+                    break;
+                case Stage::GenerateTacticals:
+                    generate_tacticals();
+                    stage = Stage::GoodTacticals;
+                    break;
+                case Stage::GoodTacticals:
+                    if (next_good_tactical(picked)) {
+                        return true;
+                    }
+                    stage = includes_quiets() ? Stage::Killer1 : Stage::BadTacticals;
+                    break;
+                case Stage::Killer1:
+                    stage = Stage::Killer2;
+                    if (try_special_quiet(td->killer_moves[0][pos->ply], picked)) {
+                        return true;
+                    }
+                    break;
+                case Stage::Killer2:
+                    stage = Stage::CounterMove;
+                    if (try_special_quiet(td->killer_moves[1][pos->ply], picked)) {
+                        return true;
+                    }
+                    break;
+                case Stage::CounterMove:
+                    stage = Stage::GenerateQuiets;
+                    if (try_special_quiet(counter_move(), picked)) {
+                        return true;
+                    }
+                    break;
+                case Stage::GenerateQuiets:
+                    generate_quiets();
+                    stage = Stage::Quiets;
+                    break;
+                case Stage::Quiets:
+                    if (next_scored(quietMoves, quietIndex, picked)) {
+                        return true;
+                    }
+                    stage = Stage::BadTacticals;
+                    break;
+                case Stage::BadTacticals:
+                    if (next_scored(badTacticals, badIndex, picked)) {
+                        return true;
+                    }
+                    stage = Stage::Done;
+                    break;
+                case Stage::Done:
+                    break;
             }
         }
 
-        std::swap(move_scores[i + 1], move_scores[high]);
-        std::swap(moves[i + 1], moves[high]);
-
-        int pi = i + 1;
-
-        quicksort_scored_moves(moves, move_scores, low, pi - 1);
-        quicksort_scored_moves(moves, move_scores, pi + 1, high);
+        return false;
     }
-}
+
+private:
+    enum class Stage {
+        TtMove,
+        PvMove,
+        GenerateTacticals,
+        GoodTacticals,
+        Killer1,
+        Killer2,
+        CounterMove,
+        GenerateQuiets,
+        Quiets,
+        BadTacticals,
+        Done
+    };
+
+    thrawn::Position* pos;
+    ThreadData* td;
+    int ttMove;
+    int pvMove;
+    int moveType;
+    Stage stage;
+    std::vector<ScoredMove> tacticals;
+    std::vector<ScoredMove> badTacticals;
+    std::vector<ScoredMove> quietMoves;
+    std::size_t tacticalIndex = 0;
+    std::size_t badIndex = 0;
+    std::size_t quietIndex = 0;
+    std::array<int, 8> triedMoves{};
+    int triedCount = 0;
+
+    bool includes_quiets() const {
+        return moveType == all_moves || moveType == only_quiets;
+    }
+
+    bool already_tried(int move) const {
+        for (int i = 0; i < triedCount; ++i) {
+            if (triedMoves[i] == move) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void mark_tried(int move) {
+        if (move && triedCount < static_cast<int>(triedMoves.size()) &&
+            !already_tried(move)) {
+            triedMoves[triedCount++] = move;
+        }
+    }
+
+    bool try_special(int move, PickedMove& picked) {
+        if (!move || already_tried(move) ||
+            !move_is_pseudo_legal(pos, move, moveType)) {
+            return false;
+        }
+
+        mark_tried(move);
+        picked = {move, 0, false};
+        return true;
+    }
+
+    bool try_special_quiet(int move, PickedMove& picked) {
+        if (!includes_quiets() || !is_quiet_move(move)) {
+            return false;
+        }
+        return try_special(move, picked);
+    }
+
+    int counter_move() const {
+        const int previousMove = previous_ply_move(td, pos->ply);
+        if (previousMove == 0) {
+            return 0;
+        }
+        return td->counter_moves[get_move_piece(previousMove)]
+                                [get_move_target(previousMove)];
+    }
+
+    static std::size_t select_best(std::vector<ScoredMove>& moves,
+                                   std::size_t first) {
+        std::size_t best = first;
+        for (std::size_t i = first + 1; i < moves.size(); ++i) {
+            if (moves[i].score > moves[best].score) {
+                best = i;
+            }
+        }
+        if (best != first) {
+            std::swap(moves[best], moves[first]);
+        }
+        return first;
+    }
+
+    bool next_scored(std::vector<ScoredMove>& moves, std::size_t& index,
+                     PickedMove& picked) {
+        while (index < moves.size()) {
+            const std::size_t best = select_best(moves, index);
+            ScoredMove scored = moves[best];
+            ++index;
+            if (already_tried(scored.move)) {
+                continue;
+            }
+
+            mark_tried(scored.move);
+            picked = {scored.move, scored.seeScore, scored.seeKnown};
+            return true;
+        }
+        return false;
+    }
+
+    void generate_tacticals() {
+        std::vector<int> moves = generate_moves(pos, only_captures);
+        tacticals.reserve(moves.size());
+        for (int move : moves) {
+            if (already_tried(move)) {
+                continue;
+            }
+            tacticals.push_back({move, tactical_move_score(pos, move), 0, false});
+        }
+    }
+
+    void generate_quiets() {
+        if (!includes_quiets()) {
+            return;
+        }
+
+        std::vector<int> moves = generate_moves(pos, only_quiets);
+        quietMoves.reserve(moves.size());
+        for (int move : moves) {
+            if (already_tried(move)) {
+                continue;
+            }
+            quietMoves.push_back({move, quiet_move_score(td, pos->ply, move), 0, false});
+        }
+    }
+
+    bool next_good_tactical(PickedMove& picked) {
+        while (tacticalIndex < tacticals.size()) {
+            const std::size_t best = select_best(tacticals, tacticalIndex);
+            ScoredMove scored = tacticals[best];
+            ++tacticalIndex;
+
+            if (already_tried(scored.move)) {
+                continue;
+            }
+
+            if (should_classify_capture_with_see(scored.move)) {
+                scored.seeScore = static_exchange_eval(pos, scored.move);
+                scored.seeKnown = true;
+                if (scored.seeScore < 0) {
+                    scored.score = bad_capture_score(pos, scored.move, scored.seeScore);
+                    badTacticals.push_back(scored);
+                    continue;
+                }
+            }
+
+            mark_tried(scored.move);
+            picked = {scored.move, scored.seeScore, scored.seeKnown};
+            return true;
+        }
+        return false;
+    }
+};
 
 } // namespace
 
@@ -657,17 +1139,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         }
     }
 
-    // Generate moves
-    std::vector<int> moves = generate_moves(pos);
-
-    // If we had a best move from TT, ensure it gets sorted first
     const bool nodeFollowPv = td->follow_pv_flag;
-    if (nodeFollowPv)
-        score_pv(pos, moves, td);
-    else
-        td->score_pv_flag = false;
-
-    sort_moves(pos, td, moves, ttMove);
+    td->score_pv_flag = false;
+    MovePicker movePicker(pos, td, ttMove, nodeFollowPv, all_moves);
 
     // We are about to search each move
     int valid_moves = 0;
@@ -675,11 +1149,13 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     int quiet_moves_seen = 0;
     bool pruned_moves = false;
     std::vector<int> failed_quiet_moves;
-    failed_quiet_moves.reserve(moves.size());
+    failed_quiet_moves.reserve(64);
 
     // Search each move (LMR, LMP, PVS logic, etc.)
-    for (int move : moves)
+    PickedMove picked;
+    while (movePicker.next(picked))
     {
+        const int move = picked.move;
         const int parentPly = pos->ply;
         const bool quietMove = is_quiet_move(move);
         const bool pawnMove = get_move_piece(move) == P || get_move_piece(move) == p;
@@ -723,12 +1199,16 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             }
 
             if (get_is_capture_move(move) && !get_promoted_piece(move) &&
-                depth <= SeePruneMaxDepth &&
-                static_exchange_eval(pos, move) < -SeePruneDepthMargin * depth &&
-                !gives_check())
+                depth <= SeePruneMaxDepth)
             {
-                pruned_moves = true;
-                continue;
+                const int seeScore = picked.seeKnown
+                    ? picked.seeScore
+                    : static_exchange_eval(pos, move);
+                if (seeScore < -SeePruneDepthMargin * depth && !gives_check())
+                {
+                    pruned_moves = true;
+                    continue;
+                }
             }
         }
 
@@ -975,20 +1455,35 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     }
 
     const int move_type = inCheck ? all_moves : only_captures;
-    std::vector<int> moves = generate_moves(pos, move_type);
-    sort_moves(pos, td, moves, ttMove);
+    MovePicker movePicker(pos, td, ttMove, false, move_type);
 
     int valid_moves = 0;
     int bestMove = 0;
     int bestScore = inCheck ? -INFINITY : alpha;
 
-    for (int move : moves)
+    PickedMove picked;
+    while (movePicker.next(picked))
     {
+        const int move = picked.move;
         const bool promotionMove = get_promoted_piece(move) != 0;
         const bool deltaPruned = !inCheck && !promotionMove &&
                                  qsearch_delta_prune(pos, move, static_eval, alpha);
-        const bool seePruned = !inCheck && !promotionMove &&
-                               qsearch_see_prune(pos, move);
+        bool seePruned = false;
+        if (!inCheck && !promotionMove &&
+            get_is_capture_move(move) &&
+            get_move_piece(move) != K && get_move_piece(move) != k)
+        {
+            const int target = get_move_target(move);
+            const uint64_t enemyKing =
+                pos->piece_bitboards[pos->colour_to_move == white ? k : K];
+            if (!(pos->king_attacks[target] & enemyKing))
+            {
+                const int seeScore = picked.seeKnown
+                    ? picked.seeScore
+                    : static_exchange_eval(pos, move);
+                seePruned = seeScore < 0;
+            }
+        }
 
         if ((deltaPruned || seePruned) && !move_gives_check(pos, move))
         {
@@ -1050,146 +1545,6 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     // move fails low (<= alpha)
     tt->store(pos, 0, alpha, alpha > oldAlpha ? BOUND_EXACT : BOUND_UPPER, bestMove);
     return alpha;
-}
-
-int score_move(thrawn::Position* pos, ThreadData* td, int move)
-{
-    // scoring pv
-    if (td->score_pv_flag)
-    {
-        if (td->pv_table[0][pos->ply] == move)
-        {
-            td->score_pv_flag = false;
-            return searchParams.pvMoveScore; // give pv move priority
-        }
-    }
-
-    const int promotedPiece = get_promoted_piece(move);
-
-    // Captures: start with MVV-LVA, then push SEE-losing captures behind
-    // useful quiet moves. This mirrors Stockfish's good-capture / quiet /
-    // bad-capture staging without replacing the current full sort.
-    if (get_is_capture_move(move))
-    {
-        int target = captured_piece(pos, move);
-        if (target == -1)
-            target = pos->colour_to_move == white ? p : P;
-
-        int captureScore = mvv_lva[get_move_piece(move)][target] + 10000;
-        if (promotedPiece == Q || promotedPiece == q)
-            captureScore += 800;
-
-        if (!promotedPiece)
-        {
-            const int seeScore = static_exchange_eval(pos, move);
-            if (seeScore < 0)
-                return -5000 + (mvv_lva[get_move_piece(move)][target] / 10) +
-                       std::clamp(seeScore, -2000, 0);
-
-            captureScore += std::min(seeScore, 1000);
-        }
-
-        return captureScore;
-    }
-    else // quiet moves
-    {
-        if (promotedPiece == Q || promotedPiece == q)
-        {
-            return searchParams.queenPromotionScore;
-        }
-
-        if (td->killer_moves[0][pos->ply] == move)
-            return searchParams.killerMoveScore1;
-        else if (td->killer_moves[1][pos->ply] == move)
-            return searchParams.killerMoveScore2;
-        else if (is_counter_move(td, pos->ply, move))
-            return searchParams.counterMoveScore +
-                   std::clamp(history_score(td, move) /
-                                  std::max(1, searchParams.counterMoveHistoryDivisor),
-                              -searchParams.counterMoveHistoryCap,
-                              searchParams.counterMoveHistoryCap);
-        else
-            return std::clamp(history_score(td, move),
-                              -searchParams.historyScoreCap,
-                              searchParams.historyScoreCap);
-    }
-    return 0;
-}
-
-void score_pv(thrawn::Position* pos, std::vector<int> &moves, ThreadData* td)
-{
-    td->follow_pv_flag = false;
-    for (int move : moves)
-    {
-        if (td->pv_table[0][pos->ply] == move)
-        {
-            td->score_pv_flag = true;
-            td->follow_pv_flag = true;
-        }
-    }
-}
-
-void sort_moves(thrawn::Position* pos, ThreadData* td,
-                std::vector<int> &moves, int bestMove)
-{
-    const int n = static_cast<int>(moves.size());
-    if (n < 2)
-        return;
-
-    constexpr int MaxStackMoveScores = 256;
-    if (n <= MaxStackMoveScores)
-    {
-        std::array<int, MaxStackMoveScores> scores{};
-        for (int i = 0; i < n; i++)
-        {
-            // If a move is the bestMove from TT, give it a high score
-            if (moves[i] == bestMove)
-                scores[i] = searchParams.ttMoveScore;
-            else
-                scores[i] = score_move(pos, td, moves[i]);
-        }
-        quicksort_scored_moves(moves, scores.data(), 0, n - 1);
-        return;
-    }
-
-    std::vector<int> scores(n);
-    for (int i = 0; i < n; i++)
-    {
-        if (moves[i] == bestMove)
-            scores[i] = searchParams.ttMoveScore;
-        else
-            scores[i] = score_move(pos, td, moves[i]);
-    }
-    quicksort_moves(moves, scores, 0, n - 1);
-}
-
-// standard quicksort helper
-void quicksort_moves(std::vector<int> &moves, std::vector<int> &move_scores,
-                     int low, int high)
-{
-    if (low < high)
-    {
-        int pivot = move_scores[high];
-        int i = low - 1;
-
-        for (int j = low; j <= high - 1; j++)
-        {
-            if (move_scores[j] > pivot)
-            {
-                i++;
-                std::swap(move_scores[i], move_scores[j]);
-                std::swap(moves[i], moves[j]);
-            }
-        }
-
-        std::swap(move_scores[i + 1], move_scores[high]);
-        std::swap(moves[i + 1], moves[high]);
-
-        int pi = i + 1;
-
-        quicksort_moves(moves, move_scores, low, pi - 1);
-        quicksort_moves(moves, move_scores, pi + 1, high);
-    }
 }
 
 // repetition check

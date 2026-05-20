@@ -173,7 +173,7 @@ bool looks_like_absolute_path(const std::string& path) {
 std::vector<std::string> candidate_paths(const std::string& requested_path) {
     std::string path = trim_copy(requested_path);
     if (path.empty()) {
-        path = "model_v6.nnue";
+        path = "model_v5.nnue";
     }
 
     std::vector<std::string> candidates{path};
@@ -1406,7 +1406,15 @@ void nnue_copy_parent_to_child(thrawn::Position* pos, int child_ply) {
     if (child_ply <= 0 || child_ply > MAX_DEPTH) {
         return;
     }
-    pos->nnue_stack[child_ply] = pos->nnue_stack[child_ply - 1];
+
+    thrawn::NnueState& child = pos->nnue_stack[child_ply];
+    const thrawn::NnueState& parent = pos->nnue_stack[child_ply - 1];
+    if (current_network() == nullptr || !parent.valid) {
+        child.valid = false;
+        return;
+    }
+
+    child = parent;
 }
 
 void nnue_add_piece(thrawn::Position* pos, int ply, int piece, int square) {
