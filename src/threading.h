@@ -28,7 +28,13 @@ public:
 
     // Killer, history, and counter-move ordering tables.
     std::array<std::array<int, MAX_DEPTH>, KILLER_MOVES> killer_moves;
-    std::array<std::array<int, BOARD_SIZE>, HISTORY_SIZE> history_moves;
+    std::array<std::array<std::array<int, BOARD_SIZE>, BOARD_SIZE>, 2> quiet_history;
+    std::array<
+        std::array<
+            std::array<std::array<int, BOARD_SIZE>, HISTORY_SIZE>,
+            BOARD_SIZE>,
+        HISTORY_SIZE> continuation_history;
+    std::array<std::array<std::array<int, HISTORY_SIZE>, BOARD_SIZE>, HISTORY_SIZE> capture_history;
     std::array<std::array<int, BOARD_SIZE>, HISTORY_SIZE> counter_moves;
     std::array<int, MAX_DEPTH> ply_moves;
 

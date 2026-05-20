@@ -41,6 +41,15 @@ bool is_mate_score(int score) {
     return score <= -mateScore || score >= mateScore;
 }
 
+int floor_log2_int(int value) {
+    int result = 0;
+    value = std::max(1, value);
+    while (value >>= 1) {
+        ++result;
+    }
+    return result;
+}
+
 int reverse_futility_margin(int depth) {
     if (depth <= 0) {
         return 0;
@@ -334,12 +343,9 @@ int history_bonus(int depth) {
     return std::min(history_max / 2, bonus);
 }
 
-int history_score(ThreadData* td, int move) {
-    return td->history_moves[get_move_piece(move)][get_move_target(move)];
-}
+int previous_ply_move(ThreadData* td, int ply);
 
-void update_history(ThreadData* td, int move, int bonus) {
-    int& entry = td->history_moves[get_move_piece(move)][get_move_target(move)];
+void update_history_entry(int& entry, int bonus) {
     const int history_max = std::max(1, searchParams.historyMax);
     bonus = std::clamp(bonus, -history_max, history_max);
     const int gravity = bonus >= 0 ? bonus : -bonus;
@@ -347,14 +353,98 @@ void update_history(ThreadData* td, int move, int bonus) {
     entry = std::clamp(entry, -history_max, history_max);
 }
 
-void update_quiet_history(ThreadData* td, int move, int depth) {
-    update_history(td, move, history_bonus(depth));
+int continuation_history_score(ThreadData* td, int ply, int move) {
+    const int previousMove = previous_ply_move(td, ply);
+    if (previousMove == 0) {
+        return 0;
+    }
+
+    return td->continuation_history[get_move_piece(previousMove)]
+                                   [get_move_target(previousMove)]
+                                   [get_move_piece(move)]
+                                   [get_move_target(move)];
 }
 
-void penalize_quiet_history(ThreadData* td, const std::vector<int>& moves, int depth) {
+int quiet_history_score(ThreadData* td, int side, int ply, int move) {
+    const int fromTo = td->quiet_history[side][get_move_source(move)]
+                                        [get_move_target(move)];
+    return 2 * fromTo + continuation_history_score(td, ply, move);
+}
+
+void update_continuation_history(ThreadData* td, int ply, int move, int bonus) {
+    const int previousMove = previous_ply_move(td, ply);
+    if (previousMove == 0) {
+        return;
+    }
+
+    int& entry = td->continuation_history[get_move_piece(previousMove)]
+                                         [get_move_target(previousMove)]
+                                         [get_move_piece(move)]
+                                         [get_move_target(move)];
+    update_history_entry(entry, bonus);
+}
+
+void update_quiet_history(ThreadData* td, int side, int ply, int move, int depth) {
+    const int bonus = history_bonus(depth);
+    update_history_entry(td->quiet_history[side][get_move_source(move)]
+                                           [get_move_target(move)], bonus);
+    update_continuation_history(td, ply, move, bonus * 3 / 4);
+}
+
+void penalize_quiet_history(ThreadData* td, int side, int ply,
+                            const std::vector<int>& moves, int depth) {
     const int penalty = -history_bonus(depth);
     for (int move : moves) {
-        update_history(td, move, penalty);
+        update_history_entry(td->quiet_history[side][get_move_source(move)]
+                                               [get_move_target(move)], penalty);
+        update_continuation_history(td, ply, move, penalty * 3 / 4);
+    }
+}
+
+int capture_history_victim(thrawn::Position* pos, int move) {
+    int victim = captured_piece(pos, move);
+    if (victim == -1) {
+        victim = pos->colour_to_move == white ? p : P;
+    }
+    return victim;
+}
+
+int capture_history_score(ThreadData* td, thrawn::Position* pos, int move) {
+    if (!get_is_capture_move(move)) {
+        return 0;
+    }
+
+    const int victim = capture_history_victim(pos, move);
+    return td->capture_history[get_move_piece(move)]
+                              [get_move_target(move)]
+                              [victim];
+}
+
+void update_capture_history(ThreadData* td, thrawn::Position* pos, int move, int depth) {
+    if (!get_is_capture_move(move)) {
+        return;
+    }
+
+    const int victim = capture_history_victim(pos, move);
+    update_history_entry(td->capture_history[get_move_piece(move)]
+                                            [get_move_target(move)]
+                                            [victim],
+                         history_bonus(depth));
+}
+
+void penalize_capture_history(ThreadData* td, thrawn::Position* pos,
+                              const std::vector<int>& moves, int depth) {
+    const int penalty = -history_bonus(depth);
+    for (int move : moves) {
+        if (!get_is_capture_move(move)) {
+            continue;
+        }
+
+        const int victim = capture_history_victim(pos, move);
+        update_history_entry(td->capture_history[get_move_piece(move)]
+                                                [get_move_target(move)]
+                                                [victim],
+                             penalty);
     }
 }
 
@@ -383,9 +473,12 @@ void update_counter_move(ThreadData* td, int ply, int move) {
 
 int late_move_reduction(int depth, int move_number, bool is_pv_node,
                         bool is_counter, int quiet_history) {
-    int reduction = searchParams.lmrBaseReduction;
+    int reduction = searchParams.lmrBaseReduction +
+                    floor_log2_int(depth) * floor_log2_int(move_number) / 5;
     if (!is_pv_node && depth >= searchParams.lmrNonPvDepth) {
         ++reduction;
+    } else if (is_pv_node) {
+        --reduction;
     }
     if (depth >= searchParams.lmrMoveDepth1 &&
         move_number > searchParams.lmrMoveNumber1) {
@@ -399,11 +492,19 @@ int late_move_reduction(int depth, int move_number, bool is_pv_node,
     const int history_max = std::max(1, searchParams.historyMax);
     const int good_history_divisor = std::max(1, searchParams.lmrGoodHistoryDivisor);
     const int bad_history_divisor = std::max(1, searchParams.lmrBadHistoryDivisor);
-    if (is_pv_node || is_counter ||
-        quiet_history > history_max / good_history_divisor) {
+    const int good_threshold = history_max / good_history_divisor;
+    const int bad_threshold = history_max / bad_history_divisor;
+
+    if (is_counter || quiet_history > good_threshold) {
         --reduction;
     }
-    if (!is_counter && quiet_history < -history_max / bad_history_divisor) {
+    if (quiet_history > history_max) {
+        --reduction;
+    }
+    if (!is_counter && quiet_history < -bad_threshold) {
+        ++reduction;
+    }
+    if (!is_counter && quiet_history < -history_max) {
         ++reduction;
     }
 
@@ -626,31 +727,33 @@ bool move_is_pseudo_legal(thrawn::Position* pos, int move, int moveType) {
     }
 }
 
-int quiet_move_score(ThreadData* td, int ply, int move) {
+int quiet_move_score(ThreadData* td, int side, int ply, int move) {
     if (td->killer_moves[0][ply] == move)
         return searchParams.killerMoveScore1;
     if (td->killer_moves[1][ply] == move)
         return searchParams.killerMoveScore2;
     if (is_counter_move(td, ply, move))
         return searchParams.counterMoveScore +
-               std::clamp(history_score(td, move) /
+               std::clamp(quiet_history_score(td, side, ply, move) /
                               std::max(1, searchParams.counterMoveHistoryDivisor),
                           -searchParams.counterMoveHistoryCap,
                           searchParams.counterMoveHistoryCap);
 
-    return std::clamp(history_score(td, move),
+    return std::clamp(quiet_history_score(td, side, ply, move),
                       -searchParams.historyScoreCap,
                       searchParams.historyScoreCap);
 }
 
-int tactical_move_score(thrawn::Position* pos, int move) {
+int tactical_move_score(thrawn::Position* pos, ThreadData* td, int move) {
     const int promotedPiece = get_promoted_piece(move);
     if (get_is_capture_move(move)) {
         int target = captured_piece(pos, move);
         if (target == -1)
             target = pos->colour_to_move == white ? p : P;
 
-        int score = mvv_lva[get_move_piece(move)][target] + 10000;
+        int score = 10000 + 8 * piece_value(target) -
+                    piece_value(get_move_piece(move)) / 8 +
+                    capture_history_score(td, pos, move) / 4;
         if (promotedPiece == Q || promotedPiece == q)
             score += 800;
         else if (promotedPiece)
@@ -666,12 +769,13 @@ int tactical_move_score(thrawn::Position* pos, int move) {
     return 0;
 }
 
-int bad_capture_score(thrawn::Position* pos, int move, int seeScore) {
+int bad_capture_score(thrawn::Position* pos, ThreadData* td, int move, int seeScore) {
     int target = captured_piece(pos, move);
     if (target == -1)
         target = pos->colour_to_move == white ? p : P;
 
-    return -5000 + (mvv_lva[get_move_piece(move)][target] / 10) +
+    return -5000 + piece_value(target) / 2 +
+           capture_history_score(td, pos, move) / 8 +
            std::clamp(seeScore, -2000, 0);
 }
 
@@ -888,7 +992,7 @@ private:
             if (already_tried(move)) {
                 continue;
             }
-            tacticals.push_back({move, tactical_move_score(pos, move), 0, false});
+            tacticals.push_back({move, tactical_move_score(pos, td, move), 0, false});
         }
     }
 
@@ -903,7 +1007,7 @@ private:
             if (already_tried(move)) {
                 continue;
             }
-            quietMoves.push_back({move, quiet_move_score(td, pos->ply, move), 0, false});
+            quietMoves.push_back({move, quiet_move_score(td, pos->colour_to_move, pos->ply, move), 0, false});
         }
     }
 
@@ -921,7 +1025,7 @@ private:
                 scored.seeScore = static_exchange_eval(pos, scored.move);
                 scored.seeKnown = true;
                 if (scored.seeScore < 0) {
-                    scored.score = bad_capture_score(pos, scored.move, scored.seeScore);
+                    scored.score = bad_capture_score(pos, td, scored.move, scored.seeScore);
                     badTacticals.push_back(scored);
                     continue;
                 }
@@ -1136,6 +1240,8 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     bool pruned_moves = false;
     std::vector<int> failed_quiet_moves;
     failed_quiet_moves.reserve(64);
+    std::vector<int> failed_capture_moves;
+    failed_capture_moves.reserve(32);
 
     // Search each move (LMR, LMP, PVS logic, etc.)
     PickedMove picked;
@@ -1143,7 +1249,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
     {
         const int move = picked.move;
         const int parentPly = pos->ply;
+        const int parentSide = pos->colour_to_move;
         const bool quietMove = is_quiet_move(move);
+        const bool captureMove = get_is_capture_move(move);
         const bool pawnMove = get_move_piece(move) == P || get_move_piece(move) == p;
         const bool firstMove = moves_searched == 0;
         bool givesCheck = false;
@@ -1241,7 +1349,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             // -----------------------------
             // Late Move Reductions (LMR)
             // -----------------------------
-            const int quietHistory = quietMove ? history_score(td, move) : 0;
+            const int quietHistory = quietMove
+                ? quiet_history_score(td, parentSide, parentPly, move)
+                : 0;
             const bool counterMove = quietMove && is_counter_move(td, parentPly, move);
 
             if (quiet_moves_seen >= searchParams.lmrFullDepthMoves &&
@@ -1303,10 +1413,13 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         {
             hashFlag = BOUND_EXACT; // PV node
 
-            // Update history for quiet moves
             if (quietMove)
             {
-                update_quiet_history(td, move, depth);
+                update_quiet_history(td, parentSide, pos->ply, move, depth);
+            }
+            else if (captureMove)
+            {
+                update_capture_history(td, pos, move, depth);
             }
 
             alpha = score;
@@ -1324,14 +1437,15 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             {
                 tt->store(pos, depth, beta, BOUND_LOWER, bestMove);
 
-                // quiet move ordering updates
                 if (quietMove)
                 {
                     td->killer_moves[1][pos->ply] = td->killer_moves[0][pos->ply];
                     td->killer_moves[0][pos->ply] = move;
                     update_counter_move(td, pos->ply, move);
-                    penalize_quiet_history(td, failed_quiet_moves, depth);
                 }
+                penalize_quiet_history(td, parentSide, pos->ply,
+                                       failed_quiet_moves, depth);
+                penalize_capture_history(td, pos, failed_capture_moves, depth);
                 return beta;
             }
         }
@@ -1339,6 +1453,10 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         if (quietMove && score <= oldAlpha)
         {
             failed_quiet_moves.push_back(move);
+        }
+        else if (captureMove && score <= oldAlpha)
+        {
+            failed_capture_moves.push_back(move);
         }
     } // end of move loop
 

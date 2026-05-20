@@ -58,8 +58,9 @@ ThreadData::ThreadData() {
         row.fill(0);
     for (auto &row : killer_moves)
         row.fill(0);
-    for (auto &row : history_moves)
-        row.fill(0);
+    quiet_history = {};
+    continuation_history = {};
+    capture_history = {};
     for (auto &row : counter_moves)
         row.fill(0);
     ply_moves.fill(0);
@@ -87,8 +88,9 @@ void ThreadData::resetThreadData() {
         row.fill(0);
     for (auto &row : killer_moves)
         row.fill(0);
-    for (auto &row : history_moves)
-        row.fill(0);
+    quiet_history = {};
+    continuation_history = {};
+    capture_history = {};
     for (auto &row : counter_moves)
         row.fill(0);
     ply_moves.fill(0);

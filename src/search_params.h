@@ -14,8 +14,8 @@ struct SearchParams {
 
     int historyMax = 16384;
     int historyScoreCap = 6000;
-    int historyBonusDepthSquared = 1;
-    int historyBonusDepthLinear = 2;
+    int historyBonusDepthSquared = 16;
+    int historyBonusDepthLinear = 64;
 
     int counterMoveScore = 7000;
     int counterMoveHistoryDivisor = 64;
@@ -54,9 +54,9 @@ struct SearchParams {
     int lateMovePruningDepth2 = 12;
     int lateMovePruningDepth3 = 24;
 
-    int lmrFullDepthMoves = 4;
+    int lmrFullDepthMoves = 3;
     int lmrReductionDepthLimit = 3;
-    int lmrBaseReduction = 1;
+    int lmrBaseReduction = 0;
     int lmrNonPvDepth = 5;
     int lmrMoveDepth1 = 6;
     int lmrMoveNumber1 = 8;

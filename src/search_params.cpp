@@ -31,8 +31,8 @@ const std::array<SearchParameterMeta, SearchParameterCount>& search_parameter_me
 
         {"SearchHistoryMax", 16384, 1024, 65536, &searchParams.historyMax},
         {"SearchHistoryScoreCap", 6000, 512, 32768, &searchParams.historyScoreCap},
-        {"SearchHistoryBonusDepthSquared", 1, 0, 64, &searchParams.historyBonusDepthSquared},
-        {"SearchHistoryBonusDepthLinear", 2, 0, 256, &searchParams.historyBonusDepthLinear},
+        {"SearchHistoryBonusDepthSquared", 16, 0, 64, &searchParams.historyBonusDepthSquared},
+        {"SearchHistoryBonusDepthLinear", 64, 0, 256, &searchParams.historyBonusDepthLinear},
 
         {"SearchCounterMoveScore", 7000, 0, 30000, &searchParams.counterMoveScore},
         {"SearchCounterMoveHistoryDivisor", 64, 1, 512, &searchParams.counterMoveHistoryDivisor},
@@ -71,9 +71,9 @@ const std::array<SearchParameterMeta, SearchParameterCount>& search_parameter_me
         {"SearchLateMovePruningDepth2", 12, 0, 128, &searchParams.lateMovePruningDepth2},
         {"SearchLateMovePruningDepth3", 24, 0, 256, &searchParams.lateMovePruningDepth3},
 
-        {"SearchLmrFullDepthMoves", 4, 1, 16, &searchParams.lmrFullDepthMoves},
+        {"SearchLmrFullDepthMoves", 3, 1, 16, &searchParams.lmrFullDepthMoves},
         {"SearchLmrReductionDepthLimit", 3, 1, 16, &searchParams.lmrReductionDepthLimit},
-        {"SearchLmrBaseReduction", 1, 0, 6, &searchParams.lmrBaseReduction},
+        {"SearchLmrBaseReduction", 0, 0, 6, &searchParams.lmrBaseReduction},
         {"SearchLmrNonPvDepth", 5, 1, 16, &searchParams.lmrNonPvDepth},
         {"SearchLmrMoveDepth1", 6, 1, 16, &searchParams.lmrMoveDepth1},
         {"SearchLmrMoveNumber1", 8, 1, 64, &searchParams.lmrMoveNumber1},
