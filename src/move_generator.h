@@ -17,7 +17,9 @@ vector<int> generate_moves(thrawn::Position* pos, int move_type);
 int make_move(thrawn::Position* pos, int move, int move_type, int ply);
 int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply);
 int make_root_move(thrawn::Position* pos, int move, int move_type);
-// void unmake_move(thrawn::Position* pos, int ply);
+void unmake_move(thrawn::Position* pos, int ply);
+void make_null_move(thrawn::Position* pos, int ply);
+void unmake_null_move(thrawn::Position* pos, int ply);
     
     
 void parse_white_pawn_moves(thrawn::Position* pos,uint64_t& curr, vector<int>& moves, int move_type = all_moves);

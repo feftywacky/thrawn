@@ -1082,24 +1082,11 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         !pawnOnlyEndgame && td->allowNullMovePruning &&
         !is_mate_score(beta) && !is_mate_score(static_eval))
     {
-        // we make a null move
-        copyBoard(pos);
-
         pos->ply++;
         td->ply_moves[pos->ply - 1] = 0;
-        nnue_copy_parent_to_child(pos, pos->ply);
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
-
-        // Remove en-passant possibility from the key
-        if (pos->enpassant != null_sq)
-            pos->zobristKey ^= pos->enpassant_hashkey[pos->enpassant];
-        pos->enpassant = null_sq;
-
-        // Switch side
-        pos->colour_to_move ^= 1;
-        pos->zobristKey ^= pos->colour_to_move_hashkey;
-        nnue_debug_check(pos);
+        make_null_move(pos, pos->ply);
 
         // Null-move search with reduced depth
         int reduction = null_move_reduction(depth, static_eval, beta);
@@ -1107,10 +1094,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         score = -negamax(pos, td, depth - 1 - reduction, -beta, -beta + 1);
         td->allowNullMovePruning = true;
         
+        unmake_null_move(pos, pos->ply);
         pos->ply--;
         pos->repetition_index--;
-        
-        restoreBoard(pos);
 
         if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
@@ -1218,14 +1204,12 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
         if (needsLmrCheckInfo)
             gives_check();
 
-        copyBoard(pos);
         pos->ply++;
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
         if (!make_move_on_board(pos, move, all_moves, pos->ply))
         {
-            restoreBoard(pos);
             pos->ply--;
             pos->repetition_index--;
             continue;
@@ -1293,9 +1277,9 @@ int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int bet
             }
         }
 
+        unmake_move(pos, pos->ply);
         pos->ply--;
         pos->repetition_index--;
-        restoreBoard(pos);
         moves_searched++;
 
         if (stopped.load(std::memory_order_relaxed) == 1)
@@ -1491,14 +1475,12 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         }
 
         const int parentPly = pos->ply;
-        copyBoard(pos);
         pos->ply++;
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
         if (!make_move_on_board(pos, move, move_type, pos->ply))
         {
-            restoreBoard(pos);
             pos->ply--;
             pos->repetition_index--;
             continue;
@@ -1508,9 +1490,9 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
 
         int score = -quiescence(pos, td, -beta, -alpha);
 
+        unmake_move(pos, pos->ply);
         pos->ply--;
         pos->repetition_index--;
-        restoreBoard(pos);
 
         if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;

@@ -206,32 +206,22 @@ static bool uci_nnue_verify_recursive(thrawn::Position* pos,
     );
 
     if (!in_check && !noMajorsOrMinorsPieces(pos)) {
-        copyBoard(pos);
-
         pos->ply++;
-        nnue_copy_parent_to_child(pos, pos->ply);
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
-
-        if (pos->enpassant != null_sq) {
-            pos->zobristKey ^= pos->enpassant_hashkey[pos->enpassant];
-        }
-        pos->enpassant = null_sq;
-
-        pos->colour_to_move ^= 1;
-        pos->zobristKey ^= pos->colour_to_move_hashkey;
+        make_null_move(pos, pos->ply);
 
         if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, max_parity_error_cp, error)) {
             error = "after null move: " + error;
+            unmake_null_move(pos, pos->ply);
             pos->ply--;
             pos->repetition_index--;
-            restoreBoard(pos);
             return false;
         }
 
+        unmake_null_move(pos, pos->ply);
         pos->ply--;
         pos->repetition_index--;
-        restoreBoard(pos);
     }
 
     std::vector<int> moves = generate_moves(pos);
@@ -240,13 +230,11 @@ static bool uci_nnue_verify_recursive(thrawn::Position* pos,
             break;
         }
 
-        copyBoard(pos);
         pos->ply++;
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
         if (!make_move_on_board(pos, move, all_moves, pos->ply)) {
-            restoreBoard(pos);
             pos->ply--;
             pos->repetition_index--;
             continue;
@@ -254,15 +242,15 @@ static bool uci_nnue_verify_recursive(thrawn::Position* pos,
 
         if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, max_parity_error_cp, error)) {
             error = "after move " + uci_move_to_string(move) + ": " + error;
+            unmake_move(pos, pos->ply);
             pos->ply--;
             pos->repetition_index--;
-            restoreBoard(pos);
             return false;
         }
 
+        unmake_move(pos, pos->ply);
         pos->ply--;
         pos->repetition_index--;
-        restoreBoard(pos);
     }
 
     return true;

@@ -32,6 +32,9 @@ struct alignas(NNUE_SIMD_ALIGNMENT) NnueState {
     std::array<uint8_t, NNUE_MAX_PIECES> piece_list{};
     std::array<uint8_t, NNUE_MAX_PIECES> square_list{};
     std::array<int8_t, BOARD_SIZE> index_by_square{};
+    // -1 means local; otherwise this perspective reads from an ancestor ply until first write.
+    int8_t white_acc_source_ply = -1;
+    int8_t black_acc_source_ply = -1;
     uint8_t piece_count = 0;
     int8_t white_king_sq = -1;
     int8_t black_king_sq = -1;
@@ -59,14 +62,15 @@ private:
     std::unique_ptr<std::array<NnueState, MAX_DEPTH + 1>> states;
 };
 
-// Holds all data needed to restore a position
+// Holds the irreversible state and capture delta needed to unmake one move.
 struct UndoData {
-    int move;             // the packed move itself: source, target, etc.
-    int captured_piece;   // which piece got captured (if any)
-    int castle_rights;    // old castle rights before move
-    int enpassant;        // old en-passant square
-    int fifty_move;       // old halfmove clock
-    uint64_t zobristKey;  // old zobrist key (optional but convenient)
+    int move = 0;
+    int captured_piece = -1;
+    int captured_square = null_sq;
+    int castle_rights = 0;
+    int enpassant = null_sq;
+    int fifty_move = 0;
+    uint64_t zobristKey = 0ULL;
 };
 
 class Position {
@@ -104,40 +108,13 @@ public:
     static uint64_t colour_to_move_hashkey;
 
     //============= UNDO STACK =============//
-    UndoData undo_stack[MAX_DEPTH];
+    UndoData undo_stack[MAX_DEPTH + 1];
 
     //============= CONSTRUCTORS & METHODS =============//
     Position();
     Position(const Position& other);
     Position& operator=(const Position& other);
 };
-
-// copying and restoring for move take backs
-#define copyBoard(pos) \
-    array<uint64_t, 12> piece_bitboards_copy; \
-    array<uint64_t, 3> occupancies_copy; \
-    int colour_to_move_copy; \
-    int enpassant_copy; \
-    int castle_rights_copy; \
-    uint64_t zobristKey_copy; \
-    int fifty_move_copy; \
-    piece_bitboards_copy = pos->piece_bitboards; \
-    occupancies_copy = pos->occupancies; \
-    colour_to_move_copy = pos->colour_to_move; \
-    enpassant_copy = pos->enpassant; \
-    castle_rights_copy = pos->castle_rights; \
-    zobristKey_copy = pos->zobristKey; \
-    fifty_move_copy = pos->fifty_move; \
-
-// Restore board state
-#define restoreBoard(pos) \
-    pos->piece_bitboards = piece_bitboards_copy; \
-    pos->occupancies = occupancies_copy; \
-    pos->colour_to_move = colour_to_move_copy; \
-    pos->enpassant = enpassant_copy; \
-    pos->castle_rights = castle_rights_copy; \
-    pos->zobristKey = zobristKey_copy; \
-    pos->fifty_move = fifty_move_copy; \
 
 } // namespace thrawn
 

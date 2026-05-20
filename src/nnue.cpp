@@ -44,6 +44,8 @@ constexpr int kL1InputSize = static_cast<int>(kExpectedFtSize) * 2; // [us_acc |
 constexpr int32_t kFtActivationMax = 127;
 constexpr int32_t kDenseActivationMax = 64;
 constexpr double kCpPerStockfishScore = 100.0 / 208.0;
+constexpr int kDividerReciprocalShift = 32;
+constexpr int8_t kLocalAccumulatorSource = -1;
 
 // Thrawn's search constants are classical cp values: the HCE fallback piece
 // values, futility margins, aspiration window, and UCI reporting are all cp-based.
@@ -55,6 +57,29 @@ struct HalfkpSelfTestCase {
     int king_square;
     bool white_perspective;
     int expected_index;
+};
+
+struct ReciprocalDivider {
+    uint32_t divisor = 1;
+    uint64_t reciprocal = UINT64_C(1) << kDividerReciprocalShift;
+};
+
+struct AccumulatorView {
+    const std::array<int16_t, kExpectedFtSize>* white = nullptr;
+    const std::array<int16_t, kExpectedFtSize>* black = nullptr;
+
+    bool valid() const {
+        return white != nullptr && black != nullptr;
+    }
+};
+
+struct EvaluationState {
+    const thrawn::NnueState* state = nullptr;
+    AccumulatorView accumulators{};
+
+    bool valid() const {
+        return state != nullptr && accumulators.valid();
+    }
 };
 
 constexpr std::array<HalfkpSelfTestCase, 4> kHalfkpSelfTests{{
@@ -77,6 +102,15 @@ struct LoadedNetwork {
     int32_t qa = 0;
     int32_t q1 = 0;
     int32_t q2 = 0;
+    ReciprocalDivider qa_divider{};
+    ReciprocalDivider q1_divider{};
+    ReciprocalDivider q2_divider{};
+    float inv_ft_scale = 0.0f;
+    float inv_l1_scale = 0.0f;
+    float inv_l2_scale = 0.0f;
+    float inv_out_scale = 0.0f;
+    double score_stm_per_raw = 0.0;
+    double cp_per_raw = 0.0;
 
     std::array<int16_t, kExpectedFtSize> ft_bias{};
     std::vector<int16_t> ft_weight;
@@ -233,16 +267,33 @@ bool parse_positive_bounded_float(float scale,
     return true;
 }
 
-int64_t div_round_by_scale(int64_t value, int32_t scale) {
+ReciprocalDivider make_reciprocal_divider(int32_t scale) {
     if (scale <= 0) {
+        return {};
+    }
+
+    const uint64_t divisor = static_cast<uint64_t>(scale);
+    const uint64_t numerator = (UINT64_C(1) << kDividerReciprocalShift) + divisor - 1;
+    return {static_cast<uint32_t>(scale), numerator / divisor};
+}
+
+int64_t div_round_by_scale(int32_t value, const ReciprocalDivider& divider) {
+    if (divider.divisor == 0) {
         return 0;
     }
 
-    const int64_t divisor = scale;
-    if (value >= 0) {
-        return (value + divisor / 2) / divisor;
+    const uint64_t magnitude = value >= 0
+        ? static_cast<uint64_t>(value)
+        : static_cast<uint64_t>(-static_cast<int64_t>(value));
+    const uint64_t rounded = magnitude + divider.divisor / 2;
+    uint64_t quotient = (rounded * divider.reciprocal) >> kDividerReciprocalShift;
+    // The ceil reciprocal can only overestimate for these 32-bit dot products.
+    if (quotient * divider.divisor > rounded) {
+        --quotient;
     }
-    return -((-value + divisor / 2) / divisor);
+
+    const int64_t signed_quotient = static_cast<int64_t>(quotient);
+    return value >= 0 ? signed_quotient : -signed_quotient;
 }
 
 int engine_to_model_square(int square) {
@@ -321,10 +372,118 @@ void clear_state(thrawn::NnueState& state) {
     state.piece_list.fill(0);
     state.square_list.fill(0);
     state.index_by_square.fill(-1);
+    state.white_acc_source_ply = kLocalAccumulatorSource;
+    state.black_acc_source_ply = kLocalAccumulatorSource;
     state.piece_count = 0;
     state.white_king_sq = -1;
     state.black_king_sq = -1;
     state.valid = false;
+}
+
+AccumulatorView local_accumulator_view(const thrawn::NnueState& state) {
+    return {&state.white_acc, &state.black_acc};
+}
+
+int accumulator_source_for_child(const thrawn::NnueState& parent,
+                                 bool white_perspective,
+                                 int parent_ply) {
+    const int parent_source = white_perspective
+        ? parent.white_acc_source_ply
+        : parent.black_acc_source_ply;
+    return parent_source == kLocalAccumulatorSource ? parent_ply : parent_source;
+}
+
+bool resolve_accumulator(const thrawn::Position* pos,
+                         int ply,
+                         bool white_perspective,
+                         const std::array<int16_t, kExpectedFtSize>*& accumulator) {
+    if (pos == nullptr || ply < 0 || ply > MAX_DEPTH) {
+        return false;
+    }
+
+    int source_ply = ply;
+    for (int hops = 0; hops <= MAX_DEPTH; ++hops) {
+        const thrawn::NnueState& state = pos->nnue_stack[static_cast<std::size_t>(source_ply)];
+        if (!state.valid) {
+            return false;
+        }
+
+        const int next_source = white_perspective
+            ? state.white_acc_source_ply
+            : state.black_acc_source_ply;
+        if (next_source == kLocalAccumulatorSource) {
+            accumulator = white_perspective ? &state.white_acc : &state.black_acc;
+            return true;
+        }
+        if (next_source < 0 || next_source > MAX_DEPTH || next_source == source_ply) {
+            return false;
+        }
+        source_ply = next_source;
+    }
+
+    return false;
+}
+
+bool accumulator_view_for_ply(const thrawn::Position* pos,
+                              int ply,
+                              AccumulatorView& view) {
+    return resolve_accumulator(pos, ply, true, view.white) &&
+           resolve_accumulator(pos, ply, false, view.black);
+}
+
+bool materialize_accumulator(thrawn::Position* pos, int ply, bool white_perspective) {
+    if (pos == nullptr || ply < 0 || ply > MAX_DEPTH) {
+        return false;
+    }
+
+    thrawn::NnueState& state = pos->nnue_stack[static_cast<std::size_t>(ply)];
+    int8_t& source = white_perspective ? state.white_acc_source_ply : state.black_acc_source_ply;
+    if (source == kLocalAccumulatorSource) {
+        return state.valid;
+    }
+
+    const std::array<int16_t, kExpectedFtSize>* source_acc = nullptr;
+    if (!resolve_accumulator(pos, ply, white_perspective, source_acc) || source_acc == nullptr) {
+        return false;
+    }
+
+    auto& target = white_perspective ? state.white_acc : state.black_acc;
+    if (source_acc != &target) {
+        target = *source_acc;
+    }
+    source = kLocalAccumulatorSource;
+    return true;
+}
+
+bool materialize_state_accumulators(thrawn::Position* pos, int ply) {
+    return materialize_accumulator(pos, ply, true) &&
+           materialize_accumulator(pos, ply, false);
+}
+
+void mark_accumulator_local(thrawn::NnueState& state, bool white_perspective) {
+    if (white_perspective) {
+        state.white_acc_source_ply = kLocalAccumulatorSource;
+    } else {
+        state.black_acc_source_ply = kLocalAccumulatorSource;
+    }
+}
+
+void copy_state_metadata_without_accumulators(thrawn::NnueState& child,
+                                              const thrawn::NnueState& parent,
+                                              int child_ply) {
+    child.piece_list = parent.piece_list;
+    child.square_list = parent.square_list;
+    child.index_by_square = parent.index_by_square;
+    child.piece_count = parent.piece_count;
+    child.white_king_sq = parent.white_king_sq;
+    child.black_king_sq = parent.black_king_sq;
+    child.valid = parent.valid;
+
+    const int parent_ply = child_ply - 1;
+    child.white_acc_source_ply = static_cast<int8_t>(
+        accumulator_source_for_child(parent, true, parent_ply));
+    child.black_acc_source_ply = static_cast<int8_t>(
+        accumulator_source_for_child(parent, false, parent_ply));
 }
 
 void copy_ft_bias(std::array<int16_t, kExpectedFtSize>& accumulator,
@@ -506,6 +665,7 @@ bool refresh_perspective_accumulator(thrawn::NnueState& state,
     }
 
     auto& acc = white_perspective ? state.white_acc : state.black_acc;
+    mark_accumulator_local(state, white_perspective);
     copy_ft_bias(acc, network.ft_bias);
 
     for (int i = 0; i < static_cast<int>(state.piece_count); ++i) {
@@ -524,7 +684,9 @@ bool refresh_perspective_accumulator(thrawn::NnueState& state,
     return true;
 }
 
-bool patch_piece_for_available_perspectives(thrawn::NnueState& state,
+bool patch_piece_for_available_perspectives(thrawn::Position* pos,
+                                            int ply,
+                                            thrawn::NnueState& state,
                                             const LoadedNetwork& network,
                                             int piece,
                                             int square,
@@ -536,6 +698,9 @@ bool patch_piece_for_available_perspectives(thrawn::NnueState& state,
     bool patched_any = false;
 
     if (state.white_king_sq >= 0 && state.white_king_sq < BOARD_SIZE) {
+        if (!materialize_accumulator(pos, ply, true)) {
+            return false;
+        }
         const int feature = halfkp_index(piece, square, state.white_king_sq, true);
         if (feature < 0) {
             return false;
@@ -550,6 +715,9 @@ bool patch_piece_for_available_perspectives(thrawn::NnueState& state,
     }
 
     if (state.black_king_sq >= 0 && state.black_king_sq < BOARD_SIZE) {
+        if (!materialize_accumulator(pos, ply, false)) {
+            return false;
+        }
         const int feature = halfkp_index(piece, square, state.black_king_sq, false);
         if (feature < 0) {
             return false;
@@ -575,6 +743,7 @@ bool refresh_perspective_accumulator_from_board(const thrawn::Position* pos,
     }
 
     auto& acc = white_perspective ? state.white_acc : state.black_acc;
+    mark_accumulator_local(state, white_perspective);
     copy_ft_bias(acc, network.ft_bias);
 
     const int our_king_square = white_perspective
@@ -608,12 +777,14 @@ bool refresh_perspective_accumulator_from_board(const thrawn::Position* pos,
     return true;
 }
 
-bool add_piece_to_state(thrawn::NnueState& state,
+bool add_piece_to_state(thrawn::Position* pos,
+                        int ply,
+                        thrawn::NnueState& state,
                         const LoadedNetwork& network,
                         int piece,
                         int square) {
     if (!is_king_piece(piece)) {
-        if (!patch_piece_for_available_perspectives(state, network, piece, square, AccumulatorUpdateOp::Add)) {
+        if (!patch_piece_for_available_perspectives(pos, ply, state, network, piece, square, AccumulatorUpdateOp::Add)) {
             return false;
         }
     }
@@ -625,12 +796,14 @@ bool add_piece_to_state(thrawn::NnueState& state,
     return true;
 }
 
-bool remove_piece_from_state(thrawn::NnueState& state,
+bool remove_piece_from_state(thrawn::Position* pos,
+                             int ply,
+                             thrawn::NnueState& state,
                              const LoadedNetwork& network,
                              int piece,
                              int square) {
     if (!is_king_piece(piece)) {
-        if (!patch_piece_for_available_perspectives(state, network, piece, square, AccumulatorUpdateOp::Subtract)) {
+        if (!patch_piece_for_available_perspectives(pos, ply, state, network, piece, square, AccumulatorUpdateOp::Subtract)) {
             return false;
         }
     }
@@ -673,20 +846,23 @@ bool build_state_from_board(const thrawn::Position* pos,
     return true;
 }
 
-const thrawn::NnueState* state_for_evaluation(const thrawn::Position* pos,
-                                              const LoadedNetwork& network,
-                                              thrawn::NnueState& refreshed_state) {
+EvaluationState state_for_evaluation(const thrawn::Position* pos,
+                                     const LoadedNetwork& network,
+                                     thrawn::NnueState& refreshed_state) {
     if (pos->ply >= 0 && pos->ply <= MAX_DEPTH) {
         const thrawn::NnueState& live_state = pos->nnue_stack[pos->ply];
         if (live_state.valid) {
-            return &live_state;
+            EvaluationState evaluation{&live_state, {}};
+            if (accumulator_view_for_ply(pos, pos->ply, evaluation.accumulators)) {
+                return evaluation;
+            }
         }
     }
 
     if (!build_state_from_board(pos, network, refreshed_state)) {
-        return nullptr;
+        return {};
     }
-    return &refreshed_state;
+    return {&refreshed_state, local_accumulator_view(refreshed_state)};
 }
 
 #if defined(USE_AVX2)
@@ -895,30 +1071,29 @@ int32_t round_to_int32(double value) {
 }
 
 double raw_outscale_units_to_score_stm(int64_t raw, const LoadedNetwork& network) {
-    return (static_cast<double>(raw) / static_cast<double>(network.out_scale)) *
-           static_cast<double>(network.score_scale);
+    return static_cast<double>(raw) * network.score_stm_per_raw;
 }
 
 double raw_outscale_units_to_cp(int64_t raw, const LoadedNetwork& network) {
-    return raw_outscale_units_to_score_stm(raw, network) * kCpPerStockfishScore;
+    return static_cast<double>(raw) * network.cp_per_raw;
 }
 
-int64_t evaluate_state_int_raw_outscale_units(const thrawn::NnueState& state,
-                                              const LoadedNetwork& network,
-                                              int colour_to_move) {
+int64_t evaluate_accumulators_int_raw_outscale_units(const AccumulatorView& accumulators,
+                                                     const LoadedNetwork& network,
+                                                     int colour_to_move) {
     alignas(64) std::array<uint8_t, kL1InputSize> x{};
     alignas(64) std::array<uint8_t, kExpectedL1Size> h1{};
     alignas(64) std::array<uint8_t, kExpectedL2Size> h2{};
 
-    const auto& us = (colour_to_move == white) ? state.white_acc : state.black_acc;
-    const auto& them = (colour_to_move == white) ? state.black_acc : state.white_acc;
+    const auto& us = (colour_to_move == white) ? *accumulators.white : *accumulators.black;
+    const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
 
     pack_clipped_u8(x.data(), us.data(), them.data(), network.qa);
 
     for (int j = 0; j < static_cast<int>(kExpectedL1Size); ++j) {
         const int32_t dot = dot_u8_i8(x.data(), network.l1_weight_t[j].data(), kL1InputSize);
         int64_t s = static_cast<int64_t>(network.l1_bias[j]) +
-                    div_round_by_scale(dot, network.qa);
+                    div_round_by_scale(dot, network.qa_divider);
         if (s < 0) s = 0;
         if (s > network.q1) s = network.q1;
         h1[j] = static_cast<uint8_t>(s);
@@ -927,7 +1102,7 @@ int64_t evaluate_state_int_raw_outscale_units(const thrawn::NnueState& state,
     for (int j = 0; j < static_cast<int>(kExpectedL2Size); ++j) {
         const int32_t dot = dot_u8_i8(h1.data(), network.l2_weight_t[j].data(), kExpectedL1Size);
         int64_t s = static_cast<int64_t>(network.l2_bias[j]) +
-                    div_round_by_scale(dot, network.q1);
+                    div_round_by_scale(dot, network.q1_divider);
         if (s < 0) s = 0;
         if (s > network.q2) s = network.q2;
         h2[j] = static_cast<uint8_t>(s);
@@ -935,15 +1110,15 @@ int64_t evaluate_state_int_raw_outscale_units(const thrawn::NnueState& state,
 
     const int32_t dot = dot_u8_i8(h2.data(), network.out_weight.data(), kExpectedL2Size);
     const int64_t out = static_cast<int64_t>(network.out_bias) +
-                        div_round_by_scale(dot, network.q2);
+                        div_round_by_scale(dot, network.q2_divider);
 
     return out;
 }
 
-int32_t evaluate_state_int_score_stm(const thrawn::NnueState& state,
-                                     const LoadedNetwork& network,
-                                     int colour_to_move) {
-    const int64_t raw = evaluate_state_int_raw_outscale_units(state, network, colour_to_move);
+int32_t evaluate_accumulators_int_score_stm(const AccumulatorView& accumulators,
+                                            const LoadedNetwork& network,
+                                            int colour_to_move) {
+    const int64_t raw = evaluate_accumulators_int_raw_outscale_units(accumulators, network, colour_to_move);
     if (!std::isfinite(network.out_scale) || network.out_scale <= 0.0f ||
         !std::isfinite(network.score_scale) || network.score_scale <= 0.0f) {
         return 0;
@@ -952,10 +1127,10 @@ int32_t evaluate_state_int_score_stm(const thrawn::NnueState& state,
     return round_to_int32(raw_outscale_units_to_score_stm(raw, network));
 }
 
-int32_t evaluate_state_int_cp(const thrawn::NnueState& state,
-                              const LoadedNetwork& network,
-                              int colour_to_move) {
-    const int64_t raw = evaluate_state_int_raw_outscale_units(state, network, colour_to_move);
+int32_t evaluate_accumulators_int_cp(const AccumulatorView& accumulators,
+                                     const LoadedNetwork& network,
+                                     int colour_to_move) {
+    const int64_t raw = evaluate_accumulators_int_raw_outscale_units(accumulators, network, colour_to_move);
     if (!std::isfinite(network.out_scale) || network.out_scale <= 0.0f ||
         !std::isfinite(network.score_scale) || network.score_scale <= 0.0f) {
         return 0;
@@ -964,65 +1139,65 @@ int32_t evaluate_state_int_cp(const thrawn::NnueState& state,
     return round_to_int32(raw_outscale_units_to_cp(raw, network));
 }
 
-int32_t evaluate_state_int_engine_score(const thrawn::NnueState& state,
-                                        const LoadedNetwork& network,
-                                        int colour_to_move) {
+int32_t evaluate_accumulators_int_engine_score(const AccumulatorView& accumulators,
+                                               const LoadedNetwork& network,
+                                               int colour_to_move) {
     if constexpr (kSearchUsesCentipawns) {
-        return evaluate_state_int_cp(state, network, colour_to_move);
+        return evaluate_accumulators_int_cp(accumulators, network, colour_to_move);
     } else {
-        return evaluate_state_int_score_stm(state, network, colour_to_move);
+        return evaluate_accumulators_int_score_stm(accumulators, network, colour_to_move);
     }
 }
 
-float evaluate_state_float_raw_output(const thrawn::NnueState& state,
-                                      const LoadedNetwork& network,
-                                      int colour_to_move) {
+float evaluate_accumulators_float_raw_output(const AccumulatorView& accumulators,
+                                             const LoadedNetwork& network,
+                                             int colour_to_move) {
     std::array<float, kL1InputSize> x{};
     std::array<float, kExpectedL1Size> h1{};
     std::array<float, kExpectedL2Size> h2{};
 
-    const auto& us = (colour_to_move == white) ? state.white_acc : state.black_acc;
-    const auto& them = (colour_to_move == white) ? state.black_acc : state.white_acc;
+    const auto& us = (colour_to_move == white) ? *accumulators.white : *accumulators.black;
+    const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
 
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        x[i] = std::clamp(static_cast<float>(us[i]) / network.ft_scale, 0.0f, 1.0f);
-        x[static_cast<int>(kExpectedFtSize) + i] = std::clamp(static_cast<float>(them[i]) / network.ft_scale, 0.0f, 1.0f);
+        x[i] = std::clamp(static_cast<float>(us[i]) * network.inv_ft_scale, 0.0f, 1.0f);
+        x[static_cast<int>(kExpectedFtSize) + i] = std::clamp(static_cast<float>(them[i]) * network.inv_ft_scale, 0.0f, 1.0f);
     }
 
     for (int j = 0; j < static_cast<int>(kExpectedL1Size); ++j) {
-        float s = static_cast<float>(network.l1_bias[j]) / network.l1_scale;
+        float s = static_cast<float>(network.l1_bias[j]) * network.inv_l1_scale;
         for (int i = 0; i < kL1InputSize; ++i) {
-            s += x[i] * (static_cast<float>(network.l1_weight_t[j][i]) / network.l1_scale);
+            s += x[i] * (static_cast<float>(network.l1_weight_t[j][i]) * network.inv_l1_scale);
         }
         h1[j] = std::clamp(s, 0.0f, 1.0f);
     }
 
     for (int j = 0; j < static_cast<int>(kExpectedL2Size); ++j) {
-        float s = static_cast<float>(network.l2_bias[j]) / network.l2_scale;
+        float s = static_cast<float>(network.l2_bias[j]) * network.inv_l2_scale;
         for (int i = 0; i < static_cast<int>(kExpectedL1Size); ++i) {
-            s += h1[i] * (static_cast<float>(network.l2_weight_t[j][i]) / network.l2_scale);
+            s += h1[i] * (static_cast<float>(network.l2_weight_t[j][i]) * network.inv_l2_scale);
         }
         h2[j] = std::clamp(s, 0.0f, 1.0f);
     }
 
-    float out = static_cast<float>(network.out_bias) / network.out_scale;
+    float out = static_cast<float>(network.out_bias) * network.inv_out_scale;
     for (int i = 0; i < static_cast<int>(kExpectedL2Size); ++i) {
-        out += h2[i] * (static_cast<float>(network.out_weight[i]) / network.out_scale);
+        out += h2[i] * (static_cast<float>(network.out_weight[i]) * network.inv_out_scale);
     }
 
     return out;
 }
 
-float evaluate_state_float_score_stm(const thrawn::NnueState& state,
-                                     const LoadedNetwork& network,
-                                     int colour_to_move) {
-    return evaluate_state_float_raw_output(state, network, colour_to_move) * network.score_scale;
+float evaluate_accumulators_float_score_stm(const AccumulatorView& accumulators,
+                                            const LoadedNetwork& network,
+                                            int colour_to_move) {
+    return evaluate_accumulators_float_raw_output(accumulators, network, colour_to_move) * network.score_scale;
 }
 
-float evaluate_state_float_cp(const thrawn::NnueState& state,
-                              const LoadedNetwork& network,
-                              int colour_to_move) {
-    return evaluate_state_float_score_stm(state, network, colour_to_move) *
+float evaluate_accumulators_float_cp(const AccumulatorView& accumulators,
+                                     const LoadedNetwork& network,
+                                     int colour_to_move) {
+    return evaluate_accumulators_float_score_stm(accumulators, network, colour_to_move) *
            static_cast<float>(kCpPerStockfishScore);
 }
 
@@ -1050,6 +1225,11 @@ bool verify_state_against_board(const thrawn::Position* pos,
         return fail("incremental state invalid");
     }
 
+    AccumulatorView incremental_accumulators{};
+    if (!accumulator_view_for_ply(pos, pos->ply, incremental_accumulators)) {
+        return fail("incremental accumulator source invalid");
+    }
+
     if (incremental.piece_count != rebuilt.piece_count) {
         return fail("piece count mismatch");
     }
@@ -1057,10 +1237,10 @@ bool verify_state_against_board(const thrawn::Position* pos,
         incremental.black_king_sq != rebuilt.black_king_sq) {
         return fail("king square mismatch");
     }
-    if (incremental.white_acc != rebuilt.white_acc) {
+    if (*incremental_accumulators.white != rebuilt.white_acc) {
         return fail("white accumulator mismatch");
     }
-    if (incremental.black_acc != rebuilt.black_acc) {
+    if (*incremental_accumulators.black != rebuilt.black_acc) {
         return fail("black accumulator mismatch");
     }
 
@@ -1075,8 +1255,10 @@ bool verify_state_against_board(const thrawn::Position* pos,
         }
     }
 
-    const int64_t incremental_raw = evaluate_state_int_raw_outscale_units(incremental, network, pos->colour_to_move);
-    const int64_t rebuilt_raw = evaluate_state_int_raw_outscale_units(rebuilt, network, pos->colour_to_move);
+    const int64_t incremental_raw =
+        evaluate_accumulators_int_raw_outscale_units(incremental_accumulators, network, pos->colour_to_move);
+    const int64_t rebuilt_raw =
+        evaluate_accumulators_int_raw_outscale_units(local_accumulator_view(rebuilt), network, pos->colour_to_move);
     if (incremental_raw != rebuilt_raw) {
         return fail("raw evaluation mismatch");
     }
@@ -1096,13 +1278,13 @@ bool measure_evaluation_parity(const thrawn::Position* pos,
     };
 
     thrawn::NnueState refreshed_state;
-    const thrawn::NnueState* state = state_for_evaluation(pos, network, refreshed_state);
-    if (state == nullptr) {
+    const EvaluationState evaluation = state_for_evaluation(pos, network, refreshed_state);
+    if (!evaluation.valid()) {
         return fail("failed to build evaluation state");
     }
 
-    const int32_t int_cp = evaluate_state_int_cp(*state, network, pos->colour_to_move);
-    const float float_cp = evaluate_state_float_cp(*state, network, pos->colour_to_move);
+    const int32_t int_cp = evaluate_accumulators_int_cp(evaluation.accumulators, network, pos->colour_to_move);
+    const float float_cp = evaluate_accumulators_float_cp(evaluation.accumulators, network, pos->colour_to_move);
     if (abs_error_cp != nullptr) {
         *abs_error_cp = std::fabs(float_cp - static_cast<float>(int_cp));
     }
@@ -1269,6 +1451,16 @@ bool load_network_from_file(const std::string& path,
     network.qa = qa;
     network.q1 = q1;
     network.q2 = q2;
+    network.qa_divider = make_reciprocal_divider(qa);
+    network.q1_divider = make_reciprocal_divider(q1);
+    network.q2_divider = make_reciprocal_divider(q2);
+    network.inv_ft_scale = 1.0f / ft_scale;
+    network.inv_l1_scale = 1.0f / l1_scale;
+    network.inv_l2_scale = 1.0f / l2_scale;
+    network.inv_out_scale = 1.0f / out_scale;
+    network.score_stm_per_raw =
+        static_cast<double>(score_scale) / static_cast<double>(out_scale);
+    network.cp_per_raw = network.score_stm_per_raw * kCpPerStockfishScore;
 
     std::copy(ft_bias_q.begin(), ft_bias_q.end(), network.ft_bias.begin());
     network.ft_weight = std::move(ft_weight_q);
@@ -1363,12 +1555,12 @@ int nnue_evaluate(thrawn::Position* pos) {
     }
 
     thrawn::NnueState refreshed_state;
-    const thrawn::NnueState* state = state_for_evaluation(pos, *network, refreshed_state);
-    if (state == nullptr) {
+    const EvaluationState evaluation = state_for_evaluation(pos, *network, refreshed_state);
+    if (!evaluation.valid()) {
         return 0;
     }
 
-    return evaluate_state_int_engine_score(*state, *network, pos->colour_to_move);
+    return evaluate_accumulators_int_engine_score(evaluation.accumulators, *network, pos->colour_to_move);
 }
 
 float nnue_evaluate_raw(const thrawn::Position* pos) {
@@ -1378,12 +1570,12 @@ float nnue_evaluate_raw(const thrawn::Position* pos) {
     }
 
     thrawn::NnueState refreshed_state;
-    const thrawn::NnueState* state = state_for_evaluation(pos, *network, refreshed_state);
-    if (state == nullptr) {
+    const EvaluationState evaluation = state_for_evaluation(pos, *network, refreshed_state);
+    if (!evaluation.valid()) {
         return 0.0f;
     }
 
-    return evaluate_state_float_score_stm(*state, *network, pos->colour_to_move);
+    return evaluate_accumulators_float_score_stm(evaluation.accumulators, *network, pos->colour_to_move);
 }
 
 void nnue_refresh_root(thrawn::Position* pos) {
@@ -1411,10 +1603,37 @@ void nnue_copy_parent_to_child(thrawn::Position* pos, int child_ply) {
     const thrawn::NnueState& parent = pos->nnue_stack[child_ply - 1];
     if (current_network() == nullptr || !parent.valid) {
         child.valid = false;
+        child.white_acc_source_ply = kLocalAccumulatorSource;
+        child.black_acc_source_ply = kLocalAccumulatorSource;
         return;
     }
 
-    child = parent;
+    copy_state_metadata_without_accumulators(child, parent, child_ply);
+}
+
+void nnue_promote_to_root(thrawn::Position* pos, int ply) {
+    if (pos == nullptr || ply < 0 || ply > MAX_DEPTH) {
+        return;
+    }
+
+    thrawn::NnueState& root = pos->nnue_stack[0];
+    if (current_network() == nullptr) {
+        root.valid = false;
+        root.white_acc_source_ply = kLocalAccumulatorSource;
+        root.black_acc_source_ply = kLocalAccumulatorSource;
+        return;
+    }
+
+    if (!pos->nnue_stack[ply].valid || !materialize_state_accumulators(pos, ply)) {
+        root.valid = false;
+        root.white_acc_source_ply = kLocalAccumulatorSource;
+        root.black_acc_source_ply = kLocalAccumulatorSource;
+        return;
+    }
+
+    root = pos->nnue_stack[ply];
+    root.white_acc_source_ply = kLocalAccumulatorSource;
+    root.black_acc_source_ply = kLocalAccumulatorSource;
 }
 
 void nnue_add_piece(thrawn::Position* pos, int ply, int piece, int square) {
@@ -1428,7 +1647,7 @@ void nnue_add_piece(thrawn::Position* pos, int ply, int piece, int square) {
         return;
     }
 
-    if (!add_piece_to_state(state, *network, piece, square)) {
+    if (!add_piece_to_state(pos, ply, state, *network, piece, square)) {
         state.valid = false;
         return;
     }
@@ -1455,7 +1674,7 @@ void nnue_remove_piece(thrawn::Position* pos, int ply, int piece, int square) {
         return;
     }
 
-    if (!remove_piece_from_state(state, *network, piece, square)) {
+    if (!remove_piece_from_state(pos, ply, state, *network, piece, square)) {
         state.valid = false;
     }
 }

@@ -42,6 +42,27 @@ inline void append_moves_from_attacks(int source,
     }
 }
 
+inline int piece_side(int piece)
+{
+    return piece <= K ? white : black;
+}
+
+inline thrawn::UndoData* save_undo(thrawn::Position* pos, int move, int ply)
+{
+    if (ply < 0 || ply > MAX_DEPTH)
+        return nullptr;
+
+    thrawn::UndoData& undo = pos->undo_stack[ply];
+    undo.move = move;
+    undo.captured_piece = -1;
+    undo.captured_square = null_sq;
+    undo.castle_rights = pos->castle_rights;
+    undo.enpassant = pos->enpassant;
+    undo.fifty_move = pos->fifty_move;
+    undo.zobristKey = pos->zobristKey;
+    return &undo;
+}
+
 } // namespace
 
 
@@ -365,278 +386,314 @@ void parse_king_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, v
 
 int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
 {
-    if (move_type == all_moves)
+    if (move_type == only_captures)
     {
-        // if(ply!=-1)
-        // {
-        //     pos->undo_stack[ply].move           = move;
-        //     pos->undo_stack[ply].captured_piece = -1;
-        //     pos->undo_stack[ply].castle_rights  = pos->castle_rights;
-        //     pos->undo_stack[ply].enpassant      = pos->enpassant;
-        //     pos->undo_stack[ply].fifty_move     = pos->fifty_move;
-        //     pos->undo_stack[ply].zobristKey     = pos->zobristKey;
-        // }
-
-        // move parsing
-        int source = get_move_source(move);
-        int target = get_move_target(move);
-        int piece = get_move_piece(move);
-        int promoted_piece = get_promoted_piece(move);
-        int is_capture_move = get_is_capture_move(move);
-        int double_pawn_move = get_is_double_pawn_move(move);
-        int enpassant_move = get_is_move_enpassant(move);
-        int castling = get_is_move_castling(move);
-        const int moving_side = pos->colour_to_move;
-        const int enemy_side = moving_side ^ 1;
-        const uint64_t source_bb = square_bb(source);
-        const uint64_t target_bb = square_bb(target);
-        const int nnue_ply = (ply >= 0) ? ply : pos->ply;
-        const bool use_nnue = nnue_loaded();
-
-        const int opponent_king = (moving_side == white) ? k : K;
-        if (is_capture_move && get_bit(pos->piece_bitboards[opponent_king], target))
-            return 0;
-
-        if (use_nnue)
-            nnue_copy_parent_to_child(pos, nnue_ply);
-
-        // move piece
-        pop_bit(pos->piece_bitboards[piece], source);
-        set_bit(pos->piece_bitboards[piece], target);
-        pos->occupancies[moving_side] ^= source_bb | target_bb;
-        pos->zobristKey ^= pos->piece_hashkey[piece][source]; // update hash to exclude source
-        pos->zobristKey ^= pos->piece_hashkey[piece][target]; // update hash to include target
-        if (use_nnue)
-        {
-            nnue_remove_piece(pos, nnue_ply, piece, source);
-        }
-        pos->fifty_move++;
-
-        // if pawn moved reset fifty-move rule
-        if (piece == P || piece == p)
-            pos->fifty_move = 0;
-
-        // if capture move, remove the piece being captured from its corresponding bitboard
-        // ie. if white pawn captures black kngiht, remove black knight from black knight bitboard
-        if (is_capture_move)
-        {
-            // if captured a piece reset fifty-move rule
-            pos->fifty_move = 0;
-            int start_piece;
-            int end_piece;
-            
-            (pos->colour_to_move==white) ? start_piece = p : start_piece = P;
-            (pos->colour_to_move==white) ? end_piece = k : end_piece = K;
-
-            for(int i=start_piece; i<=end_piece;i++)
-            {
-                if (get_bit(pos->piece_bitboards[i], target))
-                {
-                    if (ply != -1)
-                        pos->undo_stack[ply].captured_piece = i;
-
-                    pop_bit(pos->piece_bitboards[i], target);
-                    pos->occupancies[enemy_side] &= ~target_bb;
-                    if (use_nnue)
-                        nnue_remove_piece(pos, nnue_ply, i, target);
-                    
-                    // update hashkey to exclude captured piece
-                    pos->zobristKey ^= pos->piece_hashkey[i][target];
-                    break;
-                }
-            }
-        }
-
-        // handle pawn promotions
-        if (promoted_piece)
-        {
-            // erase the pawn from the target square
-            // pop_bit(piece_bitboards[(colour_to_move == white) ? P : p], target);
-            if (pos->colour_to_move == white)
-            {
-                pop_bit(pos->piece_bitboards[P], target);
-                pos->zobristKey ^= pos->piece_hashkey[P][target];
-                if (use_nnue)
-                    nnue_add_piece(pos, nnue_ply, promoted_piece, target);
-            }
-            else
-            {
-                pop_bit(pos->piece_bitboards[p], target);
-                pos->zobristKey ^= pos->piece_hashkey[p][target];
-                if (use_nnue)
-                    nnue_add_piece(pos, nnue_ply, promoted_piece, target);
-            }
-            
-            set_bit(pos->piece_bitboards[promoted_piece], target);
-            pos->zobristKey ^= pos->piece_hashkey[promoted_piece][target];
-        }
-
-        if (use_nnue && !promoted_piece)
-            nnue_add_piece(pos, nnue_ply, piece, target);
-
-        // handle enpassant capture
-        if (enpassant_move)
-        {
-            if (pos->colour_to_move==white)
-            {
-                pop_bit(pos->piece_bitboards[p], target + 8);
-                pos->occupancies[enemy_side] &= ~square_bb(target + 8);
-                pos->zobristKey ^= pos->piece_hashkey[p][target + 8];
-                if (use_nnue)
-                    nnue_remove_piece(pos, nnue_ply, p, target + 8);
-            }
-            else
-            {
-                pop_bit(pos->piece_bitboards[P], target - 8);
-                pos->occupancies[enemy_side] &= ~square_bb(target - 8);
-                pos->zobristKey ^= pos->piece_hashkey[P][target- 8];
-                if (use_nnue)
-                    nnue_remove_piece(pos, nnue_ply, P, target - 8);
-            }
-        }
-
-        if (pos->enpassant!=null_sq)
-        {
-            pos->zobristKey ^= pos->enpassant_hashkey[pos->enpassant];
-        }
-        pos->enpassant = null_sq;
-
-        // set enpassant square when pawn double moves
-        if (double_pawn_move)
-        {
-            // (colour_to_move==white) ? enpassant = target + 8 : enpassant = target - 8;
-
-            if (pos->colour_to_move == white)
-            {
-                pos->enpassant = target + 8;
-                pos->zobristKey ^= pos->enpassant_hashkey[target+8];
-            }
-            else
-            {
-                pos->enpassant = target - 8;
-                pos->zobristKey ^= pos->enpassant_hashkey[target-8];
-            }
-        }
-
-        // handle castling
-        if (castling)
-        {
-            if (target == g1)
-            {
-                pop_bit(pos->piece_bitboards[R], h1);
-                set_bit(pos->piece_bitboards[R], f1);
-                pos->occupancies[white] ^= square_bb(h1) | square_bb(f1);
-                if (use_nnue)
-                {
-                    nnue_remove_piece(pos, nnue_ply, R, h1);
-                    nnue_add_piece(pos, nnue_ply, R, f1);
-                }
-
-                pos->zobristKey ^= pos->piece_hashkey[R][h1];  // remove rook from h1 from hash key
-                pos->zobristKey ^= pos->piece_hashkey[R][f1];  // put rook on f1 into a hash key
-            }
-            else if (target == c1)
-            {
-                pop_bit(pos->piece_bitboards[R], a1);
-                set_bit(pos->piece_bitboards[R], d1);
-                pos->occupancies[white] ^= square_bb(a1) | square_bb(d1);
-                if (use_nnue)
-                {
-                    nnue_remove_piece(pos, nnue_ply, R, a1);
-                    nnue_add_piece(pos, nnue_ply, R, d1);
-                }
-
-                pos->zobristKey ^= pos->piece_hashkey[R][a1];  // remove rook from a1 from hash key
-                pos->zobristKey ^= pos->piece_hashkey[R][d1];  // put rook on d1 into a hash key
-            }
-            else if (target == g8)
-            {
-                pop_bit(pos->piece_bitboards[r], h8);
-                set_bit(pos->piece_bitboards[r], f8);
-                pos->occupancies[black] ^= square_bb(h8) | square_bb(f8);
-                if (use_nnue)
-                {
-                    nnue_remove_piece(pos, nnue_ply, r, h8);
-                    nnue_add_piece(pos, nnue_ply, r, f8);
-                }
-
-                pos->zobristKey ^= pos->piece_hashkey[r][h8];  // remove rook from h8 from hash key
-                pos->zobristKey ^= pos->piece_hashkey[r][f8];  // put rook on f8 into a hash key
-            }
-            else if (target == c8)
-            {
-                pop_bit(pos->piece_bitboards[r], a8);
-                set_bit(pos->piece_bitboards[r], d8);
-                pos->occupancies[black] ^= square_bb(a8) | square_bb(d8);
-                if (use_nnue)
-                {
-                    nnue_remove_piece(pos, nnue_ply, r, a8);
-                    nnue_add_piece(pos, nnue_ply, r, d8);
-                }
-
-                pos->zobristKey ^= pos->piece_hashkey[r][a8];  // remove rook from a8 from hash key
-                pos->zobristKey ^= pos->piece_hashkey[r][d8];  // put rook on d8 into a hash key
-            }         
-        }
-        pos->zobristKey ^= pos->castling_hashkey[pos->castle_rights]; // remove castling right hash
-
-        // updating castling rights after every move
-        pos->castle_rights &= update_castling_right_values[source];
-        pos->castle_rights &= update_castling_right_values[target];
-
-        pos->zobristKey ^= pos->castling_hashkey[pos->castle_rights]; // update castling right hash
-
-        pos->occupancies[both] = pos->occupancies[white] | pos->occupancies[black];
-
-        // change sides
-        pos->colour_to_move ^= 1;
-
-        pos->zobristKey ^= pos->colour_to_move_hashkey;
-        
-        // uint64_t curr_hash = gen_hashkey(); // new hashkey after move made
-        // if (curr_hash != zobristKey)
-        // {
-        //     cout<<"make_move()"<<"\n";
-        //     cout<<"move: ";
-        //     print_move(move);
-        //     cout<<"\n";
-        //     print_board(colour_to_move);
-        //     cout<<"correct hashkey: "<<std::hex<<curr_hash<<"\n";
-        //     cin.get();
-        // }
-
-        // handle illegal moves. if move causes king to check, restore previous position and return illegal move
-        if (is_square_under_attack(pos,(pos->colour_to_move==white) ? get_lsb_index(pos->piece_bitboards[k]) : get_lsb_index(pos->piece_bitboards[K]), pos->colour_to_move))
-        {   
-            return 0;
-        }
-        else
-        {
-            nnue_debug_check(pos);
-            return 1;
-        }
-    }
-    
-    else if (move_type == only_captures)
-    {
-        if (get_is_capture_move(move) || get_promoted_piece(move)) {
+        if (get_is_capture_move(move) || get_promoted_piece(move))
             return make_move_on_board(pos, move, all_moves, ply);
-        }
-        else    
-            return 0;
+
+        return 0;
     }
 
-    return 0;
+    if (move_type != all_moves)
+        return 0;
+
+    const int stack_ply = (ply >= 0) ? ply : pos->ply;
+    if (stack_ply < 0 || stack_ply > MAX_DEPTH)
+        return 0;
+
+    thrawn::UndoData* undo = save_undo(pos, move, stack_ply);
+
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    const int piece = get_move_piece(move);
+    const int promoted_piece = get_promoted_piece(move);
+    const bool is_capture_move = get_is_capture_move(move) != 0;
+    const bool double_pawn_move = get_is_double_pawn_move(move) != 0;
+    const bool enpassant_move = get_is_move_enpassant(move) != 0;
+    const bool castling = get_is_move_castling(move) != 0;
+    const int moving_side = pos->colour_to_move;
+    const int enemy_side = moving_side ^ 1;
+    const uint64_t source_bb = square_bb(source);
+    const uint64_t target_bb = square_bb(target);
+    const int nnue_ply = (stack_ply >= 0) ? stack_ply : pos->ply;
+    const bool use_nnue = nnue_loaded();
+
+    const int opponent_king = (moving_side == white) ? k : K;
+    if (is_capture_move && get_bit(pos->piece_bitboards[opponent_king], target))
+        return 0;
+
+    if (use_nnue)
+        nnue_copy_parent_to_child(pos, nnue_ply);
+
+    pop_bit(pos->piece_bitboards[piece], source);
+    set_bit(pos->piece_bitboards[piece], target);
+    pos->occupancies[moving_side] ^= source_bb | target_bb;
+    pos->zobristKey ^= pos->piece_hashkey[piece][source];
+    pos->zobristKey ^= pos->piece_hashkey[piece][target];
+    if (use_nnue)
+        nnue_remove_piece(pos, nnue_ply, piece, source);
+
+    pos->fifty_move++;
+    if (piece == P || piece == p)
+        pos->fifty_move = 0;
+
+    if (is_capture_move)
+    {
+        pos->fifty_move = 0;
+
+        const int start_piece = (moving_side == white) ? p : P;
+        const int end_piece = (moving_side == white) ? k : K;
+
+        for (int captured = start_piece; captured <= end_piece; captured++)
+        {
+            if (get_bit(pos->piece_bitboards[captured], target))
+            {
+                if (undo != nullptr)
+                {
+                    undo->captured_piece = captured;
+                    undo->captured_square = target;
+                }
+
+                pop_bit(pos->piece_bitboards[captured], target);
+                pos->occupancies[enemy_side] &= ~target_bb;
+                pos->zobristKey ^= pos->piece_hashkey[captured][target];
+                if (use_nnue)
+                    nnue_remove_piece(pos, nnue_ply, captured, target);
+                break;
+            }
+        }
+    }
+
+    if (promoted_piece)
+    {
+        pop_bit(pos->piece_bitboards[piece], target);
+        set_bit(pos->piece_bitboards[promoted_piece], target);
+        pos->zobristKey ^= pos->piece_hashkey[piece][target];
+        pos->zobristKey ^= pos->piece_hashkey[promoted_piece][target];
+        if (use_nnue)
+            nnue_add_piece(pos, nnue_ply, promoted_piece, target);
+    }
+    else if (use_nnue)
+    {
+        nnue_add_piece(pos, nnue_ply, piece, target);
+    }
+
+    if (enpassant_move)
+    {
+        const int captured_piece = (moving_side == white) ? p : P;
+        const int captured_square = (moving_side == white) ? target + 8 : target - 8;
+        const uint64_t captured_bb = square_bb(captured_square);
+
+        if (undo != nullptr)
+        {
+            undo->captured_piece = captured_piece;
+            undo->captured_square = captured_square;
+        }
+
+        pop_bit(pos->piece_bitboards[captured_piece], captured_square);
+        pos->occupancies[enemy_side] &= ~captured_bb;
+        pos->zobristKey ^= pos->piece_hashkey[captured_piece][captured_square];
+        if (use_nnue)
+            nnue_remove_piece(pos, nnue_ply, captured_piece, captured_square);
+    }
+
+    if (pos->enpassant != null_sq)
+        pos->zobristKey ^= pos->enpassant_hashkey[pos->enpassant];
+    pos->enpassant = null_sq;
+
+    if (double_pawn_move)
+    {
+        pos->enpassant = (moving_side == white) ? target + 8 : target - 8;
+        pos->zobristKey ^= pos->enpassant_hashkey[pos->enpassant];
+    }
+
+    if (castling)
+    {
+        if (target == g1)
+        {
+            pop_bit(pos->piece_bitboards[R], h1);
+            set_bit(pos->piece_bitboards[R], f1);
+            pos->occupancies[white] ^= square_bb(h1) | square_bb(f1);
+            pos->zobristKey ^= pos->piece_hashkey[R][h1];
+            pos->zobristKey ^= pos->piece_hashkey[R][f1];
+            if (use_nnue)
+            {
+                nnue_remove_piece(pos, nnue_ply, R, h1);
+                nnue_add_piece(pos, nnue_ply, R, f1);
+            }
+        }
+        else if (target == c1)
+        {
+            pop_bit(pos->piece_bitboards[R], a1);
+            set_bit(pos->piece_bitboards[R], d1);
+            pos->occupancies[white] ^= square_bb(a1) | square_bb(d1);
+            pos->zobristKey ^= pos->piece_hashkey[R][a1];
+            pos->zobristKey ^= pos->piece_hashkey[R][d1];
+            if (use_nnue)
+            {
+                nnue_remove_piece(pos, nnue_ply, R, a1);
+                nnue_add_piece(pos, nnue_ply, R, d1);
+            }
+        }
+        else if (target == g8)
+        {
+            pop_bit(pos->piece_bitboards[r], h8);
+            set_bit(pos->piece_bitboards[r], f8);
+            pos->occupancies[black] ^= square_bb(h8) | square_bb(f8);
+            pos->zobristKey ^= pos->piece_hashkey[r][h8];
+            pos->zobristKey ^= pos->piece_hashkey[r][f8];
+            if (use_nnue)
+            {
+                nnue_remove_piece(pos, nnue_ply, r, h8);
+                nnue_add_piece(pos, nnue_ply, r, f8);
+            }
+        }
+        else if (target == c8)
+        {
+            pop_bit(pos->piece_bitboards[r], a8);
+            set_bit(pos->piece_bitboards[r], d8);
+            pos->occupancies[black] ^= square_bb(a8) | square_bb(d8);
+            pos->zobristKey ^= pos->piece_hashkey[r][a8];
+            pos->zobristKey ^= pos->piece_hashkey[r][d8];
+            if (use_nnue)
+            {
+                nnue_remove_piece(pos, nnue_ply, r, a8);
+                nnue_add_piece(pos, nnue_ply, r, d8);
+            }
+        }
+    }
+
+    pos->zobristKey ^= pos->castling_hashkey[pos->castle_rights];
+    pos->castle_rights &= update_castling_right_values[source];
+    pos->castle_rights &= update_castling_right_values[target];
+    pos->zobristKey ^= pos->castling_hashkey[pos->castle_rights];
+
+    pos->occupancies[both] = pos->occupancies[white] | pos->occupancies[black];
+
+    pos->colour_to_move ^= 1;
+    pos->zobristKey ^= pos->colour_to_move_hashkey;
+
+    const int moved_king_square = (moving_side == white)
+        ? get_lsb_index(pos->piece_bitboards[K])
+        : get_lsb_index(pos->piece_bitboards[k]);
+
+    if (is_square_under_attack(pos, moved_king_square, enemy_side))
+    {
+        if (undo != nullptr)
+            unmake_move(pos, stack_ply);
+        return 0;
+    }
+
+    nnue_debug_check(pos);
+    return 1;
 }
+
+void unmake_move(thrawn::Position* pos, int ply)
+{
+    if (ply < 0 || ply > MAX_DEPTH)
+        return;
+
+    const thrawn::UndoData& undo = pos->undo_stack[ply];
+    const int move = undo.move;
+
+    if (move == 0)
+    {
+        pos->colour_to_move ^= 1;
+        pos->castle_rights = undo.castle_rights;
+        pos->enpassant = undo.enpassant;
+        pos->fifty_move = undo.fifty_move;
+        pos->zobristKey = undo.zobristKey;
+        return;
+    }
+
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    const int piece = get_move_piece(move);
+    const int promoted_piece = get_promoted_piece(move);
+    const bool castling = get_is_move_castling(move) != 0;
+    const int moving_side = piece_side(piece);
+    const int enemy_side = moving_side ^ 1;
+    const uint64_t source_bb = square_bb(source);
+    const uint64_t target_bb = square_bb(target);
+
+    pos->colour_to_move = moving_side;
+
+    if (promoted_piece)
+        pop_bit(pos->piece_bitboards[promoted_piece], target);
+    else
+        pop_bit(pos->piece_bitboards[piece], target);
+
+    set_bit(pos->piece_bitboards[piece], source);
+    pos->occupancies[moving_side] ^= source_bb | target_bb;
+
+    if (undo.captured_piece != -1)
+    {
+        set_bit(pos->piece_bitboards[undo.captured_piece], undo.captured_square);
+        pos->occupancies[enemy_side] |= square_bb(undo.captured_square);
+    }
+
+    if (castling)
+    {
+        if (target == g1)
+        {
+            pop_bit(pos->piece_bitboards[R], f1);
+            set_bit(pos->piece_bitboards[R], h1);
+            pos->occupancies[white] ^= square_bb(f1) | square_bb(h1);
+        }
+        else if (target == c1)
+        {
+            pop_bit(pos->piece_bitboards[R], d1);
+            set_bit(pos->piece_bitboards[R], a1);
+            pos->occupancies[white] ^= square_bb(d1) | square_bb(a1);
+        }
+        else if (target == g8)
+        {
+            pop_bit(pos->piece_bitboards[r], f8);
+            set_bit(pos->piece_bitboards[r], h8);
+            pos->occupancies[black] ^= square_bb(f8) | square_bb(h8);
+        }
+        else if (target == c8)
+        {
+            pop_bit(pos->piece_bitboards[r], d8);
+            set_bit(pos->piece_bitboards[r], a8);
+            pos->occupancies[black] ^= square_bb(d8) | square_bb(a8);
+        }
+    }
+
+    pos->occupancies[both] = pos->occupancies[white] | pos->occupancies[black];
+    pos->castle_rights = undo.castle_rights;
+    pos->enpassant = undo.enpassant;
+    pos->fifty_move = undo.fifty_move;
+    pos->zobristKey = undo.zobristKey;
+}
+
+void make_null_move(thrawn::Position* pos, int ply)
+{
+    if (ply < 0 || ply > MAX_DEPTH)
+        return;
+
+    save_undo(pos, 0, ply);
+
+    nnue_copy_parent_to_child(pos, ply);
+
+    if (pos->enpassant != null_sq)
+        pos->zobristKey ^= pos->enpassant_hashkey[pos->enpassant];
+    pos->enpassant = null_sq;
+
+    pos->colour_to_move ^= 1;
+    pos->zobristKey ^= pos->colour_to_move_hashkey;
+    nnue_debug_check(pos);
+}
+
+void unmake_null_move(thrawn::Position* pos, int ply)
+{
+    unmake_move(pos, ply);
+}
+
 
 int make_move(thrawn::Position* pos, int move, int move_type, int ply)
 {
-    copyBoard(pos);
-    if (make_move_on_board(pos, move, move_type, ply))
-        return 1;
-
-    restoreBoard(pos);
-    return 0;
+    return make_move_on_board(pos, move, move_type, ply);
 }
 
 int make_root_move(thrawn::Position* pos, int move, int move_type)
@@ -649,96 +706,10 @@ int make_root_move(thrawn::Position* pos, int move, int move_type)
     }
 
     if (nnue_loaded())
-        pos->nnue_stack[0] = pos->nnue_stack[1];
+        nnue_promote_to_root(pos, 1);
     else
         pos->nnue_stack[0].valid = false;
     pos->ply = 0;
     nnue_debug_check(pos);
     return 1;
 }
-
-// void unmake_move(thrawn::Position* pos, int ply)
-// {
-//     thrawn::UndoData& ud = pos->undo_stack[ply];
-//     int move = ud.move;
-
-//     int source         = get_move_source(move);
-//     int target         = get_move_target(move);
-//     int piece          = get_move_piece(move);
-//     int promoted_piece = get_promoted_piece(move);
-//     int is_capture     = get_is_capture_move(move);
-//     int enpassant_move = get_is_move_enpassant(move);
-//     int castling_move  = get_is_move_castling(move);
-
-//     pos->colour_to_move ^= 1;
-
-//     // Restore old Zobrist, castle rights, enpassant, halfmove from undo stack
-//     pos->zobristKey    = ud.zobristKey;
-//     pos->castle_rights = ud.castle_rights;
-//     pos->enpassant     = ud.enpassant;
-//     pos->fifty_move    = ud.fifty_move;
-
-//     if (promoted_piece)
-//     {
-//         // Remove the new piece from target
-//         pop_bit(pos->piece_bitboards[promoted_piece], target);
-//         // Put the original pawn back on source
-//         set_bit(pos->piece_bitboards[piece], source);
-//     }
-//     else
-//     {
-//         // No promotion: occupant on target was 'piece', so remove it
-//         pop_bit(pos->piece_bitboards[piece], target);
-//         // Return it to source
-//         set_bit(pos->piece_bitboards[piece], source);
-//     }
-
-//     // If there was a capture, restore the captured piece
-//     if (is_capture)
-//     {
-//         int captured = ud.captured_piece; // e.g. black knight, black rook, etc.
-//         if (captured != -1) {
-//             set_bit(pos->piece_bitboards[captured], target);
-//         }
-//     }
-
-//     // If enpassant capture, restore the captured pawn
-//     if (enpassant_move) {
-//         // figure out the square of the captured pawn
-//         if (pos->colour_to_move == white) {
-//             // black pawn was captured
-//             set_bit(pos->piece_bitboards[p], target + 8);
-//         } else {
-//             // white pawn was captured
-//             set_bit(pos->piece_bitboards[P], target - 8);
-//         }
-//     }
-
-//     // If castling, move the rook back
-//     if (castling_move) {
-//         if (target == g1) {
-//             // White O-O
-//             pop_bit(pos->piece_bitboards[R], f1);
-//             set_bit(pos->piece_bitboards[R], h1);
-//         }
-//         else if (target == c1) {
-//             // White O-O-O
-//             pop_bit(pos->piece_bitboards[R], d1);
-//             set_bit(pos->piece_bitboards[R], a1);
-//         }
-//         else if (target == g8) {
-//             // Black O-O
-//             pop_bit(pos->piece_bitboards[r], f8);
-//             set_bit(pos->piece_bitboards[r], h8);
-//         }
-//         else if (target == c8) {
-//             // Black O-O-O
-//             pop_bit(pos->piece_bitboards[r], d8);
-//             set_bit(pos->piece_bitboards[r], a8);
-//         }
-//     }
-
-//     pos->occupancies[white] = get_white_occupancy(pos);
-//     pos->occupancies[black] = get_black_occupancy(pos);
-//     pos->occupancies[both]  = pos->occupancies[white] | pos->occupancies[black];
-// }

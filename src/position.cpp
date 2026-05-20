@@ -64,6 +64,8 @@ void NnueStack::copy_up_to(const NnueStack& other, int ply) {
     }
     for (int i = limit + 1; i <= MAX_DEPTH; ++i) {
         (*states)[i].valid = false;
+        (*states)[i].white_acc_source_ply = -1;
+        (*states)[i].black_acc_source_ply = -1;
     }
 }
 
@@ -97,7 +99,7 @@ Position::Position(const Position& other)
       ply(other.ply),
       nnue_stack(),
       undo_stack{} {
-    for (int i = 0; i < MAX_DEPTH; ++i) {
+    for (int i = 0; i <= MAX_DEPTH; ++i) {
         undo_stack[i] = other.undo_stack[i];
     }
     nnue_stack.copy_up_to(other.nnue_stack, other.ply);
@@ -119,7 +121,7 @@ Position& Position::operator=(const Position& other) {
     repetition_table = other.repetition_table;
     repetition_index = other.repetition_index;
     ply = other.ply;
-    for (int i = 0; i < MAX_DEPTH; ++i) {
+    for (int i = 0; i <= MAX_DEPTH; ++i) {
         undo_stack[i] = other.undo_stack[i];
     }
     nnue_stack.copy_up_to(other.nnue_stack, other.ply);
