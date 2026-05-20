@@ -2,12 +2,17 @@
 #include "constants.h"
 #include <algorithm>
 #include <iostream>
+#include <limits>
 
 namespace {
 constexpr int TTClusterSize = 4;
 constexpr int TTAgeBits = 5;
 constexpr int TTAgeShift = 59;
 constexpr int TTAgeMask = (1 << TTAgeBits) - 1;
+constexpr int TTKeyBits = 48;
+constexpr int TTStaticEvalShift = TTKeyBits;
+constexpr uint64_t TTKeyMask = (UINT64_C(1) << TTKeyBits) - 1;
+constexpr int16_t TTStaticEvalNone = std::numeric_limits<int16_t>::min();
 
 int relative_age(int currentAge, int entryAge) {
     return (currentAge - entryAge) & TTAgeMask;
@@ -33,6 +38,53 @@ int replacement_value(uint64_t data, int currentAge) {
     const int flag = packed_flag(data);
     const int exactBonus = flag == BOUND_EXACT ? 2 : 0;
     return packed_depth(data) + exactBonus - 8 * relative_age(currentAge, packed_age(data));
+}
+
+int16_t encode_static_eval(int staticEval) {
+    if (staticEval == no_hashmap_entry) {
+        return TTStaticEvalNone;
+    }
+
+    return static_cast<int16_t>(std::clamp(staticEval,
+                                           static_cast<int>(TTStaticEvalNone) + 1,
+                                           static_cast<int>(std::numeric_limits<int16_t>::max())));
+}
+
+int decode_static_eval(uint64_t key) {
+    const auto raw = static_cast<int16_t>(key >> TTStaticEvalShift);
+    return raw == TTStaticEvalNone ? no_hashmap_entry : static_cast<int>(raw);
+}
+
+uint64_t key_tag(uint64_t zobristKey, uint64_t data) {
+    return (zobristKey ^ data) & TTKeyMask;
+}
+
+bool key_matches(uint64_t packedKey, uint64_t zobristKey, uint64_t data) {
+    return (packedKey & TTKeyMask) == key_tag(zobristKey, data);
+}
+
+uint64_t encode_key(uint64_t zobristKey, uint64_t data, int staticEval) {
+    const uint64_t eval = static_cast<uint64_t>(
+        static_cast<uint16_t>(encode_static_eval(staticEval)));
+    return key_tag(zobristKey, data) | (eval << TTStaticEvalShift);
+}
+
+bool update_static_eval_key(TTEntry& entry, uint64_t zobristKey, int staticEval) {
+    uint64_t data = entry.smp_data.load(std::memory_order_relaxed);
+    uint64_t expected = entry.smp_key.load(std::memory_order_relaxed);
+
+    while (key_matches(expected, zobristKey, data)) {
+        const uint64_t desired = (expected & TTKeyMask) |
+            (static_cast<uint64_t>(static_cast<uint16_t>(encode_static_eval(staticEval))) << TTStaticEvalShift);
+        if (entry.smp_key.compare_exchange_weak(expected, desired,
+                                                std::memory_order_relaxed,
+                                                std::memory_order_relaxed)) {
+            return true;
+        }
+        data = entry.smp_data.load(std::memory_order_relaxed);
+    }
+
+    return false;
 }
 } // namespace
 
@@ -89,8 +141,11 @@ void TranspositionTable::reset()
     currentAge.store(0, std::memory_order_relaxed);
 }
 
-bool TranspositionTable::probe(const thrawn::Position* pos, int& depth, int alpha, int beta, int& bestMove, int& score, int& flag)
+bool TranspositionTable::probe(const thrawn::Position* pos, int& depth, int alpha, int beta,
+                               int& bestMove, int& score, int& flag, int& staticEval)
 {
+    staticEval = no_hashmap_entry;
+
     if (!table || numClusters <= 0)
         return false;
 
@@ -102,13 +157,12 @@ bool TranspositionTable::probe(const thrawn::Position* pos, int& depth, int alph
         const uint64_t entry_key = entry.smp_key.load(std::memory_order_relaxed);
         const uint64_t entry_data = entry.smp_data.load(std::memory_order_relaxed);
 
-        uint64_t test_key = pos->zobristKey ^ entry_data;
-
-        if(test_key == entry_key)
+        if (entry_data != 0 && key_matches(entry_key, pos->zobristKey, entry_data))
         {
             depth = extractTTDepth(entry_data);
             bestMove = extractTTBestMove(entry_data);
             flag = extractTTHashFlag(entry_data);
+            staticEval = decode_static_eval(entry_key);
             
             score = extractTTScore(entry_data);
             // adjusted mate
@@ -130,7 +184,8 @@ bool TranspositionTable::probe(const thrawn::Position* pos, int& depth, int alph
     return false;
 }
 
-void TranspositionTable::store(const thrawn::Position* pos, int depth, int score, int flag, int bestMove)
+void TranspositionTable::store(const thrawn::Position* pos, int depth, int score, int flag,
+                               int bestMove, int staticEval)
 {
     if (!table || numClusters <= 0)
         return;
@@ -138,6 +193,7 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
     int index = static_cast<int>((pos->zobristKey & static_cast<uint64_t>(clusterMask)) * TTClusterSize);
     TTEntry* replace = &table[index];
     uint64_t replace_data = replace->smp_data.load(std::memory_order_relaxed);
+    uint64_t replace_key = replace->smp_key.load(std::memory_order_relaxed);
     const int current = currentAge.load(std::memory_order_relaxed);
     int worst_value = 1000000;
     bool replacingSamePosition = false;
@@ -147,15 +203,20 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
         TTEntry& candidate = table[index + i];
         const uint64_t old_data = candidate.smp_data.load(std::memory_order_relaxed);
         const uint64_t old_key = candidate.smp_key.load(std::memory_order_relaxed);
-        const bool samePosition = old_data != 0 && (old_data ^ old_key) == pos->zobristKey;
+        const bool samePosition = old_data != 0 && key_matches(old_key, pos->zobristKey, old_data);
 
         if (samePosition)
         {
             if (flag != BOUND_EXACT && depth < extractTTDepth(old_data) - 2)
+            {
+                if (staticEval != no_hashmap_entry)
+                    update_static_eval_key(candidate, pos->zobristKey, staticEval);
                 return;
+            }
 
             replace = &candidate;
             replace_data = old_data;
+            replace_key = old_key;
             replacingSamePosition = true;
             break;
         }
@@ -166,6 +227,7 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
             worst_value = value;
             replace = &candidate;
             replace_data = old_data;
+            replace_key = old_key;
         }
     }
 
@@ -180,10 +242,38 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
 
     uint64_t data = encodeTTData(bestMove, depth, score, flag);
     data |= (static_cast<uint64_t>(current & TTAgeMask) << TTAgeShift);
-    uint64_t key = pos->zobristKey ^ data;
+
+    int eval_to_store = no_hashmap_entry;
+    if (staticEval != no_hashmap_entry)
+        eval_to_store = staticEval;
+    else if (replacingSamePosition)
+        eval_to_store = decode_static_eval(replace_key);
     
+    const uint64_t key = encode_key(pos->zobristKey, data, eval_to_store);
     replace->smp_data.store(data, std::memory_order_relaxed);
     replace->smp_key.store(key, std::memory_order_relaxed);
+}
+
+void TranspositionTable::storeStaticEval(const thrawn::Position* pos, int staticEval)
+{
+    if (!table || numClusters <= 0 || staticEval == no_hashmap_entry)
+        return;
+
+    int index = static_cast<int>((pos->zobristKey & static_cast<uint64_t>(clusterMask)) * TTClusterSize);
+
+    for (int i = 0; i < TTClusterSize; i++)
+    {
+        TTEntry& entry = table[index + i];
+        const uint64_t entry_key = entry.smp_key.load(std::memory_order_relaxed);
+        const uint64_t entry_data = entry.smp_data.load(std::memory_order_relaxed);
+        if (entry_data != 0 && key_matches(entry_key, pos->zobristKey, entry_data))
+        {
+            update_static_eval_key(entry, pos->zobristKey, staticEval);
+            return;
+        }
+    }
+
+    store(pos, 0, 0, BOUND_NONE, 0, staticEval);
 }
 
 // bit allocations:

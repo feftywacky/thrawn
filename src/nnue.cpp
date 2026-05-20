@@ -40,6 +40,8 @@ constexpr const char* kExpectedFeatureSet = "halfkp_v1";
 constexpr int kHalfkpBuckets = 10;
 constexpr int kHalfkpStridePerKing = kHalfkpBuckets * 64; // 640
 constexpr int kL1InputSize = static_cast<int>(kExpectedFtSize) * 2; // [us_acc | them_acc]
+static_assert(kExpectedL1Size % 4 == 0, "NNUE L1 size must fit x4 dense kernels");
+static_assert(kExpectedL2Size % 4 == 0, "NNUE L2 size must fit x4 dense kernels");
 
 constexpr int32_t kFtActivationMax = 127;
 constexpr int32_t kDenseActivationMax = 64;
@@ -866,6 +868,29 @@ EvaluationState state_for_evaluation(const thrawn::Position* pos,
 }
 
 #if defined(USE_AVX2)
+static inline __m256i add_dot_u8_i8_epi32(__m256i acc,
+                                          __m256i x,
+                                          __m256i w,
+                                          const __m256i ones) {
+#if defined(__AVXVNNI__)
+    (void)ones;
+    return _mm256_dpbusd_epi32(acc, x, w);
+#else
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(x, w), ones));
+#endif
+}
+
+static inline int32_t reduce_add_epi32(__m256i acc) {
+    alignas(32) int32_t lanes[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc);
+
+    int32_t sum = 0;
+    for (int i = 0; i < 8; ++i) {
+        sum += lanes[i];
+    }
+    return sum;
+}
+
 void pack_clipped_u8_avx2(uint8_t* out,
                           const int16_t* us,
                           const int16_t* them,
@@ -912,10 +937,10 @@ int32_t dot_u8_i8_avx2(const uint8_t* x, const int8_t* w, int count) {
         const __m256i xv3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + 96));
         const __m256i wv3 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i + 96));
 
-        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(xv0, wv0), ones));
-        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(xv1, wv1), ones));
-        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(xv2, wv2), ones));
-        acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(xv3, wv3), ones));
+        acc0 = add_dot_u8_i8_epi32(acc0, xv0, wv0, ones);
+        acc1 = add_dot_u8_i8_epi32(acc1, xv1, wv1, ones);
+        acc2 = add_dot_u8_i8_epi32(acc2, xv2, wv2, ones);
+        acc3 = add_dot_u8_i8_epi32(acc3, xv3, wv3, ones);
     }
 
     acc0 = _mm256_add_epi32(acc0, acc1);
@@ -925,19 +950,64 @@ int32_t dot_u8_i8_avx2(const uint8_t* x, const int8_t* w, int count) {
     for (; i < count; i += 32) {
         const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
         const __m256i wv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i));
-        const __m256i prod16 = _mm256_maddubs_epi16(xv, wv);
-        const __m256i prod32 = _mm256_madd_epi16(prod16, ones);
-        acc0 = _mm256_add_epi32(acc0, prod32);
+        acc0 = add_dot_u8_i8_epi32(acc0, xv, wv, ones);
     }
 
-    alignas(32) int32_t lanes[8];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc0);
+    return reduce_add_epi32(acc0);
+}
 
-    int32_t sum = 0;
-    for (int i = 0; i < 8; ++i) {
-        sum += lanes[i];
+void dot_u8_i8_x4_avx2(const uint8_t* x,
+                       const int8_t* w0,
+                       const int8_t* w1,
+                       const int8_t* w2,
+                       const int8_t* w3,
+                       int count,
+                       int32_t& s0,
+                       int32_t& s1,
+                       int32_t& s2,
+                       int32_t& s3) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i a00 = _mm256_setzero_si256();
+    __m256i a01 = _mm256_setzero_si256();
+    __m256i a10 = _mm256_setzero_si256();
+    __m256i a11 = _mm256_setzero_si256();
+    __m256i a20 = _mm256_setzero_si256();
+    __m256i a21 = _mm256_setzero_si256();
+    __m256i a30 = _mm256_setzero_si256();
+    __m256i a31 = _mm256_setzero_si256();
+
+    int i = 0;
+    for (; i + 63 < count; i += 64) {
+        const __m256i xv0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
+        const __m256i xv1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + 32));
+
+        a00 = add_dot_u8_i8_epi32(a00, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i)), ones);
+        a01 = add_dot_u8_i8_epi32(a01, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i + 32)), ones);
+        a10 = add_dot_u8_i8_epi32(a10, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i)), ones);
+        a11 = add_dot_u8_i8_epi32(a11, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i + 32)), ones);
+        a20 = add_dot_u8_i8_epi32(a20, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i)), ones);
+        a21 = add_dot_u8_i8_epi32(a21, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i + 32)), ones);
+        a30 = add_dot_u8_i8_epi32(a30, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + i)), ones);
+        a31 = add_dot_u8_i8_epi32(a31, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + i + 32)), ones);
     }
-    return sum;
+
+    a00 = _mm256_add_epi32(a00, a01);
+    a10 = _mm256_add_epi32(a10, a11);
+    a20 = _mm256_add_epi32(a20, a21);
+    a30 = _mm256_add_epi32(a30, a31);
+
+    for (; i < count; i += 32) {
+        const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
+        a00 = add_dot_u8_i8_epi32(a00, xv, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i)), ones);
+        a10 = add_dot_u8_i8_epi32(a10, xv, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i)), ones);
+        a20 = add_dot_u8_i8_epi32(a20, xv, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i)), ones);
+        a30 = add_dot_u8_i8_epi32(a30, xv, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + i)), ones);
+    }
+
+    s0 = reduce_add_epi32(a00);
+    s1 = reduce_add_epi32(a10);
+    s2 = reduce_add_epi32(a20);
+    s3 = reduce_add_epi32(a30);
 }
 #endif
 
@@ -1017,6 +1087,88 @@ int32_t dot_u8_i8_neon(const uint8_t* x_u8, const int8_t* w, int count) {
     return vaddvq_s32(acc0);
 #endif
 }
+
+void dot_u8_i8_x4_neon(const uint8_t* x_u8,
+                       const int8_t* w0,
+                       const int8_t* w1,
+                       const int8_t* w2,
+                       const int8_t* w3,
+                       int count,
+                       int32_t& s0,
+                       int32_t& s1,
+                       int32_t& s2,
+                       int32_t& s3) {
+    const int8_t* x = reinterpret_cast<const int8_t*>(x_u8);
+
+    int32x4_t a00 = vdupq_n_s32(0);
+    int32x4_t a01 = vdupq_n_s32(0);
+    int32x4_t a10 = vdupq_n_s32(0);
+    int32x4_t a11 = vdupq_n_s32(0);
+    int32x4_t a20 = vdupq_n_s32(0);
+    int32x4_t a21 = vdupq_n_s32(0);
+    int32x4_t a30 = vdupq_n_s32(0);
+    int32x4_t a31 = vdupq_n_s32(0);
+
+#if !defined(__ARM_FEATURE_DOTPROD)
+    auto accumulate = [](int32x4_t acc, int8x16_t xv, int8x16_t wv) {
+        const int16x8_t lo = vmull_s8(vget_low_s8(xv), vget_low_s8(wv));
+        const int16x8_t hi = vmull_s8(vget_high_s8(xv), vget_high_s8(wv));
+        const int32x4_t lo32 = vpaddlq_s16(lo);
+        const int32x4_t hi32 = vpaddlq_s16(hi);
+        return vaddq_s32(acc, vaddq_s32(lo32, hi32));
+    };
+#endif
+
+    int i = 0;
+    for (; i + 31 < count; i += 32) {
+        const int8x16_t x0 = vld1q_s8(x + i);
+        const int8x16_t x1 = vld1q_s8(x + i + 16);
+#if defined(__ARM_FEATURE_DOTPROD)
+        a00 = vdotq_s32(a00, x0, vld1q_s8(w0 + i));
+        a01 = vdotq_s32(a01, x1, vld1q_s8(w0 + i + 16));
+        a10 = vdotq_s32(a10, x0, vld1q_s8(w1 + i));
+        a11 = vdotq_s32(a11, x1, vld1q_s8(w1 + i + 16));
+        a20 = vdotq_s32(a20, x0, vld1q_s8(w2 + i));
+        a21 = vdotq_s32(a21, x1, vld1q_s8(w2 + i + 16));
+        a30 = vdotq_s32(a30, x0, vld1q_s8(w3 + i));
+        a31 = vdotq_s32(a31, x1, vld1q_s8(w3 + i + 16));
+#else
+        a00 = accumulate(a00, x0, vld1q_s8(w0 + i));
+        a01 = accumulate(a01, x1, vld1q_s8(w0 + i + 16));
+        a10 = accumulate(a10, x0, vld1q_s8(w1 + i));
+        a11 = accumulate(a11, x1, vld1q_s8(w1 + i + 16));
+        a20 = accumulate(a20, x0, vld1q_s8(w2 + i));
+        a21 = accumulate(a21, x1, vld1q_s8(w2 + i + 16));
+        a30 = accumulate(a30, x0, vld1q_s8(w3 + i));
+        a31 = accumulate(a31, x1, vld1q_s8(w3 + i + 16));
+#endif
+    }
+
+    a00 = vaddq_s32(a00, a01);
+    a10 = vaddq_s32(a10, a11);
+    a20 = vaddq_s32(a20, a21);
+    a30 = vaddq_s32(a30, a31);
+
+    for (; i + 15 < count; i += 16) {
+        const int8x16_t xv = vld1q_s8(x + i);
+#if defined(__ARM_FEATURE_DOTPROD)
+        a00 = vdotq_s32(a00, xv, vld1q_s8(w0 + i));
+        a10 = vdotq_s32(a10, xv, vld1q_s8(w1 + i));
+        a20 = vdotq_s32(a20, xv, vld1q_s8(w2 + i));
+        a30 = vdotq_s32(a30, xv, vld1q_s8(w3 + i));
+#else
+        a00 = accumulate(a00, xv, vld1q_s8(w0 + i));
+        a10 = accumulate(a10, xv, vld1q_s8(w1 + i));
+        a20 = accumulate(a20, xv, vld1q_s8(w2 + i));
+        a30 = accumulate(a30, xv, vld1q_s8(w3 + i));
+#endif
+    }
+
+    s0 = vaddvq_s32(a00);
+    s1 = vaddvq_s32(a10);
+    s2 = vaddvq_s32(a20);
+    s3 = vaddvq_s32(a30);
+}
 #endif
 
 void pack_clipped_u8(uint8_t* out,
@@ -1059,6 +1211,58 @@ int32_t dot_u8_i8(const uint8_t* x, const int8_t* w, int count) {
     return sum;
 }
 
+void dot_u8_i8_x4_scalar(const uint8_t* x,
+                         const int8_t* w0,
+                         const int8_t* w1,
+                         const int8_t* w2,
+                         const int8_t* w3,
+                         int count,
+                         int32_t& s0,
+                         int32_t& s1,
+                         int32_t& s2,
+                         int32_t& s3) {
+    int32_t a0 = 0;
+    int32_t a1 = 0;
+    int32_t a2 = 0;
+    int32_t a3 = 0;
+    for (int i = 0; i < count; ++i) {
+        const int32_t xi = x[i];
+        a0 += xi * static_cast<int32_t>(w0[i]);
+        a1 += xi * static_cast<int32_t>(w1[i]);
+        a2 += xi * static_cast<int32_t>(w2[i]);
+        a3 += xi * static_cast<int32_t>(w3[i]);
+    }
+    s0 = a0;
+    s1 = a1;
+    s2 = a2;
+    s3 = a3;
+}
+
+void dot_u8_i8_x4(const uint8_t* x,
+                  const int8_t* w0,
+                  const int8_t* w1,
+                  const int8_t* w2,
+                  const int8_t* w3,
+                  int count,
+                  int32_t& s0,
+                  int32_t& s1,
+                  int32_t& s2,
+                  int32_t& s3) {
+#if defined(USE_AVX2)
+    if (count % 32 == 0) {
+        dot_u8_i8_x4_avx2(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+        return;
+    }
+#elif defined(USE_NEON)
+    if (count % 16 == 0) {
+        dot_u8_i8_x4_neon(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+        return;
+    }
+#endif
+
+    dot_u8_i8_x4_scalar(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+}
+
 int32_t round_to_int32(double value) {
     if (value > static_cast<double>(std::numeric_limits<int32_t>::max())) {
         return std::numeric_limits<int32_t>::max();
@@ -1081,31 +1285,65 @@ double raw_outscale_units_to_cp(int64_t raw, const LoadedNetwork& network) {
 int64_t evaluate_accumulators_int_raw_outscale_units(const AccumulatorView& accumulators,
                                                      const LoadedNetwork& network,
                                                      int colour_to_move) {
-    alignas(64) std::array<uint8_t, kL1InputSize> x{};
-    alignas(64) std::array<uint8_t, kExpectedL1Size> h1{};
-    alignas(64) std::array<uint8_t, kExpectedL2Size> h2{};
+    alignas(64) std::array<uint8_t, kL1InputSize> x;
+    alignas(64) std::array<uint8_t, kExpectedL1Size> h1;
+    alignas(64) std::array<uint8_t, kExpectedL2Size> h2;
 
     const auto& us = (colour_to_move == white) ? *accumulators.white : *accumulators.black;
     const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
 
     pack_clipped_u8(x.data(), us.data(), them.data(), network.qa);
 
-    for (int j = 0; j < static_cast<int>(kExpectedL1Size); ++j) {
-        const int32_t dot = dot_u8_i8(x.data(), network.l1_weight_t[j].data(), kL1InputSize);
-        int64_t s = static_cast<int64_t>(network.l1_bias[j]) +
-                    div_round_by_scale(dot, network.qa_divider);
-        if (s < 0) s = 0;
-        if (s > network.q1) s = network.q1;
-        h1[j] = static_cast<uint8_t>(s);
+    auto activate_u8 = [](int64_t value, int32_t cap) {
+        if (value < 0) value = 0;
+        if (value > cap) value = cap;
+        return static_cast<uint8_t>(value);
+    };
+
+    for (int j = 0; j < static_cast<int>(kExpectedL1Size); j += 4) {
+        int32_t d0;
+        int32_t d1;
+        int32_t d2;
+        int32_t d3;
+        dot_u8_i8_x4(x.data(),
+                     network.l1_weight_t[j].data(),
+                     network.l1_weight_t[j + 1].data(),
+                     network.l1_weight_t[j + 2].data(),
+                     network.l1_weight_t[j + 3].data(),
+                     kL1InputSize,
+                     d0, d1, d2, d3);
+
+        h1[j] = activate_u8(static_cast<int64_t>(network.l1_bias[j]) +
+                            div_round_by_scale(d0, network.qa_divider), network.q1);
+        h1[j + 1] = activate_u8(static_cast<int64_t>(network.l1_bias[j + 1]) +
+                                div_round_by_scale(d1, network.qa_divider), network.q1);
+        h1[j + 2] = activate_u8(static_cast<int64_t>(network.l1_bias[j + 2]) +
+                                div_round_by_scale(d2, network.qa_divider), network.q1);
+        h1[j + 3] = activate_u8(static_cast<int64_t>(network.l1_bias[j + 3]) +
+                                div_round_by_scale(d3, network.qa_divider), network.q1);
     }
 
-    for (int j = 0; j < static_cast<int>(kExpectedL2Size); ++j) {
-        const int32_t dot = dot_u8_i8(h1.data(), network.l2_weight_t[j].data(), kExpectedL1Size);
-        int64_t s = static_cast<int64_t>(network.l2_bias[j]) +
-                    div_round_by_scale(dot, network.q1_divider);
-        if (s < 0) s = 0;
-        if (s > network.q2) s = network.q2;
-        h2[j] = static_cast<uint8_t>(s);
+    for (int j = 0; j < static_cast<int>(kExpectedL2Size); j += 4) {
+        int32_t d0;
+        int32_t d1;
+        int32_t d2;
+        int32_t d3;
+        dot_u8_i8_x4(h1.data(),
+                     network.l2_weight_t[j].data(),
+                     network.l2_weight_t[j + 1].data(),
+                     network.l2_weight_t[j + 2].data(),
+                     network.l2_weight_t[j + 3].data(),
+                     kExpectedL1Size,
+                     d0, d1, d2, d3);
+
+        h2[j] = activate_u8(static_cast<int64_t>(network.l2_bias[j]) +
+                            div_round_by_scale(d0, network.q1_divider), network.q2);
+        h2[j + 1] = activate_u8(static_cast<int64_t>(network.l2_bias[j + 1]) +
+                                div_round_by_scale(d1, network.q1_divider), network.q2);
+        h2[j + 2] = activate_u8(static_cast<int64_t>(network.l2_bias[j + 2]) +
+                                div_round_by_scale(d2, network.q1_divider), network.q2);
+        h2[j + 3] = activate_u8(static_cast<int64_t>(network.l2_bias[j + 3]) +
+                                div_round_by_scale(d3, network.q1_divider), network.q2);
     }
 
     const int32_t dot = dot_u8_i8(h2.data(), network.out_weight.data(), kExpectedL2Size);

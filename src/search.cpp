@@ -91,6 +91,18 @@ void count_node(ThreadData* td) {
     }
 }
 
+int evaluate_static(thrawn::Position* pos, int cachedStaticEval = no_hashmap_entry) {
+    if (cachedStaticEval != no_hashmap_entry) {
+        return cachedStaticEval;
+    }
+
+    const int value = evaluate(pos);
+    if (nnue_loaded()) {
+        tt->storeStaticEval(pos, value);
+    }
+    return value;
+}
+
 bool is_slider_piece(int piece) {
     const int type = piece % 6;
     return type == BISHOP || type == ROOK || type == QUEEN;
@@ -1121,7 +1133,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     int ttMove = 0;
     int ttFlag = BOUND_NONE;
     int ttScore = 0;
-    if ((ttHit = tt->probe(pos, ttDepth, alpha, beta, ttMove, ttScore, ttFlag)))
+    int ttStaticEval = no_hashmap_entry;
+    if ((ttHit = tt->probe(pos, ttDepth, alpha, beta, ttMove, ttScore, ttFlag, ttStaticEval)))
     {
         if (!excludedNode && ttDepth >= depth && !isPvNode)
         {
@@ -1143,7 +1156,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     count_node(td);
 
     // Compute static evaluation
-    static_eval = evaluate(pos);
+    if (!inCheck)
+        static_eval = evaluate_static(pos, ttStaticEval);
     const bool pawnOnlyEndgame = noMajorsOrMinorsPieces(pos);
 
     // --------------------------------------
@@ -1305,7 +1319,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
                 if (score >= probCutBeta)
                 {
-                    tt->store(pos, depth, beta, BOUND_LOWER, move);
+                    tt->store(pos, depth, beta, BOUND_LOWER, move, static_eval);
                     return beta;
                 }
             }
@@ -1563,7 +1577,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             if (alpha >= beta)
             {
                 if (!excludedNode)
-                    tt->store(pos, depth, beta, BOUND_LOWER, bestMove);
+                    tt->store(pos, depth, beta, BOUND_LOWER, bestMove,
+                              inCheck ? no_hashmap_entry : static_eval);
 
                 if (!excludedNode && quietMove)
                 {
@@ -1610,7 +1625,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
     // Store in TT and return
     if (!excludedNode)
-        tt->store(pos, depth, alpha, hashFlag, bestMove);
+        tt->store(pos, depth, alpha, hashFlag, bestMove,
+                  inCheck ? no_hashmap_entry : static_eval);
     return alpha;
 }
 
@@ -1663,7 +1679,8 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     int ttMove = 0;
     int ttFlag = BOUND_NONE;
     int ttScore = 0;
-    if (tt->probe(pos, ttDepth, alpha, beta, ttMove, ttScore, ttFlag))
+    int ttStaticEval = no_hashmap_entry;
+    if (tt->probe(pos, ttDepth, alpha, beta, ttMove, ttScore, ttFlag, ttStaticEval))
     {
         if (!isPvNode || ttFlag == BOUND_EXACT)
         {
@@ -1679,12 +1696,12 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     int static_eval = 0;
     if (!inCheck)
     {
-        static_eval = evaluate(pos);
+        static_eval = evaluate_static(pos, ttStaticEval);
 
         // fail-hard beta cutoff
         if (static_eval >= beta)
         {
-            tt->store(pos, 0, beta, BOUND_LOWER, 0);
+            tt->store(pos, 0, beta, BOUND_LOWER, 0, static_eval);
             return beta; // fails high
         }
 
@@ -1766,7 +1783,8 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
             // fail-hard beta cutoff
             if (score >= beta)
             {
-                tt->store(pos, 0, beta, BOUND_LOWER, bestMove);
+                tt->store(pos, 0, beta, BOUND_LOWER, bestMove,
+                          inCheck ? no_hashmap_entry : static_eval);
                 return beta; // fails high
             }
         }
@@ -1780,7 +1798,8 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     }
 
     // move fails low (<= alpha)
-    tt->store(pos, 0, alpha, alpha > oldAlpha ? BOUND_EXACT : BOUND_UPPER, bestMove);
+    tt->store(pos, 0, alpha, alpha > oldAlpha ? BOUND_EXACT : BOUND_UPPER,
+              bestMove, inCheck ? no_hashmap_entry : static_eval);
     return alpha;
 }
 

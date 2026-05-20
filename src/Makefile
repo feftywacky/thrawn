@@ -68,10 +68,13 @@ ifeq ($(ARCH),native)
         ARCH_FLAGS += -march=native -mavx2 -mpopcnt -mbmi
     else ifeq ($(ARCH_DETECTED),arm64)
         CPPFLAGS += -DUSE_NEON
+        ARCH_FLAGS += -march=native
     else ifeq ($(ARCH_DETECTED),aarch64)
         CPPFLAGS += -DUSE_NEON
+        ARCH_FLAGS += -march=native
     else ifeq ($(ARCH_DETECTED),ARM64)
         CPPFLAGS += -DUSE_NEON
+        ARCH_FLAGS += -march=native
     endif
 else ifeq ($(ARCH),x86-64-avx2)
     CPPFLAGS += -DUSE_AVX2
@@ -80,7 +83,11 @@ else ifeq ($(ARCH),arm64-neon)
     CPPFLAGS += -DUSE_NEON
 else ifeq ($(ARCH),arm64-neon-dotprod)
     CPPFLAGS += -DUSE_NEON
-    ARCH_FLAGS += -march=armv8.2-a+dotprod
+    ifeq ($(OS_NAME),macOS)
+        ARCH_FLAGS += -march=native
+    else
+        ARCH_FLAGS += -march=armv8.2-a+dotprod
+    endif
 else
     $(error Unsupported ARCH '$(ARCH)'. Use native, x86-64-avx2, arm64-neon, or arm64-neon-dotprod)
 endif

@@ -21,8 +21,6 @@ constexpr int HISTORY_SIZE   = 12;
 constexpr int MAX_THREADS    = 16;
 constexpr int NODE_COUNTER_BATCH = 1024;
 
-// Search constants. Keep these compile-time fixed; do not expose them as UCI
-// tuning options.
 constexpr std::array<int, 6> PIECE_VALUES = {100, 320, 330, 500, 900, 20000};
 
 constexpr int SEARCH_ASPIRATION_WINDOW_DEPTH = 4;
