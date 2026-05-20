@@ -223,7 +223,8 @@ static bool uci_nnue_verify_recursive(thrawn::Position* pos,
         pos->repetition_index--;
     }
 
-    std::vector<int> moves = generate_moves(pos);
+    MoveList moves;
+    generate_moves(pos, all_moves, moves);
     for (int move : moves) {
         if (visited_nodes >= max_nodes) {
             break;
@@ -392,7 +393,8 @@ UCI PROTOCOL
 
 int uci_parse_move(thrawn::Position* pos, const char *move_str)
 {
-    std::vector<int> moves = generate_moves(pos);
+    MoveList moves;
+    generate_moves(pos, all_moves, moves);
     
     int source = (move_str[0] - 'a') + (8-(move_str[1]- '0')) * 8;
     int target = (move_str[2] - 'a') + (8-(move_str[3]- '0')) * 8;

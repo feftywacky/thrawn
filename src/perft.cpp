@@ -10,10 +10,8 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
-#include <vector>
 #include <string>
 
-using std::vector;
 using std::cout;
 using std::endl;
 using std::string;
@@ -35,7 +33,8 @@ void perft_search(thrawn::Position* pos, int depth) {
         return;
     }
 
-    vector<int> moves = generate_moves(pos);
+    MoveList moves;
+    generate_moves(pos, all_moves, moves);
     for (int move : moves) {
         pos->ply++;
         if (!make_move_on_board(pos, move, all_moves, pos->ply))
@@ -51,7 +50,8 @@ void perft_search(thrawn::Position* pos, int depth) {
 }
 
 int perft_test(thrawn::Position* pos, int depth) {
-    vector<int> moves = generate_moves(pos);
+    MoveList moves;
+    generate_moves(pos, all_moves, moves);
     size_t total_moves = moves.size();
     size_t moves_processed = 0;
 

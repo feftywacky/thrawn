@@ -18,7 +18,7 @@ inline void append_moves_from_attacks(int source,
                                       int piece,
                                       uint64_t attacks,
                                       uint64_t enemies,
-                                      vector<int>& moves,
+                                      MoveList& moves,
                                       int move_type)
 {
     if (move_type != only_quiets)
@@ -73,8 +73,14 @@ vector<int> generate_moves(thrawn::Position* pos)
 
 vector<int> generate_moves(thrawn::Position* pos, int move_type)
 {
-    vector<int> moves;
-    moves.reserve(move_type == only_captures ? 32 : 96);
+    MoveList moveList;
+    generate_moves(pos, move_type, moveList);
+    return vector<int>(moveList.begin(), moveList.end());
+}
+
+void generate_moves(thrawn::Position* pos, int move_type, MoveList& moves)
+{
+    moves.clear();
 
     if (pos->colour_to_move == white)
     {
@@ -122,11 +128,9 @@ vector<int> generate_moves(thrawn::Position* pos, int move_type)
         curr = pos->piece_bitboards[k];
         parse_king_moves(pos, curr, k, moves, move_type);
     }
-
-    return moves;
 }
 
-void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& moves, int move_type)
+void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, MoveList& moves, int move_type)
 {
     while (curr)
     {
@@ -200,7 +204,7 @@ void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
     }
 }
 
-void parse_white_castle_moves(thrawn::Position* pos, vector<int>& moves)
+void parse_white_castle_moves(thrawn::Position* pos, MoveList& moves)
 {
     if (pos->castle_rights & wks)
     {
@@ -224,7 +228,7 @@ void parse_white_castle_moves(thrawn::Position* pos, vector<int>& moves)
     }
 }
 
-void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& moves, int move_type)
+void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, MoveList& moves, int move_type)
 {
     while(curr) // while white pawns are present on the board
     {
@@ -295,7 +299,7 @@ void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, vector<int>& 
     }
 }
 
-void parse_black_castle_moves(thrawn::Position* pos, vector<int>& moves)
+void parse_black_castle_moves(thrawn::Position* pos, MoveList& moves)
 {
     if (pos->castle_rights & bks)
     {
@@ -319,7 +323,7 @@ void parse_black_castle_moves(thrawn::Position* pos, vector<int>& moves)
     }
 }
 
-void parse_knight_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
+void parse_knight_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
 {
     const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
     const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
@@ -332,7 +336,7 @@ void parse_knight_moves(thrawn::Position* pos, uint64_t& curr, const int& piece,
     }
 }
 
-void parse_bishop_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
+void parse_bishop_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
 {
     const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
     const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
@@ -345,7 +349,7 @@ void parse_bishop_moves(thrawn::Position* pos, uint64_t& curr, const int& piece,
     } 
 }
 
-void parse_rook_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
+void parse_rook_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
 {
     const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
     const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
@@ -358,7 +362,7 @@ void parse_rook_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, v
     }
 }
 
-void parse_queen_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
+void parse_queen_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
 {
     const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
     const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
@@ -371,7 +375,7 @@ void parse_queen_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, 
     }
 }
 
-void parse_king_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, vector<int>& moves, int move_type)
+void parse_king_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
 {
     const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
     const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];

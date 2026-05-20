@@ -59,9 +59,11 @@ ThreadData::ThreadData() {
     quiet_history = {};
     continuation_history = {};
     capture_history = {};
+    correction_history = {};
     for (auto &row : counter_moves)
         row.fill(0);
     ply_moves.fill(0);
+    static_eval_stack.fill(no_hashmap_entry);
 
     follow_pv_flag = false;
     score_pv_flag  = false;
@@ -89,9 +91,11 @@ void ThreadData::resetThreadData() {
     quiet_history = {};
     continuation_history = {};
     capture_history = {};
+    correction_history = {};
     for (auto &row : counter_moves)
         row.fill(0);
     ply_moves.fill(0);
+    static_eval_stack.fill(no_hashmap_entry);
 
     follow_pv_flag = false;
     score_pv_flag  = false;
@@ -143,7 +147,8 @@ void ThreadData::recordRootMove(int move, int score, int depth, int bound) {
 }
 
 static int legal_fallback_move(thrawn::Position* rootPos) {
-    std::vector<int> moves = generate_moves(rootPos);
+    MoveList moves;
+    generate_moves(rootPos, all_moves, moves);
     for (int move : moves) {
         thrawn::Position scratch(*rootPos);
         scratch.ply++;

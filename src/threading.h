@@ -35,8 +35,10 @@ public:
             BOARD_SIZE>,
         HISTORY_SIZE> continuation_history;
     std::array<std::array<std::array<int, HISTORY_SIZE>, BOARD_SIZE>, HISTORY_SIZE> capture_history;
+    std::array<std::array<int, SEARCH_CORRECTION_HISTORY_SIZE>, 2> correction_history;
     std::array<std::array<int, BOARD_SIZE>, HISTORY_SIZE> counter_moves;
     std::array<int, MAX_DEPTH> ply_moves;
+    std::array<int, MAX_DEPTH> static_eval_stack;
 
     // Flags used for move ordering and search heuristics.
     bool follow_pv_flag;

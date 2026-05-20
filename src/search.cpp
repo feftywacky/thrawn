@@ -80,6 +80,71 @@ int null_move_reduction(int depth, int static_eval, int beta) {
     return std::clamp(reduction, 1, std::max(1, depth - 1));
 }
 
+struct StaticEvalContext {
+    bool improving = false;
+    bool opponentWorsening = false;
+    bool cutNode = false;
+    bool allNode = false;
+};
+
+int reverse_futility_margin(int depth, const StaticEvalContext& context) {
+    int margin = reverse_futility_margin(depth);
+    if (context.improving)
+        margin -= 24;
+    else
+        margin += 24;
+    if (context.opponentWorsening)
+        margin -= 16;
+    if (context.cutNode)
+        margin -= 16;
+    return std::max(80, margin);
+}
+
+int null_move_reduction(int depth, int static_eval, int beta,
+                        const StaticEvalContext& context) {
+    int reduction = null_move_reduction(depth, static_eval, beta);
+    if (context.cutNode && static_eval >= beta + 160)
+        ++reduction;
+    if (context.opponentWorsening)
+        ++reduction;
+    if (!context.improving && static_eval < beta + 80)
+        --reduction;
+    return std::clamp(reduction, 1, std::max(1, depth - 1));
+}
+
+int futility_margin_for_context(int depth, const StaticEvalContext& context) {
+    int margin = futility_margin(depth);
+    if (context.improving)
+        margin += 32;
+    if (context.opponentWorsening)
+        margin -= 16;
+    if (context.allNode)
+        margin += 16;
+    return std::max(80, margin);
+}
+
+int futility_move_count_for_context(int depth, const StaticEvalContext& context) {
+    int count = futility_move_count(depth);
+    if (context.improving)
+        count += 4;
+    if (context.opponentWorsening)
+        count -= 2;
+    if (context.cutNode)
+        count -= 2;
+    return std::max(1, count);
+}
+
+int probcut_margin_for_context(const StaticEvalContext& context) {
+    int margin = SEARCH_PROBCUT_MARGIN;
+    if (context.improving)
+        margin -= 16;
+    if (context.opponentWorsening)
+        margin -= 16;
+    if (context.allNode)
+        margin += 16;
+    return std::max(80, margin);
+}
+
 int piece_value(int piece) {
     return PIECE_VALUES[piece % 6];
 }
@@ -97,10 +162,65 @@ int evaluate_static(thrawn::Position* pos, int cachedStaticEval = no_hashmap_ent
     }
 
     const int value = evaluate(pos);
-    if (nnue_loaded()) {
-        tt->storeStaticEval(pos, value);
-    }
+    tt->storeStaticEval(pos, value);
     return value;
+}
+
+int correction_history_index(const thrawn::Position* pos) {
+    static_assert((SEARCH_CORRECTION_HISTORY_SIZE & (SEARCH_CORRECTION_HISTORY_SIZE - 1)) == 0,
+                  "correction history size must be a power of two");
+    return static_cast<int>(pos->zobristKey) & (SEARCH_CORRECTION_HISTORY_SIZE - 1);
+}
+
+int corrected_static_eval(ThreadData* td, thrawn::Position* pos, int rawStaticEval) {
+    const int correction = td->correction_history[pos->colour_to_move]
+                                                 [correction_history_index(pos)];
+    const int adjusted = rawStaticEval + correction / SEARCH_CORRECTION_HISTORY_GRAIN;
+    return std::clamp(adjusted, -mateScore + MAX_DEPTH, mateScore - MAX_DEPTH);
+}
+
+StaticEvalContext make_static_eval_context(ThreadData* td, int ply, int staticEval,
+                                           bool isPvNode, int beta) {
+    StaticEvalContext context;
+    const int trendMargin = 12;
+
+    if (ply >= 2 && td->static_eval_stack[ply - 2] != no_hashmap_entry) {
+        context.improving = staticEval > td->static_eval_stack[ply - 2] + trendMargin;
+    }
+
+    if (ply >= 1 && td->static_eval_stack[ply - 1] != no_hashmap_entry) {
+        context.opponentWorsening = -staticEval < td->static_eval_stack[ply - 1] - trendMargin;
+    }
+
+    context.cutNode = !isPvNode && staticEval >= beta;
+    context.allNode = !isPvNode && !context.cutNode;
+    return context;
+}
+
+void update_correction_history(ThreadData* td, thrawn::Position* pos, int rawStaticEval,
+                               int score, int depth, int bound) {
+    if (rawStaticEval == no_hashmap_entry || is_mate_score(score)) {
+        return;
+    }
+
+    const bool usefulBound =
+        bound == BOUND_EXACT ||
+        (bound == BOUND_LOWER && score > rawStaticEval) ||
+        (bound == BOUND_UPPER && score < rawStaticEval);
+    if (!usefulBound) {
+        return;
+    }
+
+    int& entry = td->correction_history[pos->colour_to_move]
+                                       [correction_history_index(pos)];
+    const int target = std::clamp((score - rawStaticEval) *
+                                      SEARCH_CORRECTION_HISTORY_GRAIN,
+                                  -SEARCH_CORRECTION_HISTORY_MAX,
+                                  SEARCH_CORRECTION_HISTORY_MAX);
+    const int weight = std::clamp(depth + 1, 1, 16);
+    entry += (target - entry) * weight / SEARCH_CORRECTION_HISTORY_WEIGHT_SCALE;
+    entry = std::clamp(entry, -SEARCH_CORRECTION_HISTORY_MAX,
+                       SEARCH_CORRECTION_HISTORY_MAX);
 }
 
 bool is_slider_piece(int piece) {
@@ -398,8 +518,9 @@ void update_quiet_history(ThreadData* td, int side, int ply, int move, int depth
     update_continuation_history(td, ply, move, bonus * SEARCH_CONTINUATION_HISTORY_NUMERATOR / SEARCH_CONTINUATION_HISTORY_DENOMINATOR);
 }
 
+template <typename MoveContainer>
 void penalize_quiet_history(ThreadData* td, int side, int ply,
-                            const std::vector<int>& moves, int depth) {
+                            const MoveContainer& moves, int depth) {
     const int penalty = -history_bonus(depth);
     for (int move : moves) {
         update_history_entry(td->quiet_history[side][get_move_source(move)]
@@ -439,8 +560,9 @@ void update_capture_history(ThreadData* td, thrawn::Position* pos, int move, int
                          history_bonus(depth));
 }
 
+template <typename MoveContainer>
 void penalize_capture_history(ThreadData* td, thrawn::Position* pos,
-                              const std::vector<int>& moves, int depth) {
+                              const MoveContainer& moves, int depth) {
     const int penalty = -history_bonus(depth);
     for (int move : moves) {
         if (!get_is_capture_move(move)) {
@@ -479,13 +601,23 @@ void update_counter_move(ThreadData* td, int ply, int move) {
 }
 
 int late_move_reduction(int depth, int move_number, bool is_pv_node,
-                        bool is_counter, int quiet_history) {
+                        bool is_counter, int quiet_history,
+                        const StaticEvalContext& context) {
     int reduction = SEARCH_LMR_BASE_REDUCTION +
                     floor_log2_int(depth) * floor_log2_int(move_number) / SEARCH_LMR_LOG_DIVISOR;
     if (!is_pv_node && depth >= SEARCH_LMR_NON_PV_DEPTH) {
         ++reduction;
     } else if (is_pv_node) {
         --reduction;
+    }
+    if (context.cutNode) {
+        ++reduction;
+    }
+    if (context.improving) {
+        --reduction;
+    }
+    if (context.opponentWorsening && !is_pv_node) {
+        ++reduction;
     }
     if (depth >= SEARCH_LMR_MOVE_DEPTH_1 &&
         move_number > SEARCH_LMR_MOVE_NUMBER_1) {
@@ -807,15 +939,219 @@ struct ScoredMove {
     bool seeKnown = false;
 };
 
+template <typename T, std::size_t Capacity>
+struct FixedBuffer {
+    std::array<T, Capacity> values{};
+    std::size_t count = 0;
+
+    void clear() { count = 0; }
+    void push_back(const T& value) {
+        if (count < Capacity)
+            values[count++] = value;
+    }
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    T& operator[](std::size_t index) { return values[index]; }
+    const T& operator[](std::size_t index) const { return values[index]; }
+    T* begin() { return values.data(); }
+    T* end() { return values.data() + count; }
+    const T* begin() const { return values.data(); }
+    const T* end() const { return values.data() + count; }
+};
+
+int next_square_on_step(int square, int step) {
+    const int next = square + step;
+    if (next < a8 || next > h1)
+        return null_sq;
+
+    const int fileDelta = std::abs((next % 8) - (square % 8));
+    const int rankDelta = std::abs((next / 8) - (square / 8));
+    if (fileDelta > 1 || rankDelta > 1)
+        return null_sq;
+
+    return next;
+}
+
+int direction_between_squares(int from, int to) {
+    const int fromFile = from % 8;
+    const int fromRank = from / 8;
+    const int toFile = to % 8;
+    const int toRank = to / 8;
+    const int fileDelta = toFile - fromFile;
+    const int rankDelta = toRank - fromRank;
+
+    if (fileDelta == 0 && rankDelta != 0)
+        return rankDelta > 0 ? 8 : -8;
+    if (rankDelta == 0 && fileDelta != 0)
+        return fileDelta > 0 ? 1 : -1;
+    if (std::abs(fileDelta) == std::abs(rankDelta) && fileDelta != 0)
+        return (rankDelta > 0 ? 8 : -8) + (fileDelta > 0 ? 1 : -1);
+
+    return 0;
+}
+
+bool is_diagonal_step(int step) {
+    return step == -9 || step == -7 || step == 7 || step == 9;
+}
+
+bool is_orthogonal_step(int step) {
+    return step == -8 || step == -1 || step == 1 || step == 8;
+}
+
+bool slider_matches_pin_ray(int piece, int step) {
+    const int type = piece % 6;
+    return type == QUEEN ||
+           (is_diagonal_step(step) && type == BISHOP) ||
+           (is_orthogonal_step(step) && type == ROOK);
+}
+
+int first_occupied_square_on_ray(thrawn::Position* pos, int from, int step) {
+    for (int sq = next_square_on_step(from, step); sq != null_sq;
+         sq = next_square_on_step(sq, step)) {
+        if (get_bit(pos->occupancies[both], sq))
+            return sq;
+    }
+    return null_sq;
+}
+
+bool target_stays_between_king_and_slider(int kingSquare, int target,
+                                          int sliderSquare, int step) {
+    for (int sq = next_square_on_step(kingSquare, step); sq != null_sq;
+         sq = next_square_on_step(sq, step)) {
+        if (sq == target)
+            return true;
+        if (sq == sliderSquare)
+            return false;
+    }
+    return false;
+}
+
+uint64_t enemy_piece_bb_after_king_move(thrawn::Position* pos, int enemy,
+                                        int whitePiece, int blackPiece,
+                                        uint64_t capturedTarget) {
+    const int piece = enemy == white ? whitePiece : blackPiece;
+    return pos->piece_bitboards[piece] & ~capturedTarget;
+}
+
+bool king_target_attacked_after_move(thrawn::Position* pos, int move) {
+    const int side = pos->colour_to_move;
+    const int enemy = side ^ 1;
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    const uint64_t sourceBb = square_bb(source);
+    const uint64_t targetBb = square_bb(target);
+    const uint64_t capturedTarget =
+        get_is_capture_move(move) && !get_is_move_enpassant(move) ? targetBb : 0ULL;
+
+    uint64_t occupancy = pos->occupancies[both];
+    occupancy &= ~sourceBb;
+    occupancy |= targetBb;
+
+    if (get_is_move_castling(move)) {
+        if (target == g1)
+            occupancy = (occupancy & ~square_bb(h1)) | square_bb(f1);
+        else if (target == c1)
+            occupancy = (occupancy & ~square_bb(a1)) | square_bb(d1);
+        else if (target == g8)
+            occupancy = (occupancy & ~square_bb(h8)) | square_bb(f8);
+        else if (target == c8)
+            occupancy = (occupancy & ~square_bb(a8)) | square_bb(d8);
+    }
+
+    const uint64_t enemyPawns =
+        enemy_piece_bb_after_king_move(pos, enemy, P, p, capturedTarget);
+    const uint64_t pawnAttackers = enemy == white
+        ? pos->pawn_attacks[black][target] & enemyPawns
+        : pos->pawn_attacks[white][target] & enemyPawns;
+    if (pawnAttackers)
+        return true;
+
+    if (pos->knight_attacks[target] &
+        enemy_piece_bb_after_king_move(pos, enemy, N, n, capturedTarget))
+        return true;
+
+    if (pos->king_attacks[target] &
+        enemy_piece_bb_after_king_move(pos, enemy, K, k, capturedTarget))
+        return true;
+
+    const uint64_t enemyBishops =
+        enemy_piece_bb_after_king_move(pos, enemy, B, b, capturedTarget);
+    const uint64_t enemyRooks =
+        enemy_piece_bb_after_king_move(pos, enemy, R, r, capturedTarget);
+    const uint64_t enemyQueens =
+        enemy_piece_bb_after_king_move(pos, enemy, Q, q, capturedTarget);
+
+    if (get_bishop_attacks(pos, target, occupancy) & (enemyBishops | enemyQueens))
+        return true;
+    if (get_rook_attacks(pos, target, occupancy) & (enemyRooks | enemyQueens))
+        return true;
+
+    return false;
+}
+
+bool move_respects_absolute_pin(thrawn::Position* pos, int move) {
+    if (get_is_move_enpassant(move))
+        return true;
+
+    const int side = pos->colour_to_move;
+    const int piece = get_move_piece(move);
+    if (piece % 6 == KING)
+        return !king_target_attacked_after_move(pos, move);
+
+    const uint64_t kingBb = pos->piece_bitboards[side == white ? K : k];
+    if (!kingBb)
+        return true;
+
+    const int kingSquare = get_lsb_index(kingBb);
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    const int step = direction_between_squares(kingSquare, source);
+    if (!step)
+        return true;
+
+    if (first_occupied_square_on_ray(pos, kingSquare, step) != source)
+        return true;
+
+    const int sliderSquare = first_occupied_square_on_ray(pos, source, step);
+    if (sliderSquare == null_sq)
+        return true;
+
+    const int enemyStart = side == white ? p : P;
+    const int enemyEnd = side == white ? k : K;
+    int slider = -1;
+    for (int enemyPiece = enemyStart; enemyPiece <= enemyEnd; ++enemyPiece) {
+        if (get_bit(pos->piece_bitboards[enemyPiece], sliderSquare)) {
+            slider = enemyPiece;
+            break;
+        }
+    }
+
+    if (slider == -1 || !slider_matches_pin_ray(slider, step))
+        return true;
+
+    return direction_between_squares(kingSquare, target) == step &&
+           target_stays_between_king_and_slider(kingSquare, target, sliderSquare, step);
+}
+
+bool move_passes_fast_legal_filter(thrawn::Position* pos, int move, bool inCheck) {
+    const int piece = get_move_piece(move);
+    if (piece % 6 == KING)
+        return !king_target_attacked_after_move(pos, move);
+    if (inCheck)
+        return true;
+    return move_respects_absolute_pin(pos, move);
+}
+
 class MovePicker {
 public:
     MovePicker(thrawn::Position* pos, ThreadData* td, int ttMove,
-               bool followPv, int moveType)
+               bool followPv, int moveType, bool inCheck)
         : pos(pos),
           td(td),
           ttMove(ttMove),
           pvMove(followPv && pos->ply < MAX_DEPTH ? td->pv_table[0][pos->ply] : 0),
           moveType(moveType),
+          inCheck(inCheck),
           stage(Stage::TtMove) {}
 
     bool next(PickedMove& picked) {
@@ -906,10 +1242,11 @@ private:
     int ttMove;
     int pvMove;
     int moveType;
+    bool inCheck;
     Stage stage;
-    std::vector<ScoredMove> tacticals;
-    std::vector<ScoredMove> badTacticals;
-    std::vector<ScoredMove> quietMoves;
+    FixedBuffer<ScoredMove, MAX_GENERATED_MOVES> tacticals;
+    FixedBuffer<ScoredMove, MAX_GENERATED_MOVES> badTacticals;
+    FixedBuffer<ScoredMove, MAX_GENERATED_MOVES> quietMoves;
     std::size_t tacticalIndex = 0;
     std::size_t badIndex = 0;
     std::size_t quietIndex = 0;
@@ -938,7 +1275,8 @@ private:
 
     bool try_special(int move, PickedMove& picked) {
         if (!move || already_tried(move) ||
-            !move_is_pseudo_legal(pos, move, moveType)) {
+            !move_is_pseudo_legal(pos, move, moveType) ||
+            !move_passes_fast_legal_filter(pos, move, inCheck)) {
             return false;
         }
 
@@ -963,7 +1301,7 @@ private:
                                 [get_move_target(previousMove)];
     }
 
-    static std::size_t select_best(std::vector<ScoredMove>& moves,
+    static std::size_t select_best(FixedBuffer<ScoredMove, MAX_GENERATED_MOVES>& moves,
                                    std::size_t first) {
         std::size_t best = first;
         for (std::size_t i = first + 1; i < moves.size(); ++i) {
@@ -977,7 +1315,7 @@ private:
         return first;
     }
 
-    bool next_scored(std::vector<ScoredMove>& moves, std::size_t& index,
+    bool next_scored(FixedBuffer<ScoredMove, MAX_GENERATED_MOVES>& moves, std::size_t& index,
                      PickedMove& picked) {
         while (index < moves.size()) {
             const std::size_t best = select_best(moves, index);
@@ -994,15 +1332,33 @@ private:
         return false;
     }
 
-    void generate_tacticals() {
-        std::vector<int> moves = generate_moves(pos, only_captures);
-        tacticals.reserve(moves.size());
-        for (int move : moves) {
-            if (already_tried(move)) {
-                continue;
-            }
-            tacticals.push_back({move, tactical_move_score(pos, td, move), 0, false});
+    static void score_tactical_move(int move, void* context) {
+        static_cast<MovePicker*>(context)->add_tactical(move);
+    }
+
+    static void score_quiet_move(int move, void* context) {
+        static_cast<MovePicker*>(context)->add_quiet(move);
+    }
+
+    void add_tactical(int move) {
+        if (already_tried(move) ||
+            !move_passes_fast_legal_filter(pos, move, inCheck)) {
+            return;
         }
+        tacticals.push_back({move, tactical_move_score(pos, td, move), 0, false});
+    }
+
+    void add_quiet(int move) {
+        if (already_tried(move) ||
+            !move_passes_fast_legal_filter(pos, move, inCheck)) {
+            return;
+        }
+        quietMoves.push_back({move, quiet_move_score(td, pos->colour_to_move, pos->ply, move), 0, false});
+    }
+
+    void generate_tacticals() {
+        MoveList moves(score_tactical_move, this);
+        generate_moves(pos, only_captures, moves);
     }
 
     void generate_quiets() {
@@ -1010,14 +1366,8 @@ private:
             return;
         }
 
-        std::vector<int> moves = generate_moves(pos, only_quiets);
-        quietMoves.reserve(moves.size());
-        for (int move : moves) {
-            if (already_tried(move)) {
-                continue;
-            }
-            quietMoves.push_back({move, quiet_move_score(td, pos->colour_to_move, pos->ply, move), 0, false});
-        }
+        MoveList moves(score_quiet_move, this);
+        generate_moves(pos, only_quiets, moves);
     }
 
     bool next_good_tactical(PickedMove& picked) {
@@ -1068,6 +1418,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     int bestMove = 0;
     int hashFlag = BOUND_UPPER;
     int static_eval = 0;
+    int raw_static_eval = no_hashmap_entry;
+    StaticEvalContext evalContext;
     const bool excludedNode = excludedMove != 0;
 
     if (stopped.load(std::memory_order_relaxed) == 1)
@@ -1157,7 +1509,16 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
     // Compute static evaluation
     if (!inCheck)
-        static_eval = evaluate_static(pos, ttStaticEval);
+    {
+        raw_static_eval = evaluate_static(pos, ttStaticEval);
+        static_eval = corrected_static_eval(td, pos, raw_static_eval);
+        td->static_eval_stack[pos->ply] = static_eval;
+        evalContext = make_static_eval_context(td, pos->ply, static_eval, isPvNode, beta);
+    }
+    else
+    {
+        td->static_eval_stack[pos->ply] = no_hashmap_entry;
+    }
     const bool pawnOnlyEndgame = noMajorsOrMinorsPieces(pos);
 
     // --------------------------------------
@@ -1194,7 +1555,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         depth <= SEARCH_REVERSE_FUTILITY_MAX_DEPTH &&
         !is_mate_score(beta) && !is_mate_score(static_eval))
     {
-        int eval_margin = reverse_futility_margin(depth);
+        int eval_margin = reverse_futility_margin(depth, evalContext);
         // if static eval already big enough to exceed beta
         if (static_eval - eval_margin >= beta)
         {
@@ -1216,7 +1577,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         make_null_move(pos, pos->ply);
 
         // Null-move search with reduced depth
-        int reduction = null_move_reduction(depth, static_eval, beta);
+        int reduction = null_move_reduction(depth, static_eval, beta, evalContext);
         td->allowNullMovePruning = false;
         score = -negamax_impl(pos, td, depth - 1 - reduction, -beta, -beta + 1, 0);
         td->allowNullMovePruning = true;
@@ -1258,9 +1619,9 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     const int probCutDepth = depth - 1 - SEARCH_PROBCUT_REDUCTION;
     if (!excludedNode && !inCheck && !isPvNode && !pawnOnlyEndgame &&
         depth >= SEARCH_PROBCUT_MIN_DEPTH && probCutDepth > 0 &&
-        !is_mate_score(beta) && beta < mateScore - SEARCH_PROBCUT_MARGIN)
+        !is_mate_score(beta) && beta < mateScore - probcut_margin_for_context(evalContext))
     {
-        const int probCutBeta = beta + SEARCH_PROBCUT_MARGIN;
+        const int probCutBeta = beta + probcut_margin_for_context(evalContext);
         const bool ttRefutesProbCut =
             ttHit && ttDepth >= depth - SEARCH_PROBCUT_REDUCTION &&
             (ttFlag == BOUND_EXACT || ttFlag == BOUND_UPPER) &&
@@ -1268,7 +1629,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
         if (!ttRefutesProbCut)
         {
-            MovePicker probCutPicker(pos, td, ttMove, false, only_captures);
+            MovePicker probCutPicker(pos, td, ttMove, false, only_captures, inCheck);
             PickedMove probCutPicked;
             while (probCutPicker.next(probCutPicked))
             {
@@ -1319,7 +1680,9 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
                 if (score >= probCutBeta)
                 {
-                    tt->store(pos, depth, beta, BOUND_LOWER, move, static_eval);
+                    update_correction_history(td, pos, raw_static_eval, beta, depth,
+                                              BOUND_LOWER);
+                    tt->store(pos, depth, beta, BOUND_LOWER, move, raw_static_eval);
                     return beta;
                 }
             }
@@ -1328,17 +1691,15 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
     const bool nodeFollowPv = td->follow_pv_flag;
     td->score_pv_flag = false;
-    MovePicker movePicker(pos, td, ttMove, nodeFollowPv, all_moves);
+    MovePicker movePicker(pos, td, ttMove, nodeFollowPv, all_moves, inCheck);
 
     // We are about to search each move
     int valid_moves = 0;
     int moves_searched = 0;
     int quiet_moves_seen = 0;
     bool pruned_moves = false;
-    std::vector<int> failed_quiet_moves;
-    failed_quiet_moves.reserve(64);
-    std::vector<int> failed_capture_moves;
-    failed_capture_moves.reserve(32);
+    FixedBuffer<int, MAX_GENERATED_MOVES> failed_quiet_moves;
+    FixedBuffer<int, MAX_GENERATED_MOVES> failed_capture_moves;
 
     // Search each move (LMR, LMP, PVS logic, etc.)
     PickedMove picked;
@@ -1376,7 +1737,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
             if (quietMove && !pawnMove && !castleMove &&
                 depth <= SEARCH_FUTILITY_MAX_DEPTH &&
-                static_eval + futility_margin(depth) <= alpha &&
+                static_eval + futility_margin_for_context(depth, evalContext) <= alpha &&
                 !gives_check())
             {
                 pruned_moves = true;
@@ -1385,7 +1746,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
             if (quietMove && !pawnMove && !castleMove &&
                 depth <= SEARCH_LATE_MOVE_PRUNING_MAX_DEPTH &&
-                quiet_moves_seen > futility_move_count(depth) &&
+                quiet_moves_seen > futility_move_count_for_context(depth, evalContext) &&
                 !gives_check())
             {
                 pruned_moves = true;
@@ -1504,7 +1865,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             {
                 // Reduced search
                 int reduction = late_move_reduction(depth, moves_searched + 1,
-                                                    isPvNode, counterMove, quietHistory);
+                                                    isPvNode, counterMove, quietHistory,
+                                                    evalContext);
                 int reducedDepth = std::max(1, childDepth - reduction);
                 score = search_child(reducedDepth, -alpha - 1, -alpha);
             }
@@ -1577,8 +1939,12 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             if (alpha >= beta)
             {
                 if (!excludedNode)
+                {
+                    update_correction_history(td, pos, raw_static_eval, beta, depth,
+                                              BOUND_LOWER);
                     tt->store(pos, depth, beta, BOUND_LOWER, bestMove,
-                              inCheck ? no_hashmap_entry : static_eval);
+                              inCheck ? no_hashmap_entry : raw_static_eval);
+                }
 
                 if (!excludedNode && quietMove)
                 {
@@ -1625,8 +1991,11 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
     // Store in TT and return
     if (!excludedNode)
+    {
+        update_correction_history(td, pos, raw_static_eval, alpha, depth, hashFlag);
         tt->store(pos, depth, alpha, hashFlag, bestMove,
-                  inCheck ? no_hashmap_entry : static_eval);
+                  inCheck ? no_hashmap_entry : raw_static_eval);
+    }
     return alpha;
 }
 
@@ -1694,14 +2063,17 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     }
 
     int static_eval = 0;
+    int raw_static_eval = no_hashmap_entry;
     if (!inCheck)
     {
-        static_eval = evaluate_static(pos, ttStaticEval);
+        raw_static_eval = evaluate_static(pos, ttStaticEval);
+        static_eval = corrected_static_eval(td, pos, raw_static_eval);
+        td->static_eval_stack[pos->ply] = static_eval;
 
         // fail-hard beta cutoff
         if (static_eval >= beta)
         {
-            tt->store(pos, 0, beta, BOUND_LOWER, 0, static_eval);
+            tt->store(pos, 0, beta, BOUND_LOWER, 0, raw_static_eval);
             return beta; // fails high
         }
 
@@ -1709,9 +2081,13 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         if (static_eval > alpha)
             alpha = static_eval; // principal variation PV node (best move)
     }
+    else
+    {
+        td->static_eval_stack[pos->ply] = no_hashmap_entry;
+    }
 
     const int move_type = inCheck ? all_moves : only_captures;
-    MovePicker movePicker(pos, td, ttMove, false, move_type);
+    MovePicker movePicker(pos, td, ttMove, false, move_type, inCheck);
 
     int valid_moves = 0;
     int bestMove = 0;
@@ -1784,7 +2160,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
             if (score >= beta)
             {
                 tt->store(pos, 0, beta, BOUND_LOWER, bestMove,
-                          inCheck ? no_hashmap_entry : static_eval);
+                          inCheck ? no_hashmap_entry : raw_static_eval);
                 return beta; // fails high
             }
         }
@@ -1799,7 +2175,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
 
     // move fails low (<= alpha)
     tt->store(pos, 0, alpha, alpha > oldAlpha ? BOUND_EXACT : BOUND_UPPER,
-              bestMove, inCheck ? no_hashmap_entry : static_eval);
+              bestMove, inCheck ? no_hashmap_entry : raw_static_eval);
     return alpha;
 }
 
