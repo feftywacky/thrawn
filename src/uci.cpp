@@ -656,7 +656,7 @@ void uci_loop(thrawn::Position* pos)
             cout << "id author Feiyu Lin\n";
             cout << "option name Hash type spin default 256 min 4 max " << max_hashmap_size << "\n";
             cout << "option name Threads type spin default 1 min 1 max 16" << "\n";
-            cout << "option name EvalFile type string default model_v5.nnue" << "\n";
+            cout << "option name EvalFile type string default model_v4_halfkAv2_hm.nnue" << "\n";
             cout << "uciok\n";
         }
         
@@ -686,7 +686,7 @@ void uci_loop(thrawn::Position* pos)
             else if (option_name_equals(optionName, "EvalFile")) {
                 std::string path = optionValue;
                 if (path.empty()) {
-                    path = "model_v5.nnue";
+                    path = "model_v4_halfkAv2_hm.nnue";
                 }
                 nnue_init(path.c_str());
                 nnue_refresh_root(pos);

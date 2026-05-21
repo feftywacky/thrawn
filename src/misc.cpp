@@ -23,5 +23,5 @@ void init_all()
 
     init_eval_masks();
 
-    nnue_init("model_v5.nnue");
+    nnue_init("model_v4_halfkAv2_hm.nnue");
 }

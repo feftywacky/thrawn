@@ -10,8 +10,47 @@
 #include <atomic>
 #include <algorithm>
 #include <cstdint>
+#include <cstddef>
+
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 static std::int64_t globalSearchStartTime = 0;
+
+namespace {
+
+constexpr std::size_t kSearchThreadStackSize = 8U * 1024U * 1024U;
+
+#if !defined(_WIN32)
+struct SearchThreadContext {
+    thrawn::Position* pos = nullptr;
+    int thread_id = 0;
+    int max_depth = 0;
+};
+
+void* search_thread_entry(void* rawContext) {
+    auto* context = static_cast<SearchThreadContext*>(rawContext);
+    smp_worker_thread_func(context->pos, context->thread_id, context->max_depth);
+    return nullptr;
+}
+
+bool start_search_thread(pthread_t& thread, SearchThreadContext& context) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        return false;
+    }
+
+    const int stackResult = pthread_attr_setstacksize(&attr, kSearchThreadStackSize);
+    const int createResult = stackResult == 0
+        ? pthread_create(&thread, &attr, search_thread_entry, &context)
+        : stackResult;
+    pthread_attr_destroy(&attr);
+    return createResult == 0;
+}
+#endif
+
+} // namespace
 
 static int uci_mate_score(int score) {
     if (score >= mateScore) {
@@ -355,6 +394,8 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
     tt->incrementAge();
 
     // Limit the number of threads to MAX_THREADS.
+    if (numThreads < 1)
+        numThreads = 1;
     if (numThreads > MAX_THREADS)
         numThreads = MAX_THREADS;
     
@@ -369,7 +410,12 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
     for (int i = 0; i < numThreads; i++) {
         positionCopies.push_back(new thrawn::Position(*rootPos));
     }
-    
+
+    if (numThreads == 1) {
+        smp_worker_thread_func(positionCopies[0], 0, maxDepth);
+    }
+    else {
+#if defined(_WIN32)
     // Create worker threads
     std::vector<std::thread> workerPool;
     workerPool.reserve(numThreads);
@@ -381,6 +427,25 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
     for (int i = 0; i < numThreads; i++)
     {
         workerPool[i].join();
+    }
+#else
+        std::vector<pthread_t> workerPool(static_cast<std::size_t>(numThreads));
+        std::vector<SearchThreadContext> contexts(static_cast<std::size_t>(numThreads));
+        int startedThreads = 0;
+
+        for (int i = 0; i < numThreads; i++) {
+            contexts[i] = {positionCopies[i], i, maxDepth};
+            if (!start_search_thread(workerPool[i], contexts[i])) {
+                stopped.store(1, std::memory_order_relaxed);
+                break;
+            }
+            ++startedThreads;
+        }
+
+        for (int i = 0; i < startedThreads; i++) {
+            pthread_join(workerPool[i], nullptr);
+        }
+#endif
     }
     
     // Delete allocated memory for position copies

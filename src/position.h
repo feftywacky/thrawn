@@ -10,21 +10,23 @@
 
 namespace thrawn {
 
-// Latest trainer export: halfkp_v1, version 7.
-constexpr int NNUE_INPUT_FEATURES = 40960;
-constexpr int NNUE_FACTOR_FEATURES = 640;
-constexpr int NNUE_MAX_ACTIVE_FEATURES = 30;
+// Latest trainer export: HalfKAv2_hm, version 8.
+constexpr int NNUE_INPUT_FEATURES = 22528;
+constexpr int NNUE_PS_NB = 11 * 64;
+constexpr int NNUE_MAX_ACTIVE_FEATURES = 32;
 constexpr int NNUE_ACCUMULATOR_SIZE = 1024;
-constexpr int NNUE_L1_SIZE = 256;
-constexpr int NNUE_L2_SIZE = 64;
-constexpr int NNUE_HIDDEN_SIZE = NNUE_L1_SIZE; // legacy alias
-constexpr int NNUE_OUTPUT_BUCKETS = 1;         // legacy alias
 constexpr int NNUE_FT_SIZE = NNUE_ACCUMULATOR_SIZE;
+constexpr int NNUE_HIDDEN_SIZE = 31;
+constexpr int NNUE_FORWARD_SIZE = 1;
+constexpr int NNUE_FC0_OUTPUT_SIZE = NNUE_HIDDEN_SIZE + NNUE_FORWARD_SIZE;
+constexpr int NNUE_FC1_INPUT_SIZE = NNUE_HIDDEN_SIZE * 2;
+constexpr int NNUE_FC1_OUTPUT_SIZE = 32;
 constexpr int NNUE_MAX_PIECES = 32;
 constexpr int NNUE_SIMD_ALIGNMENT = 64;
 
 static_assert(NNUE_ACCUMULATOR_SIZE % 8 == 0, "NNUE accumulator must fit NEON lanes");
 static_assert(NNUE_ACCUMULATOR_SIZE % 16 == 0, "NNUE accumulator must fit AVX2 lanes");
+static_assert(NNUE_INPUT_FEATURES == 32 * NNUE_PS_NB, "HalfKAv2_hm feature count mismatch");
 
 struct alignas(NNUE_SIMD_ALIGNMENT) NnueState {
     alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> white_acc{};

@@ -48,6 +48,8 @@ MACOS_MIN_VERSION := 10.15
 
 ifeq ($(OS_NAME),Linux)
     ARCH_DETECTED := $(shell uname -m)
+    CXXFLAGS += -pthread
+    LDFLAGS += -pthread
 else ifeq ($(OS_NAME),macOS)
     ARCH_DETECTED := $(shell uname -m)
     ifeq ($(ARCH_DETECTED),arm64)
@@ -62,10 +64,10 @@ endif
 ifeq ($(ARCH),native)
     ifeq ($(ARCH_DETECTED),x86_64)
         CPPFLAGS += -DUSE_AVX2
-        ARCH_FLAGS += -march=native -mavx2 -mpopcnt -mbmi
+        ARCH_FLAGS += -march=native -mavx2 -mpopcnt -mbmi2
     else ifeq ($(ARCH_DETECTED),AMD64)
         CPPFLAGS += -DUSE_AVX2
-        ARCH_FLAGS += -march=native -mavx2 -mpopcnt -mbmi
+        ARCH_FLAGS += -march=native -mavx2 -mpopcnt -mbmi2
     else ifeq ($(ARCH_DETECTED),arm64)
         CPPFLAGS += -DUSE_NEON
         ARCH_FLAGS += -march=native
@@ -78,7 +80,7 @@ ifeq ($(ARCH),native)
     endif
 else ifeq ($(ARCH),x86-64-avx2)
     CPPFLAGS += -DUSE_AVX2
-    ARCH_FLAGS += -mavx2 -mpopcnt -mbmi
+    ARCH_FLAGS += -mavx2 -mpopcnt -mbmi2
 else ifeq ($(ARCH),arm64-neon)
     CPPFLAGS += -DUSE_NEON
 else ifeq ($(ARCH),arm64-neon-dotprod)

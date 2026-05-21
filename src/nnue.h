@@ -17,6 +17,17 @@ float nnue_evaluate_raw(const thrawn::Position* pos);      // Stockfish internal
 void nnue_refresh_root(thrawn::Position* pos);
 void nnue_copy_parent_to_child(thrawn::Position* pos, int child_ply);
 void nnue_promote_to_root(thrawn::Position* pos, int ply);
+
+struct NnuePieceUpdate {
+    int piece;
+    int square;
+    bool add;
+};
+
+void nnue_apply_piece_updates(thrawn::Position* pos,
+                              int ply,
+                              const NnuePieceUpdate* updates,
+                              int update_count);
 void nnue_add_piece(thrawn::Position* pos, int ply, int piece, int square);
 void nnue_remove_piece(thrawn::Position* pos, int ply, int piece, int square);
 

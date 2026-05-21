@@ -440,21 +440,27 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
     const uint64_t target_bb = square_bb(target);
     const int nnue_ply = (stack_ply >= 0) ? stack_ply : pos->ply;
     const bool use_nnue = update_nnue && nnue_loaded();
+    NnuePieceUpdate nnue_updates[8];
+    int nnue_update_count = 0;
+    auto queue_nnue_remove = [&](int update_piece, int update_square) {
+        if (use_nnue)
+            nnue_updates[nnue_update_count++] = {update_piece, update_square, false};
+    };
+    auto queue_nnue_add = [&](int update_piece, int update_square) {
+        if (use_nnue)
+            nnue_updates[nnue_update_count++] = {update_piece, update_square, true};
+    };
 
     const int opponent_king = (moving_side == white) ? k : K;
     if (is_capture_move && get_bit(pos->piece_bitboards[opponent_king], target))
         return 0;
-
-    if (use_nnue)
-        nnue_copy_parent_to_child(pos, nnue_ply);
 
     pop_bit(pos->piece_bitboards[piece], source);
     set_bit(pos->piece_bitboards[piece], target);
     pos->occupancies[moving_side] ^= source_bb | target_bb;
     pos->zobristKey ^= pos->piece_hashkey[piece][source];
     pos->zobristKey ^= pos->piece_hashkey[piece][target];
-    if (use_nnue)
-        nnue_remove_piece(pos, nnue_ply, piece, source);
+    queue_nnue_remove(piece, source);
 
     pos->fifty_move++;
     if (piece == P || piece == p)
@@ -476,8 +482,7 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
             pop_bit(pos->piece_bitboards[captured], target);
             pos->occupancies[enemy_side] &= ~target_bb;
             pos->zobristKey ^= pos->piece_hashkey[captured][target];
-            if (use_nnue)
-                nnue_remove_piece(pos, nnue_ply, captured, target);
+            queue_nnue_remove(captured, target);
         }
     }
 
@@ -487,12 +492,11 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
         set_bit(pos->piece_bitboards[promoted_piece], target);
         pos->zobristKey ^= pos->piece_hashkey[piece][target];
         pos->zobristKey ^= pos->piece_hashkey[promoted_piece][target];
-        if (use_nnue)
-            nnue_add_piece(pos, nnue_ply, promoted_piece, target);
+        queue_nnue_add(promoted_piece, target);
     }
-    else if (use_nnue)
+    else
     {
-        nnue_add_piece(pos, nnue_ply, piece, target);
+        queue_nnue_add(piece, target);
     }
 
     if (enpassant_move)
@@ -510,8 +514,7 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
         pop_bit(pos->piece_bitboards[captured_piece], captured_square);
         pos->occupancies[enemy_side] &= ~captured_bb;
         pos->zobristKey ^= pos->piece_hashkey[captured_piece][captured_square];
-        if (use_nnue)
-            nnue_remove_piece(pos, nnue_ply, captured_piece, captured_square);
+        queue_nnue_remove(captured_piece, captured_square);
     }
 
     if (pos->enpassant != null_sq)
@@ -533,11 +536,8 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
             pos->occupancies[white] ^= square_bb(h1) | square_bb(f1);
             pos->zobristKey ^= pos->piece_hashkey[R][h1];
             pos->zobristKey ^= pos->piece_hashkey[R][f1];
-            if (use_nnue)
-            {
-                nnue_remove_piece(pos, nnue_ply, R, h1);
-                nnue_add_piece(pos, nnue_ply, R, f1);
-            }
+            queue_nnue_remove(R, h1);
+            queue_nnue_add(R, f1);
         }
         else if (target == c1)
         {
@@ -546,11 +546,8 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
             pos->occupancies[white] ^= square_bb(a1) | square_bb(d1);
             pos->zobristKey ^= pos->piece_hashkey[R][a1];
             pos->zobristKey ^= pos->piece_hashkey[R][d1];
-            if (use_nnue)
-            {
-                nnue_remove_piece(pos, nnue_ply, R, a1);
-                nnue_add_piece(pos, nnue_ply, R, d1);
-            }
+            queue_nnue_remove(R, a1);
+            queue_nnue_add(R, d1);
         }
         else if (target == g8)
         {
@@ -559,11 +556,8 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
             pos->occupancies[black] ^= square_bb(h8) | square_bb(f8);
             pos->zobristKey ^= pos->piece_hashkey[r][h8];
             pos->zobristKey ^= pos->piece_hashkey[r][f8];
-            if (use_nnue)
-            {
-                nnue_remove_piece(pos, nnue_ply, r, h8);
-                nnue_add_piece(pos, nnue_ply, r, f8);
-            }
+            queue_nnue_remove(r, h8);
+            queue_nnue_add(r, f8);
         }
         else if (target == c8)
         {
@@ -572,11 +566,8 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
             pos->occupancies[black] ^= square_bb(a8) | square_bb(d8);
             pos->zobristKey ^= pos->piece_hashkey[r][a8];
             pos->zobristKey ^= pos->piece_hashkey[r][d8];
-            if (use_nnue)
-            {
-                nnue_remove_piece(pos, nnue_ply, r, a8);
-                nnue_add_piece(pos, nnue_ply, r, d8);
-            }
+            queue_nnue_remove(r, a8);
+            queue_nnue_add(r, d8);
         }
     }
 
@@ -604,7 +595,11 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
     }
 
     if (use_nnue)
+    {
+        nnue_copy_parent_to_child(pos, nnue_ply);
+        nnue_apply_piece_updates(pos, nnue_ply, nnue_updates, nnue_update_count);
         nnue_debug_check(pos);
+    }
     return 1;
 }
 
