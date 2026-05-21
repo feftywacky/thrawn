@@ -1575,6 +1575,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
         make_null_move(pos, pos->ply);
+        tt->prefetch(pos->zobristKey);
 
         // Null-move search with reduced depth
         int reduction = null_move_reduction(depth, static_eval, beta, evalContext);
@@ -1654,6 +1655,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                     pos->repetition_index--;
                     continue;
                 }
+                tt->prefetch(pos->zobristKey);
                 td->ply_moves[parentPly] = move;
 
                 const bool savedFollowPv = td->follow_pv_flag;
@@ -1822,6 +1824,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             pos->repetition_index--;
             continue;
         }
+        tt->prefetch(pos->zobristKey);
         valid_moves++;
         td->ply_moves[parentPly] = move;
         const int childDepth = depth - 1 + extension;
@@ -2133,6 +2136,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
             pos->repetition_index--;
             continue;
         }
+        tt->prefetch(pos->zobristKey);
         valid_moves++;
         td->ply_moves[parentPly] = move;
 
