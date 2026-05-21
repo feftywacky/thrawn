@@ -206,6 +206,7 @@ struct LoadedNetwork {
 
     std::array<int32_t, kExpectedFc0OutputSize> fc0_bias{};
     alignas(64) std::array<std::array<int8_t, kFc0InputSize>, kExpectedFc0OutputSize> fc0_weight_t{};
+    alignas(64) std::array<std::array<int16_t, kFc0InputSize>, kExpectedFc0OutputSize> fc0_weight_i16_t{};
 
     std::array<int32_t, kExpectedFc1OutputSize> fc1_bias{};
     alignas(64) std::array<std::array<int8_t, kFc1InputPaddedSize>, kExpectedFc1OutputSize> fc1_weight_t{};
@@ -599,6 +600,16 @@ static inline void acc_sub_row_avx2(int16_t* acc, const int16_t* row) {
     }
 }
 
+static inline void acc_add_sub_row_avx2(int16_t* acc, const int16_t* add, const int16_t* sub) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i));
+        const __m256i add_row = _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i));
+        const __m256i sub_row = _mm256_load_si256(reinterpret_cast<const __m256i*>(sub + i));
+        a = _mm256_sub_epi16(_mm256_add_epi16(a, add_row), sub_row);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i), a);
+    }
+}
+
 int64_t dot_i16_i8_avx2(const int16_t* x, const int8_t* w, int count) {
     __m256i acc0 = _mm256_setzero_si256();
     __m256i acc1 = _mm256_setzero_si256();
@@ -687,6 +698,55 @@ void dot_i16_i8_x4_avx2(const int16_t* x,
         s3 += xi * static_cast<int32_t>(w3[i]);
     }
 }
+
+void dot_i16_i16_x4_avx2(const int16_t* x,
+                         const int16_t* w0,
+                         const int16_t* w1,
+                         const int16_t* w2,
+                         const int16_t* w3,
+                         int count,
+                         int64_t& s0,
+                         int64_t& s1,
+                         int64_t& s2,
+                         int64_t& s3) {
+    __m256i a00 = _mm256_setzero_si256();
+    __m256i a01 = _mm256_setzero_si256();
+    __m256i a10 = _mm256_setzero_si256();
+    __m256i a11 = _mm256_setzero_si256();
+    __m256i a20 = _mm256_setzero_si256();
+    __m256i a21 = _mm256_setzero_si256();
+    __m256i a30 = _mm256_setzero_si256();
+    __m256i a31 = _mm256_setzero_si256();
+
+    int i = 0;
+    for (; i + 31 < count; i += 32) {
+        const __m256i x0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(x + i));
+        const __m256i x1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(x + i + 16));
+
+        a00 = _mm256_add_epi32(a00, _mm256_madd_epi16(x0, _mm256_load_si256(reinterpret_cast<const __m256i*>(w0 + i))));
+        a01 = _mm256_add_epi32(a01, _mm256_madd_epi16(x1, _mm256_load_si256(reinterpret_cast<const __m256i*>(w0 + i + 16))));
+        a10 = _mm256_add_epi32(a10, _mm256_madd_epi16(x0, _mm256_load_si256(reinterpret_cast<const __m256i*>(w1 + i))));
+        a11 = _mm256_add_epi32(a11, _mm256_madd_epi16(x1, _mm256_load_si256(reinterpret_cast<const __m256i*>(w1 + i + 16))));
+        a20 = _mm256_add_epi32(a20, _mm256_madd_epi16(x0, _mm256_load_si256(reinterpret_cast<const __m256i*>(w2 + i))));
+        a21 = _mm256_add_epi32(a21, _mm256_madd_epi16(x1, _mm256_load_si256(reinterpret_cast<const __m256i*>(w2 + i + 16))));
+        a30 = _mm256_add_epi32(a30, _mm256_madd_epi16(x0, _mm256_load_si256(reinterpret_cast<const __m256i*>(w3 + i))));
+        a31 = _mm256_add_epi32(a31, _mm256_madd_epi16(x1, _mm256_load_si256(reinterpret_cast<const __m256i*>(w3 + i + 16))));
+    }
+
+    s0 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a00, a01));
+    s1 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a10, a11));
+    s2 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a20, a21));
+    s3 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a30, a31));
+
+    for (; i < count; ++i) {
+        const int32_t xi = x[i];
+        s0 += xi * static_cast<int32_t>(w0[i]);
+        s1 += xi * static_cast<int32_t>(w1[i]);
+        s2 += xi * static_cast<int32_t>(w2[i]);
+        s3 += xi * static_cast<int32_t>(w3[i]);
+    }
+}
+
 #endif
 
 #if defined(USE_NEON)
@@ -703,6 +763,15 @@ static inline void acc_sub_row_neon(int16_t* acc, const int16_t* row) {
         const int16x8_t a = vld1q_s16(acc + i);
         const int16x8_t r = vld1q_s16(row + i);
         vst1q_s16(acc + i, vsubq_s16(a, r));
+    }
+}
+
+static inline void acc_add_sub_row_neon(int16_t* acc, const int16_t* add, const int16_t* sub) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
+        const int16x8_t a = vld1q_s16(acc + i);
+        const int16x8_t add_row = vld1q_s16(add + i);
+        const int16x8_t sub_row = vld1q_s16(sub + i);
+        vst1q_s16(acc + i, vsubq_s16(vaddq_s16(a, add_row), sub_row));
     }
 }
 
@@ -782,6 +851,61 @@ void dot_i16_i8_x4_neon(const int16_t* x,
         s3 += xi * static_cast<int32_t>(w3[i]);
     }
 }
+
+void dot_i16_i16_x4_neon(const int16_t* x,
+                         const int16_t* w0,
+                         const int16_t* w1,
+                         const int16_t* w2,
+                         const int16_t* w3,
+                         int count,
+                         int64_t& s0,
+                         int64_t& s1,
+                         int64_t& s2,
+                         int64_t& s3) {
+    int32x4_t a0_lo = vdupq_n_s32(0);
+    int32x4_t a0_hi = vdupq_n_s32(0);
+    int32x4_t a1_lo = vdupq_n_s32(0);
+    int32x4_t a1_hi = vdupq_n_s32(0);
+    int32x4_t a2_lo = vdupq_n_s32(0);
+    int32x4_t a2_hi = vdupq_n_s32(0);
+    int32x4_t a3_lo = vdupq_n_s32(0);
+    int32x4_t a3_hi = vdupq_n_s32(0);
+
+    auto accumulate = [](int32x4_t& acc_lo, int32x4_t& acc_hi, int16x8_t xv, int16x8_t wv) {
+        acc_lo = vmlal_s16(acc_lo, vget_low_s16(xv), vget_low_s16(wv));
+        acc_hi = vmlal_s16(acc_hi, vget_high_s16(xv), vget_high_s16(wv));
+    };
+
+    auto reduce = [](int32x4_t acc_lo, int32x4_t acc_hi) {
+        const int64x2_t lo64 = vpaddlq_s32(acc_lo);
+        const int64x2_t hi64 = vpaddlq_s32(acc_hi);
+        return vgetq_lane_s64(lo64, 0) + vgetq_lane_s64(lo64, 1) +
+               vgetq_lane_s64(hi64, 0) + vgetq_lane_s64(hi64, 1);
+    };
+
+    int i = 0;
+    for (; i + 7 < count; i += 8) {
+        const int16x8_t xv = vld1q_s16(x + i);
+        accumulate(a0_lo, a0_hi, xv, vld1q_s16(w0 + i));
+        accumulate(a1_lo, a1_hi, xv, vld1q_s16(w1 + i));
+        accumulate(a2_lo, a2_hi, xv, vld1q_s16(w2 + i));
+        accumulate(a3_lo, a3_hi, xv, vld1q_s16(w3 + i));
+    }
+
+    s0 = reduce(a0_lo, a0_hi);
+    s1 = reduce(a1_lo, a1_hi);
+    s2 = reduce(a2_lo, a2_hi);
+    s3 = reduce(a3_lo, a3_hi);
+
+    for (; i < count; ++i) {
+        const int32_t xi = x[i];
+        s0 += xi * static_cast<int32_t>(w0[i]);
+        s1 += xi * static_cast<int32_t>(w1[i]);
+        s2 += xi * static_cast<int32_t>(w2[i]);
+        s3 += xi * static_cast<int32_t>(w3[i]);
+    }
+}
+
 #endif
 
 bool update_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
@@ -860,6 +984,18 @@ bool update_accumulator_rows(std::array<int16_t, kExpectedFtSize>& accumulator,
 
     int16_t* acc = accumulator.data();
 #if defined(USE_AVX2)
+    if (add_count == 1 && sub_count == 0) {
+        acc_add_row_avx2(acc, add_rows[0]);
+        return true;
+    }
+    if (add_count == 0 && sub_count == 1) {
+        acc_sub_row_avx2(acc, sub_rows[0]);
+        return true;
+    }
+    if (add_count == 1 && sub_count == 1) {
+        acc_add_sub_row_avx2(acc, add_rows[0], sub_rows[0]);
+        return true;
+    }
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
         __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i));
         for (int j = 0; j < add_count; ++j) {
@@ -873,6 +1009,18 @@ bool update_accumulator_rows(std::array<int16_t, kExpectedFtSize>& accumulator,
         _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i), a);
     }
 #elif defined(USE_NEON)
+    if (add_count == 1 && sub_count == 0) {
+        acc_add_row_neon(acc, add_rows[0]);
+        return true;
+    }
+    if (add_count == 0 && sub_count == 1) {
+        acc_sub_row_neon(acc, sub_rows[0]);
+        return true;
+    }
+    if (add_count == 1 && sub_count == 1) {
+        acc_add_sub_row_neon(acc, add_rows[0], sub_rows[0]);
+        return true;
+    }
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
         int16x8_t a = vld1q_s16(acc + i);
         for (int j = 0; j < add_count; ++j) {
@@ -1549,6 +1697,58 @@ void dot_i16_i8_x4(const int16_t* x,
     dot_i16_i8_x4_scalar(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
 }
 
+void dot_i16_i16_x4_scalar(const int16_t* x,
+                           const int16_t* w0,
+                           const int16_t* w1,
+                           const int16_t* w2,
+                           const int16_t* w3,
+                           int count,
+                           int64_t& s0,
+                           int64_t& s1,
+                           int64_t& s2,
+                           int64_t& s3) {
+    int64_t a0 = 0;
+    int64_t a1 = 0;
+    int64_t a2 = 0;
+    int64_t a3 = 0;
+    for (int i = 0; i < count; ++i) {
+        const int32_t xi = x[i];
+        a0 += xi * static_cast<int32_t>(w0[i]);
+        a1 += xi * static_cast<int32_t>(w1[i]);
+        a2 += xi * static_cast<int32_t>(w2[i]);
+        a3 += xi * static_cast<int32_t>(w3[i]);
+    }
+    s0 = a0;
+    s1 = a1;
+    s2 = a2;
+    s3 = a3;
+}
+
+void dot_i16_i16_x4(const int16_t* x,
+                    const int16_t* w0,
+                    const int16_t* w1,
+                    const int16_t* w2,
+                    const int16_t* w3,
+                    int count,
+                    int64_t& s0,
+                    int64_t& s1,
+                    int64_t& s2,
+                    int64_t& s3) {
+#if defined(USE_AVX2)
+    if (count % 32 == 0) {
+        dot_i16_i16_x4_avx2(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+        return;
+    }
+#elif defined(USE_NEON)
+    if (count % 8 == 0) {
+        dot_i16_i16_x4_neon(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+        return;
+    }
+#endif
+
+    dot_i16_i16_x4_scalar(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+}
+
 int32_t dot_u8_i8(const uint8_t* x, const int8_t* w, int count) {
 #if defined(USE_AVX2)
     if (count % 32 == 0) {
@@ -1644,27 +1844,27 @@ IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& a
     const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
 
     for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 4) {
-        const int8_t* w0 = network.fc0_weight_t[j].data();
-        const int8_t* w1 = network.fc0_weight_t[j + 1].data();
-        const int8_t* w2 = network.fc0_weight_t[j + 2].data();
-        const int8_t* w3 = network.fc0_weight_t[j + 3].data();
+        const int16_t* w0 = network.fc0_weight_i16_t[j].data();
+        const int16_t* w1 = network.fc0_weight_i16_t[j + 1].data();
+        const int16_t* w2 = network.fc0_weight_i16_t[j + 2].data();
+        const int16_t* w3 = network.fc0_weight_i16_t[j + 3].data();
         int64_t d0;
         int64_t d1;
         int64_t d2;
         int64_t d3;
 
-        dot_i16_i8_x4(us.data(), w0, w1, w2, w3, kExpectedFtSize, d0, d1, d2, d3);
+        dot_i16_i16_x4(us.data(), w0, w1, w2, w3, kExpectedFtSize, d0, d1, d2, d3);
         int64_t t0;
         int64_t t1;
         int64_t t2;
         int64_t t3;
-        dot_i16_i8_x4(them.data(),
-                      w0 + kExpectedFtSize,
-                      w1 + kExpectedFtSize,
-                      w2 + kExpectedFtSize,
-                      w3 + kExpectedFtSize,
-                      kExpectedFtSize,
-                      t0, t1, t2, t3);
+        dot_i16_i16_x4(them.data(),
+                       w0 + kExpectedFtSize,
+                       w1 + kExpectedFtSize,
+                       w2 + kExpectedFtSize,
+                       w3 + kExpectedFtSize,
+                       kExpectedFtSize,
+                       t0, t1, t2, t3);
 
         fc0[j] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j]) +
                                       div_round_by_scale(d0 + t0, network.qft));
@@ -2094,6 +2294,7 @@ bool load_network_from_file(const std::string& path,
         for (int i = 0; i < kFc0InputSize; ++i) {
             network.fc0_weight_t[j][i] =
                 fc0_weight_q[static_cast<std::size_t>(i) * kExpectedFc0OutputSize + j];
+            network.fc0_weight_i16_t[j][i] = network.fc0_weight_t[j][i];
         }
     }
 
