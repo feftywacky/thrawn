@@ -1,9 +1,10 @@
-#include <vector>
+#include "bitboard_helpers.h"
+
+#include "bitboard.h"
+
 #include <bitset>
 #include <iostream>
-#include "constants.h"
-#include "bitboard.h"
-#include "zobrist_hashing.h"
+#include <vector>
 
 using namespace std;
 
@@ -154,4 +155,3 @@ void print_bits(uint64_t num)
     }
     std::cout << std::endl;
 }
-

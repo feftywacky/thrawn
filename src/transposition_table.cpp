@@ -283,11 +283,12 @@ void TranspositionTable::storeStaticEval(const thrawn::Position* pos, int static
 // hash_flag:   2 bits (mask: 0x3)
 // age:         5 bits (stored by store() in bits 59-63)
 //
-// Note: Score is encoded as score + INFINITY so that the range -50000...+50000 becomes 0...100000.
+// Note: Score is encoded as score + SEARCH_INFINITY so that the range
+// -50000...+50000 becomes 0...100000.
 
 uint64_t TranspositionTable::encodeTTData(int best_move, int depth, int score, int hash_flag) {
     // Offset the score to make it non-negative.
-    int encoded_score = score + INFINITY; // now in the range 0 .. 100000
+    int encoded_score = score + SEARCH_INFINITY; // now in the range 0 .. 100000
 
     uint64_t data = 0;
     data |= ((uint64_t)best_move & 0xFFFFFFULL);                // bits 0-23: best_move (24 bits)
@@ -310,7 +311,7 @@ int TranspositionTable::extractTTDepth(uint64_t data) {
 int TranspositionTable::extractTTScore(uint64_t data) {
     // Extract bits 40-56 then remove the offset.
     int encoded_score = (int)((data >> 40) & 0x1FFFFULL);
-    return encoded_score - INFINITY;
+    return encoded_score - SEARCH_INFINITY;
 }
 
 int TranspositionTable::extractTTHashFlag(uint64_t data) {

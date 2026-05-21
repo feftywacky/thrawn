@@ -34,13 +34,13 @@ static std::uint64_t exact_node_total(int numThreads) {
 }
 
 RootMove::RootMove()
-    : move(0), score(-INFINITY), depth(0), bound(BOUND_NONE), pv_length(0), completed(false)
+    : move(0), score(-SEARCH_INFINITY), depth(0), bound(BOUND_NONE), pv_length(0), completed(false)
 {
     pv.fill(0);
 }
 
 SearchResult::SearchResult()
-    : thread(nullptr), thread_id(0), move(0), score(-INFINITY), depth(0),
+    : thread(nullptr), thread_id(0), move(0), score(-SEARCH_INFINITY), depth(0),
       pv_length(0), has_move(false)
 {
     pv.fill(0);
@@ -201,8 +201,8 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
 {
     ThreadData* td = &threadDatas[threadID];
     td->thread_id = threadID;
-    int alpha = -INFINITY;
-    int beta  =  INFINITY;
+    int alpha = -SEARCH_INFINITY;
+    int beta  =  SEARCH_INFINITY;
     int score = 0;
 
     // Perform iterative deepening from depth 1 to maxDepth
@@ -226,8 +226,8 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         }
         else
         {
-            alpha = -INFINITY;
-            beta  = INFINITY;
+            alpha = -SEARCH_INFINITY;
+            beta  = SEARCH_INFINITY;
         }
 
         // Aspiration loop: adjust the window until search returns a score in (alpha, beta)
@@ -416,7 +416,7 @@ SearchResult select_best_thread(ThreadData threadDatas[], int numThreads) {
     struct MoveVote {
         int move = 0;
         long long votes = 0;
-        int best_score = -INFINITY;
+        int best_score = -SEARCH_INFINITY;
         int best_depth = 0;
         int thread_id = 0;
         int pv_length = 0;
@@ -425,7 +425,7 @@ SearchResult select_best_thread(ThreadData threadDatas[], int numThreads) {
 
     SearchResult result;
     std::vector<MoveVote> moveVotes;
-    int worstScore = INFINITY;
+    int worstScore = SEARCH_INFINITY;
     bool foundCandidate = false;
     bool exactResultAvailable = false;
 

@@ -322,29 +322,32 @@ void init_magic_nums()
 }
 
 // is <square> under attacked by <side> pieces
-bool is_square_under_attack(thrawn::Position* pos, int square, int side)
+bool is_square_under_attack(const thrawn::Position* pos, int square, int side)
 {
-    // Attacked by white pawns
     if ((side == white) && (pos->pawn_attacks[black][square] & pos->piece_bitboards[P]))
         return true;
 
-    // Attacked by black pawns
     if ((side == black) && (pos->pawn_attacks[white][square] & pos->piece_bitboards[p]))
         return true;
 
-    if (pos->knight_attacks[square] & ((side == white) ? pos->piece_bitboards[N] : pos->piece_bitboards[n]))
+    const uint64_t knights = (side == white) ? pos->piece_bitboards[N] : pos->piece_bitboards[n];
+    if (pos->knight_attacks[square] & knights)
         return true;
 
-    if (get_bishop_attacks(pos, square, pos->occupancies[both]) & ((side == white) ? pos->piece_bitboards[B] : pos->piece_bitboards[b]))
+    const uint64_t diagonal_sliders = (side == white)
+        ? (pos->piece_bitboards[B] | pos->piece_bitboards[Q])
+        : (pos->piece_bitboards[b] | pos->piece_bitboards[q]);
+    if (get_bishop_attacks(pos, square, pos->occupancies[both]) & diagonal_sliders)
         return true;
 
-    if (get_rook_attacks(pos, square, pos->occupancies[both]) & ((side == white) ? pos->piece_bitboards[R] : pos->piece_bitboards[r]))
+    const uint64_t orthogonal_sliders = (side == white)
+        ? (pos->piece_bitboards[R] | pos->piece_bitboards[Q])
+        : (pos->piece_bitboards[r] | pos->piece_bitboards[q]);
+    if (get_rook_attacks(pos, square, pos->occupancies[both]) & orthogonal_sliders)
         return true;
 
-    if (get_queen_attacks(pos, square, pos->occupancies[both]) & ((side == white) ? pos->piece_bitboards[Q] : pos->piece_bitboards[q]))
-        return true;
-
-    if (pos->king_attacks[square] & ((side == white) ? pos->piece_bitboards[K] : pos->piece_bitboards[k]))
+    const uint64_t king = (side == white) ? pos->piece_bitboards[K] : pos->piece_bitboards[k];
+    if (pos->king_attacks[square] & king)
         return true;
 
     return false;

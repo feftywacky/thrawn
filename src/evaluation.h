@@ -37,9 +37,9 @@ extern const int open_file_score;
 extern const int bishop_mobility_unit;
 extern const int queen_mobility_unit;
 
-extern const int bishop_mobility_middlegame;
+extern const int bishop_mobility_opening;
 extern const int bishop_mobility_endgame;
-extern const int queen_mobility_middlegame;
+extern const int queen_mobility_opening;
 extern const int queen_mobility_endgame;
 
 

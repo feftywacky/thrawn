@@ -1414,7 +1414,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                  int beta, int excludedMove)
 {
     int score = 0;
-    int bestScore = -INFINITY;
+    int bestScore = -SEARCH_INFINITY;
     int bestMove = 0;
     int hashFlag = BOUND_UPPER;
     int static_eval = 0;
@@ -1785,7 +1785,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 SEARCH_SINGULAR_EXTENSION_BASE_MARGIN +
                 SEARCH_SINGULAR_EXTENSION_DEPTH_FACTOR * depth;
             const int singularBeta =
-                std::max(-INFINITY + 1, std::min(INFINITY - 1,
+                std::max(-SEARCH_INFINITY + 1, std::min(SEARCH_INFINITY - 1,
                                                  ttScore - singularMargin));
             const int singularDepth = std::max(1, (depth - 1) / 2);
 
@@ -2091,7 +2091,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
 
     int valid_moves = 0;
     int bestMove = 0;
-    int bestScore = inCheck ? -INFINITY : alpha;
+    int bestScore = inCheck ? -SEARCH_INFINITY : alpha;
 
     PickedMove picked;
     while (movePicker.next(picked))

@@ -1,13 +1,11 @@
 #include "perft.h"
 #include "move_generator.h"
-#include "move_helpers.h"
 #include "constants.h"
-#include "bitboard_helpers.h"
-#include "zobrist_hashing.h"
 #include "position.h"
 #include "fen.h"
 
 #include <chrono>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -25,56 +23,79 @@ const string BLUE    = "\033[34m";
 const string MAGENTA = "\033[35m";
 const string CYAN    = "\033[36m";
 
-long leaf_nodes = 0;
+namespace {
 
-void perft_search(thrawn::Position* pos, int depth) {
-    if (depth == 0) {
-        leaf_nodes++;
-        return;
-    }
+std::uint64_t perft_nodes(thrawn::Position* pos, int depth)
+{
+    if (depth == 0)
+        return 1;
 
     MoveList moves;
     generate_moves(pos, all_moves, moves);
-    for (int move : moves) {
+    std::uint64_t nodes = 0;
+
+    for (int move : moves)
+    {
         pos->ply++;
-        if (!make_move_on_board(pos, move, all_moves, pos->ply))
+        if (!make_move_for_perft(pos, move, pos->ply))
         {
             pos->ply--;
             continue;
         }
 
-        perft_search(pos, depth - 1);
+        if (depth == 1)
+            nodes++;
+        else
+            nodes += perft_nodes(pos, depth - 1);
+
         unmake_move(pos, pos->ply);
         pos->ply--;
     }
+
+    return nodes;
 }
 
-int perft_test(thrawn::Position* pos, int depth) {
-    MoveList moves;
-    generate_moves(pos, all_moves, moves);
-    size_t total_moves = moves.size();
-    size_t moves_processed = 0;
+} // namespace
 
-    auto start = std::chrono::high_resolution_clock::now();
+std::uint64_t perft_search(thrawn::Position* pos, int depth)
+{
+    return perft_nodes(pos, depth);
+}
+
+std::uint64_t perft_test(thrawn::Position* pos, int depth) {
+    std::uint64_t leaf_nodes = 0;
 
     cout << BLUE << "\n===== PERFT TEST (Depth: " << depth << ") =====" << RESET << "\n";
 
+    auto start = std::chrono::high_resolution_clock::now();
+
+    MoveList moves;
+    generate_moves(pos, all_moves, moves);
+    const size_t total_moves = moves.size();
+    size_t moves_processed = 0;
+
     for (int move : moves) {
+        moves_processed++;
         pos->ply++;
-        if (!make_move_on_board(pos, move, all_moves, pos->ply))
+        if (!make_move_for_perft(pos, move, pos->ply))
         {
             pos->ply--;
-            continue;
+        }
+        else
+        {
+            if (depth <= 1)
+                leaf_nodes++;
+            else
+                leaf_nodes += perft_nodes(pos, depth - 1);
+            unmake_move(pos, pos->ply);
+            pos->ply--;
         }
 
-        perft_search(pos, depth - 1);
-        unmake_move(pos, pos->ply);
-        pos->ply--;
-        moves_processed++;
-
         // Update the progress bar
-        int bar_width = 30;
-        int progress = static_cast<int>((static_cast<float>(moves_processed) / total_moves) * bar_width);
+        const int bar_width = 30;
+        const int progress = total_moves == 0
+            ? bar_width
+            : static_cast<int>((static_cast<double>(moves_processed) / total_moves) * bar_width);
         cout << "\r" << CYAN << "Progress: [" << RESET;
         for (int i = 0; i < bar_width; ++i) {
             if (i < progress)
@@ -84,13 +105,16 @@ int perft_test(thrawn::Position* pos, int depth) {
             else
                 cout << " ";
         }
-        cout << CYAN << "] " << RESET << (moves_processed * 100 / total_moves) << "%" << std::flush;
+        const size_t percent = total_moves == 0 ? 100 : (moves_processed * 100 / total_moves);
+        cout << CYAN << "] " << RESET << percent << "%" << std::flush;
     }
     cout << "\n";
 
     auto duration = std::chrono::high_resolution_clock::now() - start;
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-    double nodes_per_sec = (leaf_nodes * 1000.0) / duration_ms;
+    const auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+    const auto duration_ms = duration_us / 1000;
+    const double elapsed_ms = duration_us / 1000.0;
+    const double nodes_per_sec = elapsed_ms > 0.0 ? (leaf_nodes * 1000.0) / elapsed_ms : 0.0;
 
     cout << YELLOW << "\n===== Perft Results =====" << RESET << "\n";
     cout << "Depth:          " << depth << "\n";
@@ -100,19 +124,17 @@ int perft_test(thrawn::Position* pos, int depth) {
     cout << "Nodes per Sec:  " << nodes_per_sec << "\n";
     cout << YELLOW << "=========================" << RESET << "\n\n";
 
-    int result = leaf_nodes;
-    leaf_nodes = 0;  // Reset for next test
-    return result;
+    return leaf_nodes;
 }
 
 void perft_run_unit_tests() {
     thrawn::Position p;
-    int output_nodes = 0;
+    std::uint64_t output_nodes = 0;
 
     struct Test {
         const char* fen;
         int depth;
-        long long expected_nodes;
+        std::uint64_t expected_nodes;
     };
 
     // Define your test cases (make sure these FEN strings and expected values are correct)
@@ -127,8 +149,8 @@ void perft_run_unit_tests() {
 
     int total_tests = sizeof(tests) / sizeof(Test);
     int pass_count = 0;
-    long total_nodes_accumulated = 0;
-    long total_time_ms_accumulated = 0;
+    std::uint64_t total_nodes_accumulated = 0;
+    std::uint64_t total_time_ms_accumulated = 0;
 
     cout << MAGENTA << "\n========================================" << RESET << "\n";
     cout << MAGENTA << "         PERFT UNIT TESTS             " << RESET << "\n";
@@ -164,7 +186,7 @@ void perft_run_unit_tests() {
     double overall_avg_nps = (total_nodes_accumulated * 1000.0) / total_time_ms_accumulated;
     string performance_rating;
     if (overall_avg_nps >= 200e6)
-        performance_rating = "FUCKING FAST ALRIGHT";
+        performance_rating = "Elite";
     else if (overall_avg_nps >= 100e6)
         performance_rating = "Blazingly FAST";
     else if (overall_avg_nps >= 50e6)

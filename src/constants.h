@@ -11,7 +11,7 @@ using namespace std;
 // ----------------------------------------
 // Some constants used in the search
 // ----------------------------------------
-#define INFINITY 50000
+constexpr int SEARCH_INFINITY = 50000;
 #define mateVal 49000
 #define mateScore 48000
 #define MAX_DEPTH 64

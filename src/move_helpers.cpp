@@ -1,7 +1,8 @@
-#include <iostream>
-#include <vector>
-#include "constants.h"
 #include "move_helpers.h"
+
+#include "constants.h"
+
+#include <iostream>
 
 /* 
  * METHODS BELOW ENCODE AND DECODED MOVE NUMBER 

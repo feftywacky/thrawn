@@ -1,18 +1,28 @@
-#include <iostream>
-#include <vector>
 #include "move_generator.h"
 #include "bitboard.h"
 #include "constants.h"
 #include "bitboard_helpers.h"
 #include "move_helpers.h"
 #include "nnue.h"
-#include "zobrist_hashing.h"
-#include "search.h"
 #include "position.h"
 
-using namespace std;
-
 namespace {
+
+constexpr uint64_t rank_1 = 0xFF00000000000000ULL;
+constexpr uint64_t rank_3 = 0x0000FF0000000000ULL;
+constexpr uint64_t rank_6 = 0x0000000000FF0000ULL;
+constexpr uint64_t rank_8 = 0x00000000000000FFULL;
+
+void parse_white_pawn_moves(const thrawn::Position* pos, uint64_t pawns, MoveList& moves, int move_type);
+void parse_black_pawn_moves(const thrawn::Position* pos, uint64_t pawns, MoveList& moves, int move_type);
+void parse_knight_moves(const thrawn::Position* pos, uint64_t pieces, int piece, uint64_t friends, uint64_t enemies, MoveList& moves, int move_type);
+void parse_bishop_moves(const thrawn::Position* pos, uint64_t pieces, int piece, uint64_t friends, uint64_t enemies, MoveList& moves, int move_type);
+void parse_rook_moves(const thrawn::Position* pos, uint64_t pieces, int piece, uint64_t friends, uint64_t enemies, MoveList& moves, int move_type);
+void parse_queen_moves(const thrawn::Position* pos, uint64_t pieces, int piece, uint64_t friends, uint64_t enemies, MoveList& moves, int move_type);
+void parse_king_moves(const thrawn::Position* pos, uint64_t pieces, int piece, uint64_t friends, uint64_t enemies, MoveList& moves, int move_type);
+void parse_white_castle_moves(const thrawn::Position* pos, MoveList& moves);
+void parse_black_castle_moves(const thrawn::Position* pos, MoveList& moves);
+int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool update_nnue);
 
 inline void append_moves_from_attacks(int source,
                                       int piece,
@@ -21,7 +31,7 @@ inline void append_moves_from_attacks(int source,
                                       MoveList& moves,
                                       int move_type)
 {
-    if (move_type != only_quiets)
+    if (move_type == only_captures || move_type == only_checks)
     {
         uint64_t captures = attacks & enemies;
         while (captures)
@@ -29,9 +39,10 @@ inline void append_moves_from_attacks(int source,
             const int target = pop_lsb(captures);
             moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
         }
+        return;
     }
 
-    if (move_type == all_moves || move_type == only_quiets)
+    if (move_type == only_quiets)
     {
         uint64_t quiets = attacks & ~enemies;
         while (quiets)
@@ -39,7 +50,70 @@ inline void append_moves_from_attacks(int source,
             const int target = pop_lsb(quiets);
             moves.push_back(parse_move(source, target, piece, 0, 0, 0, 0, 0));
         }
+        return;
     }
+
+    uint64_t captures = attacks & enemies;
+    uint64_t quiets = attacks ^ captures;
+    while (captures)
+    {
+        const int target = pop_lsb(captures);
+        moves.push_back(parse_move(source, target, piece, 0, 1, 0, 0, 0));
+    }
+    while (quiets)
+    {
+        const int target = pop_lsb(quiets);
+        moves.push_back(parse_move(source, target, piece, 0, 0, 0, 0, 0));
+    }
+}
+
+inline void append_promotions(int source, int target, int piece, int queen, int rook_piece,
+                              int knight, int bishop_piece, int capture, MoveList& moves)
+{
+    moves.push_back(parse_move(source, target, piece, queen, capture, 0, 0, 0));
+    moves.push_back(parse_move(source, target, piece, rook_piece, capture, 0, 0, 0));
+    moves.push_back(parse_move(source, target, piece, knight, capture, 0, 0, 0));
+    moves.push_back(parse_move(source, target, piece, bishop_piece, capture, 0, 0, 0));
+}
+
+inline void append_white_pawn_capture(int source, int target, MoveList& moves)
+{
+    if (target <= h8)
+        append_promotions(source, target, P, Q, R, N, B, 1, moves);
+    else
+        moves.push_back(parse_move(source, target, P, 0, 1, 0, 0, 0));
+}
+
+inline void append_black_pawn_capture(int source, int target, MoveList& moves)
+{
+    if (target >= a1)
+        append_promotions(source, target, p, q, r, n, b, 1, moves);
+    else
+        moves.push_back(parse_move(source, target, p, 0, 1, 0, 0, 0));
+}
+
+inline int captured_piece_on(const thrawn::Position* pos, int side, uint64_t square)
+{
+    if (side == white)
+    {
+        if (pos->piece_bitboards[P] & square) return P;
+        if (pos->piece_bitboards[N] & square) return N;
+        if (pos->piece_bitboards[B] & square) return B;
+        if (pos->piece_bitboards[R] & square) return R;
+        if (pos->piece_bitboards[Q] & square) return Q;
+        if (pos->piece_bitboards[K] & square) return K;
+    }
+    else
+    {
+        if (pos->piece_bitboards[p] & square) return p;
+        if (pos->piece_bitboards[n] & square) return n;
+        if (pos->piece_bitboards[b] & square) return b;
+        if (pos->piece_bitboards[r] & square) return r;
+        if (pos->piece_bitboards[q] & square) return q;
+        if (pos->piece_bitboards[k] & square) return k;
+    }
+
+    return -1;
 }
 
 inline int piece_side(int piece)
@@ -66,21 +140,13 @@ inline thrawn::UndoData* save_undo(thrawn::Position* pos, int move, int ply)
 } // namespace
 
 
-vector<int> generate_moves(thrawn::Position* pos)
-{
-    return generate_moves(pos, all_moves);
-}
-
-vector<int> generate_moves(thrawn::Position* pos, int move_type)
-{
-    MoveList moveList;
-    generate_moves(pos, move_type, moveList);
-    return vector<int>(moveList.begin(), moveList.end());
-}
-
 void generate_moves(thrawn::Position* pos, int move_type, MoveList& moves)
 {
     moves.clear();
+
+    const int side = pos->colour_to_move;
+    const uint64_t friends = pos->occupancies[side];
+    const uint64_t enemies = pos->occupancies[side ^ 1];
 
     if (pos->colour_to_move == white)
     {
@@ -88,22 +154,22 @@ void generate_moves(thrawn::Position* pos, int move_type, MoveList& moves)
         parse_white_pawn_moves(pos, curr, moves, move_type);
 
         curr = pos->piece_bitboards[N];
-        parse_knight_moves(pos, curr, N, moves, move_type);
+        parse_knight_moves(pos, curr, N, friends, enemies, moves, move_type);
 
         curr = pos->piece_bitboards[B];
-        parse_bishop_moves(pos, curr, B, moves, move_type);
+        parse_bishop_moves(pos, curr, B, friends, enemies, moves, move_type);
 
         curr = pos->piece_bitboards[R];
-        parse_rook_moves(pos, curr, R, moves, move_type);
+        parse_rook_moves(pos, curr, R, friends, enemies, moves, move_type);
 
         curr = pos->piece_bitboards[Q];
-        parse_queen_moves(pos, curr, Q, moves, move_type);
+        parse_queen_moves(pos, curr, Q, friends, enemies, moves, move_type);
 
         if (move_type == all_moves || move_type == only_quiets)
             parse_white_castle_moves(pos, moves);
 
         curr = pos->piece_bitboards[K];
-        parse_king_moves(pos, curr, K, moves, move_type);
+        parse_king_moves(pos, curr, K, friends, enemies, moves, move_type);
     }
     else
     {
@@ -111,108 +177,91 @@ void generate_moves(thrawn::Position* pos, int move_type, MoveList& moves)
         parse_black_pawn_moves(pos, curr, moves, move_type);
 
         curr = pos->piece_bitboards[n];
-        parse_knight_moves(pos, curr, n, moves, move_type);
+        parse_knight_moves(pos, curr, n, friends, enemies, moves, move_type);
 
         curr = pos->piece_bitboards[b];
-        parse_bishop_moves(pos, curr, b, moves, move_type);
+        parse_bishop_moves(pos, curr, b, friends, enemies, moves, move_type);
 
         curr = pos->piece_bitboards[r];
-        parse_rook_moves(pos, curr, r, moves, move_type);
+        parse_rook_moves(pos, curr, r, friends, enemies, moves, move_type);
 
         curr = pos->piece_bitboards[q];
-        parse_queen_moves(pos, curr, q, moves, move_type);
+        parse_queen_moves(pos, curr, q, friends, enemies, moves, move_type);
 
         if (move_type == all_moves || move_type == only_quiets)
             parse_black_castle_moves(pos, moves);
 
         curr = pos->piece_bitboards[k];
-        parse_king_moves(pos, curr, k, moves, move_type);
+        parse_king_moves(pos, curr, k, friends, enemies, moves, move_type);
     }
 }
 
-void parse_white_pawn_moves(thrawn::Position* pos, uint64_t& curr, MoveList& moves, int move_type)
+namespace {
+
+void parse_white_pawn_moves(const thrawn::Position* pos, uint64_t pawns, MoveList& moves, int move_type)
 {
-    while (curr)
+    const uint64_t empty = ~pos->occupancies[both];
+
+    if (move_type == all_moves || move_type == only_quiets)
     {
-        int source = pop_lsb(curr);
-        int target = source - 8; // go up one square
-
-        if (target>=a8 && !get_bit(pos->occupancies[both], target))
+        uint64_t pushes = (pawns >> 8) & empty;
+        uint64_t quiets = pushes & ~rank_8;
+        while (quiets)
         {
-            // pawn promotion by going up one square (NOT TAKING A PIECE)
-            if (source>=a7 && source<=h7)
-            {
-                if (move_type != only_quiets)
-                {
-                    moves.push_back(parse_move(source, target, P, Q, 0, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, P, R, 0, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, P, N, 0, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, P, B, 0, 0, 0, 0));
-                }
-            }
-
-            // one square and two square pawn moves
-            else if (move_type == all_moves || move_type == only_quiets)
-            {
-                // one square
-                moves.push_back(parse_move(source, target, P, 0, 0, 0, 0, 0));
-
-                // two square
-                if (source>=a2 && source<=h2 && !get_bit(pos->occupancies[both], target-8))
-                {
-                    moves.push_back(parse_move(source, target-8, P, 0, 0, 1, 0, 0));
-                }
-            }
+            const int target = pop_lsb(quiets);
+            moves.push_back(parse_move(target + 8, target, P, 0, 0, 0, 0, 0));
         }
 
-        if (move_type != only_quiets)
+        uint64_t doubles = ((pushes & rank_3) >> 8) & empty;
+        while (doubles)
         {
-            uint64_t attacks = pos->pawn_attacks[pos->colour_to_move][source]  & pos->occupancies[black];
+            const int target = pop_lsb(doubles);
+            moves.push_back(parse_move(target + 16, target, P, 0, 0, 1, 0, 0));
+        }
+    }
 
-            while (attacks) // while attacks squares are present on the board
-            {   
-                target = pop_lsb(attacks);
+    if (move_type == only_quiets)
+        return;
 
-                if (source>=a7 && source<=h7) // pawn promotions by capturing a piece
-                {
-                    moves.push_back(parse_move(source, target, P, Q, 1, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, P, R, 1, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, P, N, 1, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, P, B, 1, 0, 0, 0));
-                }
+    uint64_t promotions = ((pawns >> 8) & empty) & rank_8;
+    while (promotions)
+    {
+        const int target = pop_lsb(promotions);
+        append_promotions(target + 8, target, P, Q, R, N, B, 0, moves);
+    }
 
-                // diagonal pawn capture
-                else
-                {
-                    moves.push_back(parse_move(source, target, P, 0, 1, 0, 0, 0));
-                }
+    uint64_t captures = ((pawns >> 7) & not_a_file) & pos->occupancies[black];
+    while (captures)
+    {
+        const int target = pop_lsb(captures);
+        append_white_pawn_capture(target + 7, target, moves);
+    }
 
-            }
+    captures = ((pawns >> 9) & not_h_file) & pos->occupancies[black];
+    while (captures)
+    {
+        const int target = pop_lsb(captures);
+        append_white_pawn_capture(target + 9, target, moves);
+    }
 
-            // enpassant
-            if (pos->enpassant!=null_sq)
-            {
-                
-                uint64_t enpassant_attacks = pos->pawn_attacks[pos->colour_to_move][source] & (1ULL << pos->enpassant);
-                if (enpassant_attacks)
-                {
-                    int enpassant_target = get_lsb_index(enpassant_attacks);
-                    moves.push_back(parse_move(source, enpassant_target, P, 0, 1, 0, 1, 0));
-                }
-            }
+    if (pos->enpassant != null_sq)
+    {
+        uint64_t attackers = pos->pawn_attacks[black][pos->enpassant] & pawns;
+        while (attackers)
+        {
+            const int source = pop_lsb(attackers);
+            moves.push_back(parse_move(source, pos->enpassant, P, 0, 1, 0, 1, 0));
         }
     }
 }
 
-void parse_white_castle_moves(thrawn::Position* pos, MoveList& moves)
+void parse_white_castle_moves(const thrawn::Position* pos, MoveList& moves)
 {
     if (pos->castle_rights & wks)
     {
         if (!get_bit(pos->occupancies[both], f1) && !get_bit(pos->occupancies[both], g1))
         {
-            // make sure can't castle through check
-            // if (!is_square_under_attack(e8, white) && !is_square_under_attack(f1, black) && !is_square_under_attack(g1, black))
-            if (!is_square_under_attack(pos,e1, black) && !is_square_under_attack(pos,f1, black))
+            if (!is_square_under_attack(pos, e1, black) && !is_square_under_attack(pos, f1, black))
                 moves.push_back(parse_move(e1, g1, K, 0, 0, 0, 0, 1));
         }
     }
@@ -220,94 +269,76 @@ void parse_white_castle_moves(thrawn::Position* pos, MoveList& moves)
     {
         if (!get_bit(pos->occupancies[both], b1) && !get_bit(pos->occupancies[both], c1) && !get_bit(pos->occupancies[both], d1))
         {
-            // make sure can't castle through check
-            // if (!is_square_under_attack(e1, black) && !is_square_under_attack(c1, black) && !is_square_under_attack(d1, black))
-            if (!is_square_under_attack(pos,e1, black) && !is_square_under_attack(pos,d1, black))
+            if (!is_square_under_attack(pos, e1, black) && !is_square_under_attack(pos, d1, black))
                 moves.push_back(parse_move(e1, c1, K, 0, 0, 0, 0, 1));
         }
     }
 }
 
-void parse_black_pawn_moves(thrawn::Position* pos, uint64_t& curr, MoveList& moves, int move_type)
+void parse_black_pawn_moves(const thrawn::Position* pos, uint64_t pawns, MoveList& moves, int move_type)
 {
-    while(curr) // while white pawns are present on the board
+    const uint64_t empty = ~pos->occupancies[both];
+
+    if (move_type == all_moves || move_type == only_quiets)
     {
-        int source = pop_lsb(curr);
-        int target = source + 8; // go down one square
-
-        if (target<=h1 && !get_bit(pos->occupancies[both], target))
+        uint64_t pushes = (pawns << 8) & empty;
+        uint64_t quiets = pushes & ~rank_1;
+        while (quiets)
         {
-            // pawn promotion by going down one square (NOT TAKING A PIECE)
-            if (source>=a2 && source<=h2)
-            {
-                if (move_type != only_quiets)
-                {
-                    moves.push_back(parse_move(source, target, p, q, 0, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, p, r, 0, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, p, n, 0, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, p, b, 0, 0, 0, 0));
-                }
-            }
-
-            // one square and two square pawn moves
-            else if (move_type == all_moves || move_type == only_quiets)
-            {
-                // one square
-                moves.push_back(parse_move(source, target, p, 0, 0, 0, 0, 0));
-
-                // two square
-                if (source>=a7 && source<=h7 && !get_bit(pos->occupancies[both], target+8))
-                    moves.push_back(parse_move(source, target+8, p, 0, 0, 1, 0, 0));
-            }
+            const int target = pop_lsb(quiets);
+            moves.push_back(parse_move(target - 8, target, p, 0, 0, 0, 0, 0));
         }
 
-        if (move_type != only_quiets)
+        uint64_t doubles = ((pushes & rank_6) << 8) & empty;
+        while (doubles)
         {
-            uint64_t attacks = pos->pawn_attacks[pos->colour_to_move][source] & pos->occupancies[white];
+            const int target = pop_lsb(doubles);
+            moves.push_back(parse_move(target - 16, target, p, 0, 0, 1, 0, 0));
+        }
+    }
 
-            while (attacks) // while attacks squares are present on the board
-            {   
-                target = pop_lsb(attacks);
+    if (move_type == only_quiets)
+        return;
 
-                if (source>=a2 && source<=h2) // pawn promotion by capturing piece
-                {
-                    moves.push_back(parse_move(source, target, p, q, 1, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, p, r, 1, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, p, n, 1, 0, 0, 0));
-                    moves.push_back(parse_move(source, target, p, b, 1, 0, 0, 0));
-                }
+    uint64_t promotions = ((pawns << 8) & empty) & rank_1;
+    while (promotions)
+    {
+        const int target = pop_lsb(promotions);
+        append_promotions(target - 8, target, p, q, r, n, b, 0, moves);
+    }
 
-                // diagonal pawn capture
-                else
-                {
-                    moves.push_back(parse_move(source, target, p, 0, 1, 0, 0, 0));
-                }
+    uint64_t captures = ((pawns << 7) & not_h_file) & pos->occupancies[white];
+    while (captures)
+    {
+        const int target = pop_lsb(captures);
+        append_black_pawn_capture(target - 7, target, moves);
+    }
 
-            }
+    captures = ((pawns << 9) & not_a_file) & pos->occupancies[white];
+    while (captures)
+    {
+        const int target = pop_lsb(captures);
+        append_black_pawn_capture(target - 9, target, moves);
+    }
 
-            // enpassant
-            if (pos->enpassant!=null_sq)
-            {   
-                uint64_t enpassant_attacks = pos->pawn_attacks[pos->colour_to_move][source] & (1ULL << pos->enpassant);
-                if (enpassant_attacks)
-                {
-                    int enpassant_target = get_lsb_index(enpassant_attacks);
-                    moves.push_back(parse_move(source, enpassant_target, p, 0, 1, 0, 1, 0));
-                }
-            }
+    if (pos->enpassant != null_sq)
+    {
+        uint64_t attackers = pos->pawn_attacks[white][pos->enpassant] & pawns;
+        while (attackers)
+        {
+            const int source = pop_lsb(attackers);
+            moves.push_back(parse_move(source, pos->enpassant, p, 0, 1, 0, 1, 0));
         }
     }
 }
 
-void parse_black_castle_moves(thrawn::Position* pos, MoveList& moves)
+void parse_black_castle_moves(const thrawn::Position* pos, MoveList& moves)
 {
     if (pos->castle_rights & bks)
     {
         if (!get_bit(pos->occupancies[both], f8) && !get_bit(pos->occupancies[both], g8))
         {
-            // pruend by make_move() for g8
-            // if (!is_square_under_attack(e8, white) && !is_square_under_attack(f8, white) && !is_square_under_attack(g8, white))
-            if (!is_square_under_attack(pos,e8, white) && !is_square_under_attack(pos,f8, white))
+            if (!is_square_under_attack(pos, e8, white) && !is_square_under_attack(pos, f8, white))
                 moves.push_back(parse_move(e8, g8, k, 0, 0, 0, 0, 1));
         }
     }
@@ -315,85 +346,73 @@ void parse_black_castle_moves(thrawn::Position* pos, MoveList& moves)
     {
         if (!get_bit(pos->occupancies[both], b8) && !get_bit(pos->occupancies[both], c8) && !get_bit(pos->occupancies[both], d8))
         {
-            // pruend by make_move() 
-            // if (!is_square_under_attack(e8, white) && !is_square_under_attack(c8, white) && !is_square_under_attack(d8, white))
-            if (!is_square_under_attack(pos, e8, white) && !is_square_under_attack(pos,d8, white))
+            if (!is_square_under_attack(pos, e8, white) && !is_square_under_attack(pos, d8, white))
                 moves.push_back(parse_move(e8, c8, k, 0, 0, 0, 0, 1));
         }
     }
 }
 
-void parse_knight_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
+void parse_knight_moves(const thrawn::Position* pos, uint64_t pieces, int piece,
+                        uint64_t friends, uint64_t enemies, MoveList& moves, int move_type)
 {
-    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
-    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
-
-    while (curr)
+    while (pieces)
     {
-        const int source = pop_lsb(curr);
+        const int source = pop_lsb(pieces);
         const uint64_t attacks = pos->knight_attacks[source] & ~friends;
         append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     }
 }
 
-void parse_bishop_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
+void parse_bishop_moves(const thrawn::Position* pos, uint64_t pieces, int piece,
+                        uint64_t friends, uint64_t enemies, MoveList& moves, int move_type)
 {
-    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
-    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
-
-    while(curr)
+    while (pieces)
     {
-        const int source = pop_lsb(curr);
+        const int source = pop_lsb(pieces);
         const uint64_t attacks = get_bishop_attacks(pos, source, pos->occupancies[both]) & ~friends;
         append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     } 
 }
 
-void parse_rook_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
+void parse_rook_moves(const thrawn::Position* pos, uint64_t pieces, int piece,
+                      uint64_t friends, uint64_t enemies, MoveList& moves, int move_type)
 {
-    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
-    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
-
-    while(curr)
+    while (pieces)
     {
-        const int source = pop_lsb(curr);
+        const int source = pop_lsb(pieces);
         const uint64_t attacks = get_rook_attacks(pos, source, pos->occupancies[both]) & ~friends;
         append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     }
 }
 
-void parse_queen_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
+void parse_queen_moves(const thrawn::Position* pos, uint64_t pieces, int piece,
+                       uint64_t friends, uint64_t enemies, MoveList& moves, int move_type)
 {
-    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
-    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
-
-    while (curr)
+    while (pieces)
     {
-        const int source = pop_lsb(curr);
+        const int source = pop_lsb(pieces);
         const uint64_t attacks = get_queen_attacks(pos, source, pos->occupancies[both]) & ~friends;
         append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     }
 }
 
-void parse_king_moves(thrawn::Position* pos, uint64_t& curr, const int& piece, MoveList& moves, int move_type)
+void parse_king_moves(const thrawn::Position* pos, uint64_t pieces, int piece,
+                      uint64_t friends, uint64_t enemies, MoveList& moves, int move_type)
 {
-    const uint64_t friends = (pos->colour_to_move == white) ? pos->occupancies[white] : pos->occupancies[black];
-    const uint64_t enemies = (pos->colour_to_move == white) ? pos->occupancies[black] : pos->occupancies[white];
-
-    while (curr)
+    while (pieces)
     {
-        const int source = pop_lsb(curr);
+        const int source = pop_lsb(pieces);
         const uint64_t attacks = pos->king_attacks[source] & ~friends;
         append_moves_from_attacks(source, piece, attacks, enemies, moves, move_type);
     }
 }
 
-int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
+int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool update_nnue)
 {
     if (move_type == only_captures)
     {
         if (get_is_capture_move(move) || get_promoted_piece(move))
-            return make_move_on_board(pos, move, all_moves, ply);
+            return make_move_impl(pos, move, all_moves, ply, update_nnue);
 
         return 0;
     }
@@ -420,7 +439,7 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
     const uint64_t source_bb = square_bb(source);
     const uint64_t target_bb = square_bb(target);
     const int nnue_ply = (stack_ply >= 0) ? stack_ply : pos->ply;
-    const bool use_nnue = nnue_loaded();
+    const bool use_nnue = update_nnue && nnue_loaded();
 
     const int opponent_king = (moving_side == white) ? k : K;
     if (is_capture_move && get_bit(pos->piece_bitboards[opponent_king], target))
@@ -445,26 +464,20 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
     {
         pos->fifty_move = 0;
 
-        const int start_piece = (moving_side == white) ? p : P;
-        const int end_piece = (moving_side == white) ? k : K;
-
-        for (int captured = start_piece; captured <= end_piece; captured++)
+        const int captured = enpassant_move ? -1 : captured_piece_on(pos, enemy_side, target_bb);
+        if (captured != -1)
         {
-            if (get_bit(pos->piece_bitboards[captured], target))
+            if (undo != nullptr)
             {
-                if (undo != nullptr)
-                {
-                    undo->captured_piece = captured;
-                    undo->captured_square = target;
-                }
-
-                pop_bit(pos->piece_bitboards[captured], target);
-                pos->occupancies[enemy_side] &= ~target_bb;
-                pos->zobristKey ^= pos->piece_hashkey[captured][target];
-                if (use_nnue)
-                    nnue_remove_piece(pos, nnue_ply, captured, target);
-                break;
+                undo->captured_piece = captured;
+                undo->captured_square = target;
             }
+
+            pop_bit(pos->piece_bitboards[captured], target);
+            pos->occupancies[enemy_side] &= ~target_bb;
+            pos->zobristKey ^= pos->piece_hashkey[captured][target];
+            if (use_nnue)
+                nnue_remove_piece(pos, nnue_ply, captured, target);
         }
     }
 
@@ -577,9 +590,11 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
     pos->colour_to_move ^= 1;
     pos->zobristKey ^= pos->colour_to_move_hashkey;
 
-    const int moved_king_square = (moving_side == white)
-        ? get_lsb_index(pos->piece_bitboards[K])
-        : get_lsb_index(pos->piece_bitboards[k]);
+    const int moved_king_square = (piece == K || piece == k)
+        ? target
+        : ((moving_side == white)
+            ? get_lsb_index(pos->piece_bitboards[K])
+            : get_lsb_index(pos->piece_bitboards[k]));
 
     if (is_square_under_attack(pos, moved_king_square, enemy_side))
     {
@@ -588,8 +603,21 @@ int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
         return 0;
     }
 
-    nnue_debug_check(pos);
+    if (use_nnue)
+        nnue_debug_check(pos);
     return 1;
+}
+
+} // namespace
+
+int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
+{
+    return make_move_impl(pos, move, move_type, ply, true);
+}
+
+int make_move_for_perft(thrawn::Position* pos, int move, int ply)
+{
+    return make_move_impl(pos, move, all_moves, ply, false);
 }
 
 void unmake_move(thrawn::Position* pos, int ply)

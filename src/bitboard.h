@@ -76,7 +76,7 @@ inline uint64_t get_queen_attacks(const thrawn::Position* pos, int square, uint6
 // set occupancy
 uint64_t set_occupancy(const int& index, const int& bits_in_mask, uint64_t attack_mask);
 
-bool is_square_under_attack(thrawn::Position* pos,int square, int side);
+bool is_square_under_attack(const thrawn::Position* pos, int square, int side);
 
 
 // MAGIC NUMBERS AND BITBOARDS

@@ -1,15 +1,10 @@
-#ifndef ENGINE_H
-#define ENGINE_H
+#ifndef MOVE_GENERATOR_H
+#define MOVE_GENERATOR_H
 
-#include <cstdint>
-#include <iostream>
-#include <map>
-#include <set>
 #include <array>
-#include <vector>
-#include "bitboard.h"
+#include <cstdint>
 
-using namespace std;
+#include "position.h"
 
 constexpr int MAX_GENERATED_MOVES = 256;
 
@@ -26,6 +21,7 @@ struct MoveList {
         : consumer(consumer), consumerContext(context) {}
 
     void clear() { count = 0; }
+
     void push_back(int move) {
         if (consumer) {
             consumer(move, consumerContext);
@@ -45,27 +41,14 @@ struct MoveList {
     const int& operator[](int index) const { return moves[index]; }
 };
 
-vector<int> generate_moves(thrawn::Position* pos);
-vector<int> generate_moves(thrawn::Position* pos, int move_type);
 void generate_moves(thrawn::Position* pos, int move_type, MoveList& moves);
-
 
 int make_move(thrawn::Position* pos, int move, int move_type, int ply);
 int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply);
+int make_move_for_perft(thrawn::Position* pos, int move, int ply);
 int make_root_move(thrawn::Position* pos, int move, int move_type);
 void unmake_move(thrawn::Position* pos, int ply);
 void make_null_move(thrawn::Position* pos, int ply);
 void unmake_null_move(thrawn::Position* pos, int ply);
-    
-    
-void parse_white_pawn_moves(thrawn::Position* pos,uint64_t& curr, MoveList& moves, int move_type = all_moves);
-void parse_black_pawn_moves(thrawn::Position* pos,uint64_t& curr, MoveList& moves, int move_type = all_moves);
-void parse_knight_moves(thrawn::Position* pos,uint64_t& curr, const int& piece, MoveList& moves, int move_type = all_moves);
-void parse_bishop_moves(thrawn::Position* pos,uint64_t& curr, const int& piece, MoveList& moves, int move_type = all_moves);
-void parse_rook_moves(thrawn::Position* pos,uint64_t& curr, const int& piece, MoveList& moves, int move_type = all_moves);
-void parse_queen_moves(thrawn::Position* pos,uint64_t& curr, const int& piece, MoveList& moves, int move_type = all_moves);
-void parse_king_moves(thrawn::Position* pos,uint64_t& curr, const int& piece, MoveList& moves, int move_type = all_moves);
-void parse_white_castle_moves(thrawn::Position* pos, MoveList& moves);
-void parse_black_castle_moves(thrawn::Position* pos, MoveList& moves);
 
 #endif
