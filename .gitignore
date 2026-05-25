@@ -1,5 +1,6 @@
 # Compiled Object files
 *.o
+*.d
 
 # Executables
 *.out
@@ -16,3 +17,13 @@ Thrawn
 
 # MacOS
 *.DS_STORE
+
+*.nnue
+
+# Local tuning binaries/books
+tools/Thrawn
+tools/Thrawn.exe
+tools/fastchess
+tools/fastchess.exe
+tools/*.epd
+tools/*.pgn

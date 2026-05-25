@@ -5,32 +5,6 @@
 
 using namespace std;
 
-// GET OCCUPANCY BITBOARDS
-uint64_t get_white_occupancy(thrawn::Position* pos)
-{
-    uint64_t res = 0ULL;
-    for(int i=0;i<6;i++)
-        res |= pos->piece_bitboards[i];
-    return res;
-}
-
-uint64_t get_black_occupancy(thrawn::Position* pos)
-{
-    uint64_t res = 0ULL;
-    for(int i=6;i<12;i++)
-        res |= pos->piece_bitboards[i];
-    return res;
-}
-
-uint64_t get_both_occupancy(thrawn::Position* pos)
-{
-    uint64_t res = 0ULL;
-    res |= get_white_occupancy(pos);
-    res |= get_black_occupancy(pos);
-    return res;
-}
-
-
 // PRE-COMPUTE PIECE ATTACK BITBOARDS
 
 // pawns
@@ -267,8 +241,7 @@ uint64_t set_occupancy(const int& index, const int& bits_in_mask, uint64_t attac
 
     for (int i=0;i<bits_in_mask;i++)
     {
-        int square = get_lsb_index(attack_mask);
-        clear_bit(attack_mask, square);
+        int square = pop_lsb(attack_mask);
 
         // make sure occupancy is on board
         if (index & (1 << i))
@@ -348,63 +321,36 @@ void init_magic_nums()
         bishop_magic_nums[square] = find_magic_num(square, bishop_relevant_bits[square], bishop);
 }
 
-uint64_t get_bishop_attacks(thrawn::Position* pos, int square, uint64_t occupancy)
-{
-    // generate bishop attacks given current board occupancy
-    occupancy &= pos->bishop_masks[square];
-    occupancy *= bishop_magic_nums[square];
-    occupancy >>= 64-bishop_relevant_bits[square];
-
-    return pos->bishop_attacks[square][occupancy];
-}
-
-uint64_t get_rook_attacks(thrawn::Position* pos, int square, uint64_t occupancy)
-{
-    // generate rook attacks given current board occupancy
-    occupancy &= pos->rook_masks[square];
-    occupancy *= rook_magic_nums[square];
-    occupancy >>= 64-rook_relevant_bits[square];
-
-    return pos->rook_attacks[square][occupancy];
-}
-
-uint64_t get_queen_attacks(thrawn::Position* pos, int square, uint64_t occupancy)
-{
-    return get_bishop_attacks(pos, square, occupancy) | get_rook_attacks(pos, square, occupancy);
-}
-
 // is <square> under attacked by <side> pieces
-bool is_square_under_attack(thrawn::Position* pos, int square, int side)
+bool is_square_under_attack(const thrawn::Position* pos, int square, int side)
 {
-    // Attacked by white pawns
     if ((side == white) && (pos->pawn_attacks[black][square] & pos->piece_bitboards[P]))
         return true;
 
-    // Attacked by black pawns
     if ((side == black) && (pos->pawn_attacks[white][square] & pos->piece_bitboards[p]))
         return true;
 
-    if (pos->knight_attacks[square] & ((side == white) ? pos->piece_bitboards[N] : pos->piece_bitboards[n]))
+    const uint64_t knights = (side == white) ? pos->piece_bitboards[N] : pos->piece_bitboards[n];
+    if (pos->knight_attacks[square] & knights)
         return true;
 
-    if (get_bishop_attacks(pos, square, pos->occupancies[both]) & ((side == white) ? pos->piece_bitboards[B] : pos->piece_bitboards[b]))
+    const uint64_t diagonal_sliders = (side == white)
+        ? (pos->piece_bitboards[B] | pos->piece_bitboards[Q])
+        : (pos->piece_bitboards[b] | pos->piece_bitboards[q]);
+    if (get_bishop_attacks(pos, square, pos->occupancies[both]) & diagonal_sliders)
         return true;
 
-    if (get_rook_attacks(pos, square, pos->occupancies[both]) & ((side == white) ? pos->piece_bitboards[R] : pos->piece_bitboards[r]))
+    const uint64_t orthogonal_sliders = (side == white)
+        ? (pos->piece_bitboards[R] | pos->piece_bitboards[Q])
+        : (pos->piece_bitboards[r] | pos->piece_bitboards[q]);
+    if (get_rook_attacks(pos, square, pos->occupancies[both]) & orthogonal_sliders)
         return true;
 
-    if (get_queen_attacks(pos, square, pos->occupancies[both]) & ((side == white) ? pos->piece_bitboards[Q] : pos->piece_bitboards[q]))
-        return true;
-
-    if (pos->king_attacks[square] & ((side == white) ? pos->piece_bitboards[K] : pos->piece_bitboards[k]))
+    const uint64_t king = (side == white) ? pos->piece_bitboards[K] : pos->piece_bitboards[k];
+    if (pos->king_attacks[square] & king)
         return true;
 
     return false;
-}
-
-bool noMajorsOrMinorsPieces(thrawn::Position* pos)
-{
-    return !(count_bits(pos->occupancies[both]) - count_bits(pos->piece_bitboards[P]) - count_bits(pos->piece_bitboards[p]) - 2);
 }
 
 void init_sliding_attacks(thrawn::Position* pos, int isBishop)

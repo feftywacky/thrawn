@@ -1,14 +1,89 @@
 #include "threading.h"
 #include "search.h"         // for negamax, quiescence, etc.
 #include "uci.h"            // for 'stopped', 'communicate()', etc.
+#include "move_generator.h"
 #include "move_helpers.h"
 #include "transposition_table.h"
 #include "globals.h"
 #include <thread>
 #include <iostream>
 #include <atomic>
+#include <algorithm>
+#include <cstdint>
+#include <cstddef>
 
-static int globalSearchStartTime = 0;
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
+
+static std::int64_t globalSearchStartTime = 0;
+
+namespace {
+
+constexpr std::size_t kSearchThreadStackSize = 8U * 1024U * 1024U;
+
+#if !defined(_WIN32)
+struct SearchThreadContext {
+    thrawn::Position* pos = nullptr;
+    int thread_id = 0;
+    int max_depth = 0;
+};
+
+void* search_thread_entry(void* rawContext) {
+    auto* context = static_cast<SearchThreadContext*>(rawContext);
+    smp_worker_thread_func(context->pos, context->thread_id, context->max_depth);
+    return nullptr;
+}
+
+bool start_search_thread(pthread_t& thread, SearchThreadContext& context) {
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        return false;
+    }
+
+    const int stackResult = pthread_attr_setstacksize(&attr, kSearchThreadStackSize);
+    const int createResult = stackResult == 0
+        ? pthread_create(&thread, &attr, search_thread_entry, &context)
+        : stackResult;
+    pthread_attr_destroy(&attr);
+    return createResult == 0;
+}
+#endif
+
+} // namespace
+
+static int uci_mate_score(int score) {
+    if (score >= mateScore) {
+        return (mateVal - score + 1) / 2;
+    }
+
+    if (score <= -mateScore) {
+        return -((mateVal + score) / 2);
+    }
+
+    return 0;
+}
+
+static std::uint64_t exact_node_total(int numThreads) {
+    std::uint64_t nodes = 0;
+    for (int i = 0; i < numThreads; ++i) {
+        nodes += static_cast<std::uint64_t>(threadDatas[i].nodes);
+    }
+    return nodes;
+}
+
+RootMove::RootMove()
+    : move(0), score(-SEARCH_INFINITY), depth(0), bound(BOUND_NONE), pv_length(0), completed(false)
+{
+    pv.fill(0);
+}
+
+SearchResult::SearchResult()
+    : thread(nullptr), thread_id(0), move(0), score(-SEARCH_INFINITY), depth(0),
+      pv_length(0), has_move(false)
+{
+    pv.fill(0);
+}
 
 /*
  * ThreadData constructor:
@@ -20,8 +95,14 @@ ThreadData::ThreadData() {
         row.fill(0);
     for (auto &row : killer_moves)
         row.fill(0);
-    for (auto &row : history_moves)
+    quiet_history = {};
+    continuation_history = {};
+    capture_history = {};
+    correction_history = {};
+    for (auto &row : counter_moves)
         row.fill(0);
+    ply_moves.fill(0);
+    static_eval_stack.fill(no_hashmap_entry);
 
     follow_pv_flag = false;
     score_pv_flag  = false;
@@ -29,8 +110,12 @@ ThreadData::ThreadData() {
 
     nodes = 0;
 
+    thread_id = 0;
     final_depth = 0;
     final_score = 0;
+    final_bound = BOUND_NONE;
+    root_moves.clear();
+    iteration_root_moves.clear();
 }
 
 /*
@@ -42,8 +127,14 @@ void ThreadData::resetThreadData() {
         row.fill(0);
     for (auto &row : killer_moves)
         row.fill(0);
-    for (auto &row : history_moves)
+    quiet_history = {};
+    continuation_history = {};
+    capture_history = {};
+    correction_history = {};
+    for (auto &row : counter_moves)
         row.fill(0);
+    ply_moves.fill(0);
+    static_eval_stack.fill(no_hashmap_entry);
 
     follow_pv_flag = false;
     score_pv_flag  = false;
@@ -51,8 +142,93 @@ void ThreadData::resetThreadData() {
 
     nodes = 0;
 
+    thread_id = 0;
     final_depth = 0;
     final_score = 0;
+    final_bound = BOUND_NONE;
+    root_moves.clear();
+    iteration_root_moves.clear();
+}
+
+void ThreadData::recordRootMove(int move, int score, int depth, int bound) {
+    RootMove* entry = nullptr;
+    for (RootMove& rootMove : iteration_root_moves) {
+        if (rootMove.move == move) {
+            entry = &rootMove;
+            break;
+        }
+    }
+
+    if (entry == nullptr) {
+        iteration_root_moves.emplace_back();
+        entry = &iteration_root_moves.back();
+        entry->move = move;
+    }
+
+    entry->score = score;
+    entry->depth = depth;
+    entry->bound = bound;
+    entry->completed = true;
+    entry->pv.fill(0);
+    entry->pv[0] = move;
+
+    int length = pv_length[1];
+    if (length < 1)
+        length = 1;
+    if (length > MAX_DEPTH)
+        length = MAX_DEPTH;
+
+    for (int nextPly = 1; nextPly < length; nextPly++) {
+        entry->pv[nextPly] = pv_table[1][nextPly];
+    }
+
+    entry->pv_length = length;
+}
+
+static int legal_fallback_move(thrawn::Position* rootPos) {
+    MoveList moves;
+    generate_moves(rootPos, all_moves, moves);
+    for (int move : moves) {
+        thrawn::Position scratch(*rootPos);
+        scratch.ply++;
+        scratch.repetition_index++;
+        scratch.repetition_table[scratch.repetition_index] = scratch.zobristKey;
+
+        if (make_move(&scratch, move, all_moves, scratch.ply))
+            return move;
+    }
+
+    return 0;
+}
+
+static void print_result_info(const SearchResult& result) {
+    if (!result.has_move)
+        return;
+
+    const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
+    std::cout << "info depth " << result.depth
+              << " nodes " << total_nodes.load(std::memory_order_relaxed)
+              << " time " << currentTime
+              << " score ";
+
+    if (result.score >= mateScore || result.score <= -mateScore) {
+        std::cout << "mate " << uci_mate_score(result.score);
+    } else {
+        std::cout << "cp " << result.score;
+    }
+
+    if (result.pv_length > 0) {
+        std::cout << " pv ";
+        for (int i = 0; i < result.pv_length; i++) {
+            print_move(result.pv[i]);
+            std::cout << " ";
+        }
+    } else {
+        std::cout << " pv (none)";
+    }
+
+    std::cout << "\n";
+    std::cout.flush();
 }
 
 /**
@@ -63,21 +239,24 @@ void ThreadData::resetThreadData() {
 void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
 {
     ThreadData* td = &threadDatas[threadID];
-    int alpha = -INFINITY;
-    int beta  =  INFINITY;
+    td->thread_id = threadID;
+    int alpha = -SEARCH_INFINITY;
+    int beta  =  SEARCH_INFINITY;
     int score = 0;
 
     // Perform iterative deepening from depth 1 to maxDepth
     for (int curr_depth = 1; curr_depth <= maxDepth; curr_depth++)
     {
-        if (stopped == 1)
+        if (stopped.load(std::memory_order_relaxed) == 1)
             break;
         
         td->follow_pv_flag = true;
 
-        //  for depths beyond WindowDepth, derive the window from the previous score
-        int delta = WindowSize;
-        if(curr_depth>=WindowDepth)
+        // For configured aspiration depths, derive the window from the previous score.
+        const int threadCycle = std::max(1, SEARCH_ASPIRATION_THREAD_CYCLE);
+        int delta = SEARCH_ASPIRATION_WINDOW_SIZE +
+                    (threadID % threadCycle) * SEARCH_ASPIRATION_THREAD_DELTA;
+        if(curr_depth>=SEARCH_ASPIRATION_WINDOW_DEPTH)
         {
             // Use the previous iteration’s best score (final_score) to set the window.
             // Here we “clamp” alpha to at least –mateVal and beta to at most mateVal.
@@ -86,68 +265,96 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         }
         else
         {
-            alpha = -INFINITY;
-            beta  = INFINITY;
+            alpha = -SEARCH_INFINITY;
+            beta  = SEARCH_INFINITY;
         }
 
         // Aspiration loop: adjust the window until search returns a score in (alpha, beta)
+        bool completed_iteration = false;
         while (true)
         {
-            if(stopped==1)
+            if(stopped.load(std::memory_order_relaxed)==1)
                 break;
 
             // Backup the current good PV from the previous iteration.
             std::array<int, MAX_DEPTH> backup_pv = td->pv_table[0];
             int backup_pv_length = td->pv_length[0];
+            td->iteration_root_moves.clear();
             
             score = negamax(pos, td, curr_depth, alpha, beta);
+
+            if (stopped.load(std::memory_order_relaxed) == 1)
+            {
+                td->pv_table[0] = backup_pv;
+                td->pv_length[0] = backup_pv_length;
+                break;
+            }
             
             // If the score falls inside the window, then we consider the search good
             if (score > alpha && score < beta)
+            {
+                completed_iteration = true;
                 break;
+            }
             
-            // If the search “fails low” (score too low), narrow the window:
+            // If the search fails low, shift the window around the returned score.
             if (score <= alpha) {
-                // Adjust beta downward (Here we simply take the midpoint)
-                beta = (alpha + beta) / 2;
-                // Expand the lower window boundary by subtracting delta
-                alpha = std::max(-mateVal, alpha - delta);
+                beta = alpha;
+                alpha = std::max(-mateVal, score - delta);
                 // Restore the previous PV since the current iteration did not complete properly
                 td->pv_table[0] = backup_pv;
                 td->pv_length[0] = backup_pv_length;
             }
-            // If the search “fails high” (score too high), widen the window upward
+            // If the search fails high, keep some overlap and expand upward.
             else if (score >= beta) {
-                beta = std::min(mateVal, beta + delta);
+                alpha = std::max(alpha, beta - delta);
+                beta = std::min(mateVal, score + delta);
             }
             
             // Increase delta for the next iteration of the aspiration loop
             delta = delta + delta / 2;
         }
 
+        if (!completed_iteration)
+            break;
+
         // Update the aspiration window.
-        alpha = score - WindowSize;
-        beta = score + WindowSize;
+        alpha = score - SEARCH_ASPIRATION_WINDOW_SIZE;
+        beta = score + SEARCH_ASPIRATION_WINDOW_SIZE;
 
         td->final_depth = curr_depth;
         td->final_score = score;
+        td->root_moves = td->iteration_root_moves;
+        td->final_bound = BOUND_NONE;
+
+        if (td->pv_length[0] > 0) {
+            const int pvMove = td->pv_table[0][0];
+            for (const RootMove& rootMove : td->root_moves) {
+                if (rootMove.completed && rootMove.move == pvMove) {
+                    td->final_bound = rootMove.bound;
+                    break;
+                }
+            }
+
+            if (td->final_bound == BOUND_NONE)
+                td->final_bound = BOUND_EXACT;
+        }
         
         // print an info line from the master thread (thread 0)
         if (threadID == 0)
         {   
-            int currentTime = get_time_ms() - globalSearchStartTime;
+            const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
+            const std::uint64_t reportedNodes =
+                total_nodes.load(std::memory_order_relaxed) +
+                static_cast<std::uint64_t>(td->nodes & (NODE_COUNTER_BATCH - 1));
             std::cout << "info depth " << curr_depth
-                      << " nodes " << total_nodes
+                      << " nodes " << reportedNodes
                       << " time " << currentTime;
             
             // Determine whether to report a mate score or a centipawn score
-            if (score > -mateVal && score < -mateScore)
+            if (score >= mateScore || score <= -mateScore)
             {
-                std::cout << " score mate " << -(score + mateVal) / 2 - 1;
-            }
-            else if (score > mateScore && score < mateVal)
-            {
-                std::cout << " score mate " << (mateVal - score) / 2 + 1;
+                std::cout << " score mate " << uci_mate_score(score);
             }
             else
             {
@@ -180,13 +387,15 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
 void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numThreads)
 {
     // Reset stop flags and counters.
-    total_nodes = 0;
-    stopped = 0;
+    total_nodes.store(0, std::memory_order_relaxed);
+    stopped.store(0, std::memory_order_relaxed);
     globalSearchStartTime = get_time_ms();
 
     tt->incrementAge();
 
     // Limit the number of threads to MAX_THREADS.
+    if (numThreads < 1)
+        numThreads = 1;
     if (numThreads > MAX_THREADS)
         numThreads = MAX_THREADS;
     
@@ -201,7 +410,12 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
     for (int i = 0; i < numThreads; i++) {
         positionCopies.push_back(new thrawn::Position(*rootPos));
     }
-    
+
+    if (numThreads == 1) {
+        smp_worker_thread_func(positionCopies[0], 0, maxDepth);
+    }
+    else {
+#if defined(_WIN32)
     // Create worker threads
     std::vector<std::thread> workerPool;
     workerPool.reserve(numThreads);
@@ -214,82 +428,180 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
     {
         workerPool[i].join();
     }
+#else
+        std::vector<pthread_t> workerPool(static_cast<std::size_t>(numThreads));
+        std::vector<SearchThreadContext> contexts(static_cast<std::size_t>(numThreads));
+        int startedThreads = 0;
+
+        for (int i = 0; i < numThreads; i++) {
+            contexts[i] = {positionCopies[i], i, maxDepth};
+            if (!start_search_thread(workerPool[i], contexts[i])) {
+                stopped.store(1, std::memory_order_relaxed);
+                break;
+            }
+            ++startedThreads;
+        }
+
+        for (int i = 0; i < startedThreads; i++) {
+            pthread_join(workerPool[i], nullptr);
+        }
+#endif
+    }
     
     // Delete allocated memory for position copies
     for (int i = 0; i < numThreads; i++) {
         delete positionCopies[i];
     }
 
+    total_nodes.store(exact_node_total(numThreads), std::memory_order_relaxed);
+
     // After all threads have finished, select the best result.
-    ThreadData* best_td = select_best_thread(threadDatas, numThreads);
+    SearchResult result = select_best_thread(threadDatas, numThreads);
+    int bestMove = result.move;
+    if (!result.has_move)
+        bestMove = legal_fallback_move(rootPos);
+    if (result.has_move && result.thread_id != 0) {
+        std::cout << "info string thread " << result.thread_id
+                  << " selected by Lazy SMP vote\n";
+        print_result_info(result);
+    }
     
     // Print the total nodes and best move.
     //std::cout << "total nodes across all threads " << total_nodes << std::endl;
     std::cout << "bestmove ";
-    print_move(best_td->pv_table[0][0]);
+    if (bestMove != 0)
+        print_move(bestMove);
+    else
+        std::cout << "0000";
     std::cout << "\n";
     std::cout.flush();
 }
 
-/**
- * select_best_thread
- * Choose the best result among the threadDatas (mimics Ethereal’s select_from_threads).
- *
- * A thread is considered better than another if:
- *   [1] They have equal depth and the thread’s score is higher.
- *   [2] The thread has a mate score (i.e. its absolute score is greater than mateScore) and a better mate proximity.
- *   [3] The thread has a greater depth and (a higher score or the current best isn’t a mate score).
- */
-ThreadData* select_best_thread(ThreadData threadDatas[], int numThreads) {
-    ThreadData* best_td = &threadDatas[0];
-    int res_thread_id = 0;
-    for (int i = 1; i < numThreads; i++) {
-        int best_depth = best_td->final_depth;
-        int best_score = best_td->final_score;
-        int this_depth = threadDatas[i].final_depth;
-        int this_score = threadDatas[i].final_score;
-        
-        if ((this_depth == best_depth && this_score > best_score)
-            || (std::abs(this_score) > mateScore && std::abs(this_score) > std::abs(best_score))
-            || (this_depth > best_depth && (this_score > best_score || std::abs(best_score) < mateScore)))
-        {
-            best_td = &threadDatas[i];
-            res_thread_id = i;
-        }
+SearchResult select_best_thread(ThreadData threadDatas[], int numThreads) {
+    struct MoveVote {
+        int move = 0;
+        long long votes = 0;
+        int best_score = -SEARCH_INFINITY;
+        int best_depth = 0;
+        int thread_id = 0;
+        int pv_length = 0;
+        std::array<int, MAX_DEPTH> pv{};
+    };
+
+    SearchResult result;
+    std::vector<MoveVote> moveVotes;
+    int worstScore = SEARCH_INFINITY;
+    bool foundCandidate = false;
+    bool exactResultAvailable = false;
+
+    for (int i = 0; i < numThreads; i++) {
+        if (threadDatas[i].final_depth <= 0 || threadDatas[i].pv_length[0] <= 0 ||
+            threadDatas[i].pv_table[0][0] == 0)
+            continue;
+
+        if (threadDatas[i].final_bound == BOUND_EXACT)
+            exactResultAvailable = true;
     }
 
-    // the case where the best thread is not the main thread (thread 0)
-    if(best_td!=&threadDatas[0])
-    {   
-        std::cout<<"thread "<<res_thread_id<<" is better"<<"\n";
-        int currentTime = get_time_ms() - globalSearchStartTime;
-        std::cout << "info depth " << best_td->final_depth
-                  << " nodes " << total_nodes
-                  << " time " << currentTime
-                  << " score ";
+    for (int i = 0; i < numThreads; i++) {
+        if (threadDatas[i].final_depth <= 0 || threadDatas[i].pv_length[0] <= 0 ||
+            threadDatas[i].pv_table[0][0] == 0)
+            continue;
 
-        // Print mate or centipawn score
-        if (best_td->final_score > mateScore) {
-            std::cout << "mate " << (mateVal - best_td->final_score) / 2 + 1;
-        } else if (best_td->final_score < -mateScore) {
-            std::cout << "mate " << -(best_td->final_score + mateVal) / 2 - 1;
-        } else {
-            std::cout << "cp " << best_td->final_score;
-        }
+        if (exactResultAvailable && threadDatas[i].final_bound != BOUND_EXACT)
+            continue;
 
-        // Print the principal variation (PV)
-        if (best_td->pv_length[0] > 0) {
-            std::cout << " pv ";
-            for (int i = 0; i < best_td->pv_length[0]; i++) {
-                print_move(best_td->pv_table[0][i]);
-                std::cout << " ";
+        worstScore = std::min(worstScore, threadDatas[i].final_score);
+        foundCandidate = true;
+    }
+
+    if (foundCandidate) {
+        for (int i = 0; i < numThreads; i++) {
+            if (threadDatas[i].final_depth <= 0 || threadDatas[i].pv_length[0] <= 0)
+                continue;
+
+            const int move = threadDatas[i].pv_table[0][0];
+            if (move == 0)
+                continue;
+
+            if (exactResultAvailable && threadDatas[i].final_bound != BOUND_EXACT)
+                continue;
+
+            MoveVote* vote = nullptr;
+            for (MoveVote& existing : moveVotes) {
+                if (existing.move == move) {
+                    vote = &existing;
+                    break;
+                }
             }
-        } else {
-            std::cout << " pv (none)";
+
+            if (vote == nullptr) {
+                moveVotes.emplace_back();
+                vote = &moveVotes.back();
+                vote->move = move;
+                vote->pv.fill(0);
+            }
+
+            const int scoreGap = std::max(1,
+                                          threadDatas[i].final_score - worstScore +
+                                              SEARCH_SMP_VOTE_SCORE_OFFSET);
+            vote->votes += static_cast<long long>(std::max(1, threadDatas[i].final_depth)) * scoreGap;
+
+            if (threadDatas[i].final_depth > vote->best_depth ||
+                (threadDatas[i].final_depth == vote->best_depth &&
+                 threadDatas[i].final_score > vote->best_score)) {
+                vote->best_score = threadDatas[i].final_score;
+                vote->best_depth = threadDatas[i].final_depth;
+                vote->thread_id = i;
+                vote->pv_length = threadDatas[i].pv_length[0];
+                vote->pv = threadDatas[i].pv_table[0];
+            }
         }
 
-        std::cout << "\n";
-        std::cout.flush();
+        const MoveVote* bestVote = nullptr;
+        for (const MoveVote& vote : moveVotes) {
+            if (bestVote == nullptr ||
+                vote.votes > bestVote->votes ||
+                (vote.votes == bestVote->votes && vote.best_depth > bestVote->best_depth) ||
+                (vote.votes == bestVote->votes && vote.best_depth == bestVote->best_depth &&
+                 vote.best_score > bestVote->best_score)) {
+                bestVote = &vote;
+            }
+        }
+
+        if (bestVote != nullptr) {
+            result.thread = &threadDatas[bestVote->thread_id];
+            result.thread_id = bestVote->thread_id;
+            result.move = bestVote->move;
+            result.score = bestVote->best_score;
+            result.depth = bestVote->best_depth;
+            result.pv_length = bestVote->pv_length;
+            result.pv = bestVote->pv;
+            result.has_move = true;
+            return result;
+        }
     }
-    return best_td;
+
+    for (int i = 0; i < numThreads; i++) {
+        if (threadDatas[i].final_depth <= 0 || threadDatas[i].pv_length[0] <= 0)
+            continue;
+
+        if (exactResultAvailable && threadDatas[i].final_bound != BOUND_EXACT)
+            continue;
+
+        if (!result.has_move ||
+            threadDatas[i].final_depth > result.depth ||
+            (threadDatas[i].final_depth == result.depth && threadDatas[i].final_score > result.score)) {
+            result.thread = &threadDatas[i];
+            result.thread_id = i;
+            result.move = threadDatas[i].pv_table[0][0];
+            result.score = threadDatas[i].final_score;
+            result.depth = threadDatas[i].final_depth;
+            result.pv_length = threadDatas[i].pv_length[0];
+            result.pv = threadDatas[i].pv_table[0];
+            result.has_move = result.move != 0;
+        }
+    }
+
+    return result;
 }

@@ -2,20 +2,77 @@
 #define POSITION_H
 
 #include <array>
-#include <vector>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <vector>
 #include "constants.h"
 
 namespace thrawn {
 
-// Holds all data needed to restore a position
+// Latest trainer export: HalfKAv2_hm, version 8.
+constexpr int NNUE_INPUT_FEATURES = 22528;
+constexpr int NNUE_PS_NB = 11 * 64;
+constexpr int NNUE_MAX_ACTIVE_FEATURES = 32;
+constexpr int NNUE_ACCUMULATOR_SIZE = 1024;
+constexpr int NNUE_FT_SIZE = NNUE_ACCUMULATOR_SIZE;
+constexpr int NNUE_HIDDEN_SIZE = 31;
+constexpr int NNUE_FORWARD_SIZE = 1;
+constexpr int NNUE_FC0_OUTPUT_SIZE = NNUE_HIDDEN_SIZE + NNUE_FORWARD_SIZE;
+constexpr int NNUE_FC1_INPUT_SIZE = NNUE_HIDDEN_SIZE * 2;
+constexpr int NNUE_FC1_OUTPUT_SIZE = 32;
+constexpr int NNUE_MAX_PIECES = 32;
+constexpr int NNUE_SIMD_ALIGNMENT = 64;
+
+static_assert(NNUE_ACCUMULATOR_SIZE % 8 == 0, "NNUE accumulator must fit NEON lanes");
+static_assert(NNUE_ACCUMULATOR_SIZE % 16 == 0, "NNUE accumulator must fit AVX2 lanes");
+static_assert(NNUE_INPUT_FEATURES == 32 * NNUE_PS_NB, "HalfKAv2_hm feature count mismatch");
+
+struct alignas(NNUE_SIMD_ALIGNMENT) NnueState {
+    alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> white_acc{};
+    alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> black_acc{};
+    std::array<uint8_t, NNUE_MAX_PIECES> piece_list{};
+    std::array<uint8_t, NNUE_MAX_PIECES> square_list{};
+    std::array<int8_t, BOARD_SIZE> index_by_square{};
+    // -1 means local; otherwise this perspective reads from an ancestor ply until first write.
+    int8_t white_acc_source_ply = -1;
+    int8_t black_acc_source_ply = -1;
+    uint8_t piece_count = 0;
+    int8_t white_king_sq = -1;
+    int8_t black_king_sq = -1;
+    bool valid = false;
+
+    NnueState() {
+        index_by_square.fill(-1);
+    }
+};
+
+class NnueStack {
+public:
+    NnueStack();
+    NnueStack(const NnueStack& other);
+    NnueStack& operator=(const NnueStack& other);
+    NnueStack(NnueStack&& other) noexcept = default;
+    NnueStack& operator=(NnueStack&& other) noexcept = default;
+
+    NnueState& operator[](std::size_t index);
+    const NnueState& operator[](std::size_t index) const;
+
+    void copy_up_to(const NnueStack& other, int ply);
+
+private:
+    std::unique_ptr<std::array<NnueState, MAX_DEPTH + 1>> states;
+};
+
+// Holds the irreversible state and capture delta needed to unmake one move.
 struct UndoData {
-    int move;             // the packed move itself: source, target, etc.
-    int captured_piece;   // which piece got captured (if any)
-    int castle_rights;    // old castle rights before move
-    int enpassant;        // old en-passant square
-    int fifty_move;       // old halfmove clock
-    uint64_t zobristKey;  // old zobrist key (optional but convenient)
+    int move = 0;
+    int captured_piece = -1;
+    int captured_square = null_sq;
+    int castle_rights = 0;
+    int enpassant = null_sq;
+    int fifty_move = 0;
+    uint64_t zobristKey = 0ULL;
 };
 
 class Position {
@@ -34,56 +91,32 @@ public:
     int repetition_index;
 
     int ply;
+    NnueStack nnue_stack;
 
     //============= ATTACK AND HASHING TABLES =============//
 
-    std::array<std::array<uint64_t, 64>, 2> pawn_attacks;
-    std::array<uint64_t, 64> knight_attacks;
-    std::array<uint64_t, 64> king_attacks;
+    static std::array<std::array<uint64_t, 64>, 2> pawn_attacks;
+    static std::array<uint64_t, 64> knight_attacks;
+    static std::array<uint64_t, 64> king_attacks;
 
-    std::array<uint64_t, 64> bishop_masks;
-    std::array<std::array<uint64_t, 512>, 64> bishop_attacks;
-    std::array<uint64_t, 64> rook_masks;
-    std::array<std::array<uint64_t, 4096>, 64> rook_attacks;
+    static std::array<uint64_t, 64> bishop_masks;
+    static std::array<std::array<uint64_t, 512>, 64> bishop_attacks;
+    static std::array<uint64_t, 64> rook_masks;
+    static std::array<std::array<uint64_t, 4096>, 64> rook_attacks;
 
-    uint64_t piece_hashkey[12][64];
-    uint64_t enpassant_hashkey[64];
-    uint64_t castling_hashkey[16];
-    uint64_t colour_to_move_hashkey;
+    static uint64_t piece_hashkey[12][64];
+    static uint64_t enpassant_hashkey[64];
+    static uint64_t castling_hashkey[16];
+    static uint64_t colour_to_move_hashkey;
 
     //============= UNDO STACK =============//
-    UndoData undo_stack[MAX_DEPTH];
+    UndoData undo_stack[MAX_DEPTH + 1];
 
     //============= CONSTRUCTORS & METHODS =============//
     Position();
+    Position(const Position& other);
+    Position& operator=(const Position& other);
 };
-
-// copying and restoring for move take backs
-#define copyBoard(pos) \
-    array<uint64_t, 12> piece_bitboards_copy; \
-    array<uint64_t, 3> occupancies_copy; \
-    int colour_to_move_copy; \
-    int enpassant_copy; \
-    int castle_rights_copy; \
-    uint64_t zobristKey_copy; \
-    int fifty_move_copy; \
-    piece_bitboards_copy = pos->piece_bitboards; \
-    occupancies_copy = pos->occupancies; \
-    colour_to_move_copy = pos->colour_to_move; \
-    enpassant_copy = pos->enpassant; \
-    castle_rights_copy = pos->castle_rights; \
-    zobristKey_copy = pos->zobristKey; \
-    fifty_move_copy = pos->fifty_move; \
-
-// Restore board state
-#define restoreBoard(pos) \
-    pos->piece_bitboards = piece_bitboards_copy; \
-    pos->occupancies = occupancies_copy; \
-    pos->colour_to_move = colour_to_move_copy; \
-    pos->enpassant = enpassant_copy; \
-    pos->castle_rights = castle_rights_copy; \
-    pos->zobristKey = zobristKey_copy; \
-    pos->fifty_move = fifty_move_copy; \
 
 } // namespace thrawn
 

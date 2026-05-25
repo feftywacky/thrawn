@@ -1,14 +1,16 @@
 #ifndef BITBOARD_HELPERS_H
 #define BITBOARD_HELPERS_H
 
-#include <vector>
 #include <bitset>
-#include <map>
-#include <set>
+#include <cstdint>
+#include <vector>
 #include "constants.h"
 #include "zobrist_hashing.h"
 #include "search.h"
-#include <cstdint>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 using namespace std;
 
@@ -16,24 +18,85 @@ using namespace std;
 
 extern unsigned int random_state;
 
-void set_bit(uint64_t& bitboard, int bit);
+inline uint64_t square_bb(int bit) {
+    return 1ULL << bit;
+}
 
-void clear_bit(uint64_t& bitboard, int bit);
+inline void set_bit(uint64_t& bitboard, int bit) {
+    bitboard |= square_bb(bit);
+}
 
-void pop_bit(uint64_t& bitboard, int bit);
+inline void clear_bit(uint64_t& bitboard, int bit) {
+    bitboard &= ~square_bb(bit);
+}
 
-uint64_t get_bit(uint64_t bitboard, int bit);
+inline void pop_bit(uint64_t& bitboard, int bit) {
+    bitboard &= ~square_bb(bit);
+}
 
-bool is_bit_set(uint64_t bitboard, int bit);
+inline uint64_t get_bit(uint64_t bitboard, int bit) {
+    return bitboard & square_bb(bit);
+}
 
-void toggle_bit(uint64_t& bitboard, int bit);
+inline bool is_bit_set(uint64_t bitboard, int bit) {
+    return (bitboard & square_bb(bit)) != 0;
+}
+
+inline void toggle_bit(uint64_t& bitboard, int bit) {
+    bitboard ^= square_bb(bit);
+}
 
 vector<int> get_squares_from_bb(uint16_t bitboard);  
 
 // BIT MANIPULATION
-int count_bits(uint64_t bitboard);
+inline int count_bits(uint64_t bitboard) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_popcountll(bitboard);
+#elif defined(_MSC_VER) && defined(_M_X64)
+    return static_cast<int>(__popcnt64(bitboard));
+#elif defined(_MSC_VER)
+    return static_cast<int>(__popcnt(static_cast<unsigned int>(bitboard))) +
+           static_cast<int>(__popcnt(static_cast<unsigned int>(bitboard >> 32)));
+#else
+    int count = 0;
+    while (bitboard) {
+        bitboard &= bitboard - 1;
+        ++count;
+    }
+    return count;
+#endif
+}
 
-int get_lsb_index(uint64_t bitboard);
+inline int get_lsb_index(uint64_t bitboard) {
+    if (!bitboard) {
+        return -1;
+    }
+
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(bitboard);
+#elif defined(_MSC_VER) && defined(_M_X64)
+    unsigned long index = 0;
+    _BitScanForward64(&index, bitboard);
+    return static_cast<int>(index);
+#elif defined(_MSC_VER)
+    unsigned long index = 0;
+    const unsigned long lo = static_cast<unsigned long>(bitboard);
+    if (lo != 0) {
+        _BitScanForward(&index, lo);
+        return static_cast<int>(index);
+    }
+    _BitScanForward(&index, static_cast<unsigned long>(bitboard >> 32));
+    return static_cast<int>(index + 32);
+#else
+    return count_bits((bitboard & -bitboard) - 1);
+#endif
+}
+
+inline int pop_lsb(uint64_t& bitboard) {
+    const int square = get_lsb_index(bitboard);
+    bitboard &= bitboard - 1;
+    return square;
+}
 
 // XOR SHIFT RANDOM NUMBER GEN ALGORITHM
 // Generate 32-bit pseudo legal numbers

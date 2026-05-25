@@ -37,9 +37,9 @@ extern const int open_file_score;
 extern const int bishop_mobility_unit;
 extern const int queen_mobility_unit;
 
-extern const int bishop_mobility_middlegame;
+extern const int bishop_mobility_opening;
 extern const int bishop_mobility_endgame;
-extern const int queen_mobility_middlegame;
+extern const int queen_mobility_opening;
 extern const int queen_mobility_endgame;
 
 
@@ -49,10 +49,6 @@ extern const int opening_phase_score;
 extern const int endgame_phase_score;
 
 extern const int get_rank_from_sq[64];
-
-// converting from thrawn to nnue library
-extern int nnue_pieces[12];
-extern int nnue_squares[64];
 
 int evaluate_HCE(thrawn::Position* pos);
 int evaluate(thrawn::Position* pos); // neural network eval

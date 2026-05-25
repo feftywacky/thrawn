@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "uci.h"
 #include "move_generator.h"
 #include "move_helpers.h"
@@ -7,19 +10,23 @@
 #include "fen.h"
 #include "perft.h"
 #include "search.h"
+#include "evaluation.h"
 #include "misc.h"
 #include "globals.h"
+#include "nnue.h"
 #include <stdlib.h>
 #include <vector>
 #include <cstring>
+#include <cctype>
 #include <string>
 #include <chrono>
 #include <sstream>
+#include <atomic>
 #include <unistd.h>
 #include <stdio.h>
-#ifdef _WIN32
-#include <windows.h>
-#else
+#include <algorithm>
+#include <cstdint>
+#ifndef _WIN32
 #include <termios.h>
 #include <sys/ioctl.h>
 #endif
@@ -32,7 +39,7 @@ UCI PROTOCOL CODE REFERENCES TO VICE CHESS ENGINE BY RICHARD ALBERT
 */
 
 // exit from engine flag
-int quit = 0;
+std::atomic<int> quit{0};
 
 // UCI "movestogo" command moves counter
 int movestogo = 30;
@@ -47,24 +54,246 @@ int uci_time = -1;
 int inc = 0;
 
 // UCI "starttime" command time holder
-int starttime = 0;
+std::int64_t starttime = 0;
 
 // UCI "stoptime" command time holder
-int stoptime = 0;
+std::int64_t stoptime = 0;
 
 // variable to flag time control availability
 int timeset = 0;
 
 // variable to flag when the time is up
-int stopped = 0;
+std::atomic<int> stopped{0};
 
 // Number of threads use for search
-int numThreads = 4;
+int numThreads = 1;
+
+static std::string trim_option_value(const char* value) {
+    if (value == nullptr) {
+        return {};
+    }
+
+    std::string text(value);
+    std::size_t start = 0;
+    while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start]))) {
+        ++start;
+    }
+
+    std::size_t end = text.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1]))) {
+        --end;
+    }
+
+    return text.substr(start, end - start);
+}
+
+static bool parse_uci_setoption(const char* command,
+                                std::string& name,
+                                std::string& value) {
+    const std::string text = trim_option_value(command);
+    const std::string prefix = "setoption name ";
+    if (text.rfind(prefix, 0) != 0) {
+        return false;
+    }
+
+    const std::string rest = text.substr(prefix.size());
+    const std::string value_marker = " value ";
+    const std::size_t value_pos = rest.find(value_marker);
+
+    if (value_pos == std::string::npos) {
+        name = trim_option_value(rest.c_str());
+        value.clear();
+    } else {
+        name = trim_option_value(rest.substr(0, value_pos).c_str());
+        value = trim_option_value(rest.substr(value_pos + value_marker.size()).c_str());
+    }
+
+    return !name.empty();
+}
+
+static bool option_name_equals(const std::string& lhs, const char* rhs) {
+    std::size_t rhs_len = std::strlen(rhs);
+    if (lhs.size() != rhs_len) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < lhs.size(); i++) {
+        if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
+            std::tolower(static_cast<unsigned char>(rhs[i]))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void uci_report_raw_nnue(const char* command) {
+    if (!nnue_loaded()) {
+        std::cout << "info string NNUE not loaded\n";
+        return;
+    }
+
+    const std::string fen = trim_option_value(command + 7);
+    if (fen.empty()) {
+        std::cout << "info string usage: nnuefen <fen>\n";
+        return;
+    }
+
+    thrawn::Position scratch;
+    parse_fen(&scratch, fen.c_str());
+
+    std::cout << "info string nnue score_stm " << nnue_evaluate_raw(&scratch) << "\n";
+}
+
+static void uci_report_engine_nnue(const char* command) {
+    if (!nnue_loaded()) {
+        std::cout << "info string NNUE not loaded\n";
+        return;
+    }
+
+    const std::string fen = trim_option_value(command + 13);
+    if (fen.empty()) {
+        std::cout << "info string usage: nnuefenengine <fen>\n";
+        return;
+    }
+
+    thrawn::Position scratch;
+    parse_fen(&scratch, fen.c_str());
+
+    std::cout << "info string engine nnue score " << evaluate(&scratch) << "\n";
+}
+
+static std::string uci_move_to_string(int move) {
+    std::string text;
+    text += square_to_coordinates[get_move_source(move)];
+    text += square_to_coordinates[get_move_target(move)];
+
+    const int promoted_piece = get_promoted_piece(move);
+    if (promoted_piece != 0) {
+        text += static_cast<char>(std::tolower(ascii_pieces[promoted_piece]));
+    }
+    return text;
+}
+
+static bool uci_nnue_verify_recursive(thrawn::Position* pos,
+                                      int depth,
+                                      int max_nodes,
+                                      int& visited_nodes,
+                                      float& max_parity_error_cp,
+                                      std::string& error) {
+    if (!nnue_verify_position(pos, &error)) {
+        return false;
+    }
+    float parity_error_cp = 0.0f;
+    if (!nnue_measure_evaluation_parity(pos, &parity_error_cp, &error)) {
+        return false;
+    }
+    max_parity_error_cp = std::max(max_parity_error_cp, parity_error_cp);
+
+    if (depth <= 0 || visited_nodes >= max_nodes || pos->ply >= MAX_DEPTH - 1) {
+        return true;
+    }
+
+    ++visited_nodes;
+
+    const bool in_check = is_square_under_attack(
+        pos,
+        (pos->colour_to_move == white)
+            ? get_lsb_index(pos->piece_bitboards[K])
+            : get_lsb_index(pos->piece_bitboards[k]),
+        pos->colour_to_move ^ 1
+    );
+
+    if (!in_check && !noMajorsOrMinorsPieces(pos)) {
+        pos->ply++;
+        pos->repetition_index++;
+        pos->repetition_table[pos->repetition_index] = pos->zobristKey;
+        make_null_move(pos, pos->ply);
+
+        if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, max_parity_error_cp, error)) {
+            error = "after null move: " + error;
+            unmake_null_move(pos, pos->ply);
+            pos->ply--;
+            pos->repetition_index--;
+            return false;
+        }
+
+        unmake_null_move(pos, pos->ply);
+        pos->ply--;
+        pos->repetition_index--;
+    }
+
+    MoveList moves;
+    generate_moves(pos, all_moves, moves);
+    for (int move : moves) {
+        if (visited_nodes >= max_nodes) {
+            break;
+        }
+
+        pos->ply++;
+        pos->repetition_index++;
+        pos->repetition_table[pos->repetition_index] = pos->zobristKey;
+
+        if (!make_move_on_board(pos, move, all_moves, pos->ply)) {
+            pos->ply--;
+            pos->repetition_index--;
+            continue;
+        }
+
+        if (!uci_nnue_verify_recursive(pos, depth - 1, max_nodes, visited_nodes, max_parity_error_cp, error)) {
+            error = "after move " + uci_move_to_string(move) + ": " + error;
+            unmake_move(pos, pos->ply);
+            pos->ply--;
+            pos->repetition_index--;
+            return false;
+        }
+
+        unmake_move(pos, pos->ply);
+        pos->ply--;
+        pos->repetition_index--;
+    }
+
+    return true;
+}
+
+static void uci_verify_nnue_search(const char* command, thrawn::Position* pos) {
+    if (!nnue_loaded()) {
+        std::cout << "info string NNUE not loaded\n";
+        return;
+    }
+
+    int depth = 3;
+    const std::string args = trim_option_value(command + 10);
+    if (!args.empty()) {
+        depth = std::max(0, std::atoi(args.c_str()));
+    }
+
+    constexpr int kMaxVerifyNodes = 5000;
+    int visited_nodes = 0;
+    float max_parity_error_cp = 0.0f;
+    std::string error;
+    const bool ok = uci_nnue_verify_recursive(pos,
+                                              depth,
+                                              kMaxVerifyNodes,
+                                              visited_nodes,
+                                              max_parity_error_cp,
+                                              error);
+
+    if (ok) {
+        std::cout << "info string NNUE verify ok depth " << depth
+                  << " nodes " << visited_nodes
+                  << " parity_cp " << max_parity_error_cp << "\n";
+    } else {
+        std::cout << "info string NNUE verify failed depth " << depth
+                  << " nodes " << visited_nodes
+                  << " reason " << error << "\n";
+    }
+}
 
 /*
 TIME CONTROL
 */
-int get_time_ms() {
+std::int64_t get_time_ms() {
     return chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
 }
 
@@ -107,16 +336,19 @@ void read_input() {
 
     // "Listen" to STDIN
     if (input_waiting()) {
-        // cout<<"input waiting"<<"\n";
-        stopped = 1;
-
         // Loop to read bytes from STDIN
         do {
-            bytes = read(fileno(stdin), input, 256);
+            bytes = read(fileno(stdin), input, sizeof(input) - 1);
         }
 
         // Until bytes are available
         while (bytes < 0);
+
+        if (bytes <= 0) {
+            return;
+        }
+
+        input[bytes] = '\0';
 
         // Searches for the first occurrence of '\n'
         endc = strchr(input, '\n');
@@ -125,18 +357,19 @@ void read_input() {
         if (endc)
             *endc = 0;
 
-        // If input is available
+        // If input is available, stop only for explicit UCI stop commands.
         if (strlen(input) > 0) {
             // Match UCI "quit" command
             if (!strncmp(input, "quit", 4)) {
                 // Tell the engine to terminate execution
-                quit = 1;
+                quit.store(1, std::memory_order_relaxed);
+                stopped.store(1, std::memory_order_relaxed);
             }
 
             // Match UCI "stop" command
             else if (!strncmp(input, "stop", 4)) {
                 // Tell the engine to terminate execution
-                quit = 1;
+                stopped.store(1, std::memory_order_relaxed);
             }
         }
     }
@@ -147,7 +380,7 @@ void communicate() {
 	// if time is up break here
     if(timeset == 1 && get_time_ms() > stoptime) {
          // cout<<"communicate set stopped = 1"<<"\n";
-		stopped = 1;
+			stopped.store(1, std::memory_order_relaxed);
 	}
 	
     // read GUI input
@@ -160,7 +393,8 @@ UCI PROTOCOL
 
 int uci_parse_move(thrawn::Position* pos, const char *move_str)
 {
-    std::vector<int> moves = generate_moves(pos);
+    MoveList moves;
+    generate_moves(pos, all_moves, moves);
     
     int source = (move_str[0] - 'a') + (8-(move_str[1]- '0')) * 8;
     int target = (move_str[2] - 'a') + (8-(move_str[3]- '0')) * 8;
@@ -174,13 +408,7 @@ int uci_parse_move(thrawn::Position* pos, const char *move_str)
 
             if (promoted_piece)
             {
-                if ((promoted_piece == Q || promoted_piece == q) && move_str[4] == 'q')
-                    return move;
-                else if ((promoted_piece == R || promoted_piece == r) && move_str[4] == 'r')
-                    return move;
-                else if ((promoted_piece == N || promoted_piece == n) && move_str[4] == 'b')
-                    return move;
-                else if ((promoted_piece == B || promoted_piece == b) && move_str[4] == 'n')
+                if (move_str[4] == promoted_pieces.at(promoted_piece))
                     return move;
                 continue;
             }
@@ -196,7 +424,6 @@ int uci_parse_move(thrawn::Position* pos, const char *move_str)
 
 void uci_parse_position(thrawn::Position* pos, const char *command) {
     // Create a non-const pointer for manipulation
-    cout<<command<<endl;
     const char *non_const_command = command;
 
     non_const_command += 9; // shift index to skip 'position' in command
@@ -241,7 +468,7 @@ void uci_parse_position(thrawn::Position* pos, const char *command) {
             pos->repetition_index++;
             pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
-            make_move(pos, move, all_moves,-1);
+            make_root_move(pos, move, all_moves);
 
             // Move index to the end of the current move
             while (*curr_ch && *curr_ch != ' ')
@@ -324,18 +551,26 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
         // Set the timeset flag
         timeset = 1;
 
-        // Set up timing
-        uci_time /= movestogo;
-        uci_time -= 50; // lag compensation 
+        const int remainingTime = std::max(0, uci_time);
+        const int moveOverheadMs = std::clamp(remainingTime / 20, 1, 100);
+        constexpr int incrementPercent = 75;
 
-        if (uci_time < 0)
-        {
-            uci_time = 0;
-            inc -= 50;
-            if (inc<0) 
-                inc = 1;
+        const int movesToGo = std::max(1, movestogo);
+        int allocatedTime = 0;
+
+        if (movetime != -1) {
+            allocatedTime = std::max(1, movetime - moveOverheadMs);
+        } else {
+            allocatedTime = remainingTime / movesToGo;
+            allocatedTime += inc * incrementPercent / 100;
+            allocatedTime -= moveOverheadMs;
+
+            const int maxSafeTime = std::max(1, remainingTime - moveOverheadMs);
+            allocatedTime = std::clamp(allocatedTime, 1, maxSafeTime);
         }
-        stoptime = starttime + uci_time + inc;
+
+        uci_time = allocatedTime;
+        stoptime = starttime + allocatedTime;
     }
 
     // If depth is not available, set depth to 64 plies
@@ -344,8 +579,9 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
     }
 
     // Print debug info
-    std::cout << "time:" << uci_time << " start:" << static_cast<unsigned int>(starttime) << " stop:" << static_cast<unsigned int>(stoptime)
-              << " depth:" << depth << " timeset:" << timeset << std::endl;
+    std::cout << "info string time " << uci_time << " start " << starttime
+              << " stop " << stoptime << " depth " << depth
+              << " timeset " << timeset << std::endl;
 
     std::cout << "info depth 0 nodes 0 time 0 score cp 0 pv none"<<endl;
     search_position_threaded(pos, depth, numThreads);  
@@ -376,7 +612,7 @@ void uci_loop(thrawn::Position* pos)
         
         // get user / GUI input
         if (!fgets(input, INPUT_BUFFER, stdin))
-            continue;
+            break;
         
         // make sure input is available
         if (input[0] == '\n')
@@ -392,7 +628,6 @@ void uci_loop(thrawn::Position* pos)
         // parse UCI "position" command
         else if (strncmp(input, "position", 8) == 0)
         {
-            tt->reset();
             uci_parse_position(pos, input);
         }
 
@@ -403,8 +638,11 @@ void uci_loop(thrawn::Position* pos)
             uci_parse_position(pos, "position startpos");
         }
         // parse UCI "go" command
-        else if (strncmp(input, "go", 2) == 0)
+        else if (strncmp(input, "go", 2) == 0) {
             uci_parse_go(pos, input);
+            if (quit.load(std::memory_order_relaxed) == 1)
+                break;
+        }
         
         // parse UCI "quit" command
         else if (strncmp(input, "quit", 4) == 0)
@@ -416,31 +654,61 @@ void uci_loop(thrawn::Position* pos)
             // print engine info
             cout << "id name Thrawn"<< version << "\n";
             cout << "id author Feiyu Lin\n";
-            cout << "option name Hash type spin default 256 min 4 max 1024" << max_hashmap_size << "\n";
-            cout << "option name Threads type spin default 4 min 1 max 16" << "\n";
+            cout << "option name Hash type spin default 256 min 4 max " << max_hashmap_size << "\n";
+            cout << "option name Threads type spin default 1 min 1 max 16" << "\n";
+            cout << "option name EvalFile type string default thrawn-nn-1.nnue" << "\n";
             cout << "uciok\n";
         }
         
-        else if (!strncmp(input, "setoption name Hash value ", 26)) {			
-            // init MB
-            sscanf(input,"%*s %*s %*s %*s %d", &mb);
-            
-            // adjust MB if going beyond the aloowed bounds
-            if(mb < 4) mb = 4;
-            if(mb > max_hashmap_size) mb = max_hashmap_size;
-            
-            // set hash table size in MB
-            std::cout << "    Set hash table size to " << mb << "MB\n";
-            tt->initTable(mb);
+        else if (!strncmp(input, "setoption name ", 15)) {
+            std::string optionName;
+            std::string optionValue;
+            if (!parse_uci_setoption(input, optionName, optionValue)) {
+                std::cout << "info string Ignored malformed setoption command\n";
+                continue;
+            }
+
+            if (option_name_equals(optionName, "Hash")) {
+                mb = optionValue.empty() ? mb : std::atoi(optionValue.c_str());
+                if(mb < 4) mb = 4;
+                if(mb > max_hashmap_size) mb = max_hashmap_size;
+
+                std::cout << "info string Set hash table size to " << mb << "MB\n";
+                tt->initTable(mb);
+            }
+            else if (option_name_equals(optionName, "Threads")) {
+                int t = optionValue.empty() ? numThreads : std::atoi(optionValue.c_str());
+                if (t < 1) t = 1;
+                if (t > 16) t = 16;
+                numThreads = t;
+                std::cout << "info string Set threads = " << numThreads << std::endl;
+            }
+            else if (option_name_equals(optionName, "EvalFile")) {
+                std::string path = optionValue;
+                if (path.empty()) {
+                    path = "thrawn-nn-1.nnue";
+                }
+                nnue_init(path.c_str());
+                nnue_refresh_root(pos);
+            }
+            else {
+                std::cout << "info string Unknown option " << optionName << std::endl;
+            }
         }
 
-        else if (!strncmp(input, "setoption name Threads value ", 29)) {
-            int t = 1;
-            sscanf(input, "%*s %*s %*s %*s %d", &t);
-            if (t < 1) t = 1;
-            if (t > 16) t = 16;
-            numThreads = t;
-            std::cout << "info string Set threads = " << numThreads << std::endl;
+        else if (strncmp(input, "nnuefenengine", 13) == 0)
+        {
+            uci_report_engine_nnue(input);
+        }
+
+        else if (strncmp(input, "nnuefen", 7) == 0)
+        {
+            uci_report_raw_nnue(input);
+        }
+
+        else if (strncmp(input, "nnueverify", 10) == 0)
+        {
+            uci_verify_nnue_search(input, pos);
         }
 
         else if (strncmp(input, "perft", 5) == 0)
@@ -452,7 +720,7 @@ void uci_loop(thrawn::Position* pos)
 
 void reset_time_control()
 {
-    quit = 0;
+    quit.store(0, std::memory_order_relaxed);
     movestogo = 30;
     movetime = -1;
     uci_time = -1;
@@ -460,5 +728,5 @@ void reset_time_control()
     starttime = 0;
     stoptime = 0;
     timeset = 0;
-    stopped = 0;
+    stopped.store(0, std::memory_order_relaxed);
 }

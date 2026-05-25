@@ -1,60 +1,12 @@
-#include <iostream>
-#include <vector>
+#include "move_helpers.h"
+
 #include "constants.h"
+
+#include <iostream>
 
 /* 
  * METHODS BELOW ENCODE AND DECODED MOVE NUMBER 
 */
-
-// parses move into a single int
-int parse_move(int source, int target, int piece, int promoted_piece, int capture, int double_pawn_move, int enpassant, int castling)
-{
-    return source | (target<<6) | (piece<<12) | (promoted_piece<<16) | (capture<<20) | (double_pawn_move<<21) | (enpassant<<22) | (castling<<23);
-}
-
-// following methods unpacks and retrives specific information from move
-
-int get_move_source(int move)
-{
-    return move & 0x3f;
-}
-
-int get_move_target(int move)
-{
-    return (move & 0xfc0) >> 6;
-}
-
-int get_move_piece(int move)
-{
-    return (move & 0xf000) >> 12;
-}
-
-int get_promoted_piece(int move)
-{
-    return (move & 0xf0000) >> 16;
-}
-
-int get_is_capture_move(int move)
-{
-    return move & 0x100000;
-}
-
-int get_is_double_pawn_move(int move)
-{
-    return move & 0x200000;
-}
-
-int get_is_move_enpassant(int move)
-{
-    return move & 0x400000;
-}
-
-int get_is_move_castling(int move)
-{
-    return move & 0x800000;
-}
-
-
 
 // PRINTING 
 
@@ -91,5 +43,3 @@ void print_move_list(const std::vector<int>& move_list)
                   << "" << std::endl;
     }
 }
-
-
