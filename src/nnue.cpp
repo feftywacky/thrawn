@@ -45,7 +45,7 @@ constexpr uint32_t kExpectedFc1InputSize = thrawn::NNUE_FC1_INPUT_SIZE;
 constexpr uint32_t kExpectedFc1OutputSize = thrawn::NNUE_FC1_OUTPUT_SIZE;
 constexpr uint32_t kExpectedOutputPerspective = 1;
 constexpr const char* kExpectedFeatureSet = "HalfKAv2_hm";
-constexpr const char* kDefaultEvalFile = "model_v4_halfkAv2_hm.nnue";
+constexpr const char* kDefaultEvalFile = "thrawn-nn-1.nnue";
 
 constexpr int kFc0InputSize = static_cast<int>(kExpectedFtSize) * 2;
 constexpr int kFc1InputPaddedSize = 64;
