@@ -12,7 +12,34 @@
 #include <intrin.h>
 #endif
 
+#if defined(__BMI2__)
+#include <immintrin.h>
+#endif
+
 using namespace std;
+
+// Parallel bit extract. On x86 with BMI2 this is the single-cycle (Intel) /
+// few-cycle (Zen3+) PEXT instruction used for pext-bitboard slider indexing.
+// The portable software fallback produces identical results, so correctness can
+// be validated on non-BMI2 hardware (e.g. Apple Silicon); only the speed
+// differs. NOTE: PEXT is microcoded and slow on pre-Zen3 AMD — gate USE_PEXT to
+// Intel Haswell+ / AMD Zen3+ targets.
+inline uint64_t pext_u64(uint64_t val, uint64_t mask) {
+#if defined(__BMI2__)
+    return _pext_u64(val, mask);
+#else
+    uint64_t res = 0;
+    uint64_t out_bit = 1;
+    while (mask) {
+        const uint64_t lsb = mask & (0ULL - mask);
+        if (val & lsb)
+            res |= out_bit;
+        out_bit <<= 1;
+        mask &= mask - 1;
+    }
+    return res;
+#endif
+}
 
 // class Bitboard;
 

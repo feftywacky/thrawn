@@ -75,6 +75,10 @@ constexpr int SEARCH_LATE_MOVE_PRUNING_DEPTH_1 = 8;
 constexpr int SEARCH_LATE_MOVE_PRUNING_DEPTH_2 = 12;
 constexpr int SEARCH_LATE_MOVE_PRUNING_DEPTH_3 = 24;
 
+// History pruning: skip late quiet moves with clearly bad history at low depth.
+constexpr int SEARCH_HISTORY_PRUNING_MAX_DEPTH = 4;
+constexpr int SEARCH_HISTORY_PRUNING_DEPTH_MARGIN = 2048;
+
 constexpr int SEARCH_LMR_FULL_DEPTH_MOVES = 3;
 constexpr int SEARCH_LMR_REDUCTION_DEPTH_LIMIT = 3;
 constexpr int SEARCH_LMR_BASE_REDUCTION = 0;
@@ -96,6 +100,11 @@ constexpr int SEARCH_PROBCUT_MIN_DEPTH = 5;
 constexpr int SEARCH_PROBCUT_REDUCTION = 3;
 constexpr int SEARCH_PROBCUT_MARGIN = 160;
 constexpr int SEARCH_PROBCUT_SEE_MARGIN = 0;
+
+// Internal Iterative Reductions: with no TT move to guide ordering at a deep
+// node, reduce one ply so the cheaper search can seed the TT with a move.
+constexpr int SEARCH_IIR_MIN_DEPTH = 4;
+constexpr int SEARCH_IIR_REDUCTION = 1;
 
 constexpr int SEARCH_QSEARCH_DELTA_MARGIN = 200;
 constexpr int SEARCH_SEE_PRUNE_MAX_DEPTH = 4;

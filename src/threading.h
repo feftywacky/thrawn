@@ -42,7 +42,6 @@ public:
 
     // Flags used for move ordering and search heuristics.
     bool follow_pv_flag;
-    bool score_pv_flag;
     bool allowNullMovePruning;
 
     long long nodes;

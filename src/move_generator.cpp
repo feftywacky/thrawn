@@ -92,30 +92,6 @@ inline void append_black_pawn_capture(int source, int target, MoveList& moves)
         moves.push_back(parse_move(source, target, p, 0, 1, 0, 0, 0));
 }
 
-inline int captured_piece_on(const thrawn::Position* pos, int side, uint64_t square)
-{
-    if (side == white)
-    {
-        if (pos->piece_bitboards[P] & square) return P;
-        if (pos->piece_bitboards[N] & square) return N;
-        if (pos->piece_bitboards[B] & square) return B;
-        if (pos->piece_bitboards[R] & square) return R;
-        if (pos->piece_bitboards[Q] & square) return Q;
-        if (pos->piece_bitboards[K] & square) return K;
-    }
-    else
-    {
-        if (pos->piece_bitboards[p] & square) return p;
-        if (pos->piece_bitboards[n] & square) return n;
-        if (pos->piece_bitboards[b] & square) return b;
-        if (pos->piece_bitboards[r] & square) return r;
-        if (pos->piece_bitboards[q] & square) return q;
-        if (pos->piece_bitboards[k] & square) return k;
-    }
-
-    return -1;
-}
-
 inline int piece_side(int piece)
 {
     return piece <= K ? white : black;
@@ -455,11 +431,16 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
     if (is_capture_move && get_bit(pos->piece_bitboards[opponent_king], target))
         return 0;
 
+    // Read the occupant of the target square from the mailbox before any
+    // mutation clobbers it; for a (non-ep) capture this is the captured piece.
+    const int captured_occupant = pos->mailbox[target];
+
     pop_bit(pos->piece_bitboards[piece], source);
     set_bit(pos->piece_bitboards[piece], target);
     pos->occupancies[moving_side] ^= source_bb | target_bb;
     pos->zobristKey ^= pos->piece_hashkey[piece][source];
     pos->zobristKey ^= pos->piece_hashkey[piece][target];
+    pos->mailbox[source] = -1;
     queue_nnue_remove(piece, source);
 
     pos->fifty_move++;
@@ -470,7 +451,7 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
     {
         pos->fifty_move = 0;
 
-        const int captured = enpassant_move ? -1 : captured_piece_on(pos, enemy_side, target_bb);
+        const int captured = enpassant_move ? -1 : captured_occupant;
         if (captured != -1)
         {
             if (undo != nullptr)
@@ -499,6 +480,9 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
         queue_nnue_add(piece, target);
     }
 
+    // Final occupant of the target square (overwrites any captured piece there).
+    pos->mailbox[target] = static_cast<int8_t>(promoted_piece ? promoted_piece : piece);
+
     if (enpassant_move)
     {
         const int captured_piece = (moving_side == white) ? p : P;
@@ -514,6 +498,7 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
         pop_bit(pos->piece_bitboards[captured_piece], captured_square);
         pos->occupancies[enemy_side] &= ~captured_bb;
         pos->zobristKey ^= pos->piece_hashkey[captured_piece][captured_square];
+        pos->mailbox[captured_square] = -1;
         queue_nnue_remove(captured_piece, captured_square);
     }
 
@@ -536,6 +521,8 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
             pos->occupancies[white] ^= square_bb(h1) | square_bb(f1);
             pos->zobristKey ^= pos->piece_hashkey[R][h1];
             pos->zobristKey ^= pos->piece_hashkey[R][f1];
+            pos->mailbox[h1] = -1;
+            pos->mailbox[f1] = R;
             queue_nnue_remove(R, h1);
             queue_nnue_add(R, f1);
         }
@@ -546,6 +533,8 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
             pos->occupancies[white] ^= square_bb(a1) | square_bb(d1);
             pos->zobristKey ^= pos->piece_hashkey[R][a1];
             pos->zobristKey ^= pos->piece_hashkey[R][d1];
+            pos->mailbox[a1] = -1;
+            pos->mailbox[d1] = R;
             queue_nnue_remove(R, a1);
             queue_nnue_add(R, d1);
         }
@@ -556,6 +545,8 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
             pos->occupancies[black] ^= square_bb(h8) | square_bb(f8);
             pos->zobristKey ^= pos->piece_hashkey[r][h8];
             pos->zobristKey ^= pos->piece_hashkey[r][f8];
+            pos->mailbox[h8] = -1;
+            pos->mailbox[f8] = r;
             queue_nnue_remove(r, h8);
             queue_nnue_add(r, f8);
         }
@@ -566,6 +557,8 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
             pos->occupancies[black] ^= square_bb(a8) | square_bb(d8);
             pos->zobristKey ^= pos->piece_hashkey[r][a8];
             pos->zobristKey ^= pos->piece_hashkey[r][d8];
+            pos->mailbox[a8] = -1;
+            pos->mailbox[d8] = r;
             queue_nnue_remove(r, a8);
             queue_nnue_add(r, d8);
         }
@@ -653,10 +646,16 @@ void unmake_move(thrawn::Position* pos, int ply)
     set_bit(pos->piece_bitboards[piece], source);
     pos->occupancies[moving_side] ^= source_bb | target_bb;
 
+    // Restore the mailbox: the mover returns to its source; target is emptied
+    // (a normal capture re-fills it below, en passant leaves it empty).
+    pos->mailbox[target] = -1;
+    pos->mailbox[source] = static_cast<int8_t>(piece);
+
     if (undo.captured_piece != -1)
     {
         set_bit(pos->piece_bitboards[undo.captured_piece], undo.captured_square);
         pos->occupancies[enemy_side] |= square_bb(undo.captured_square);
+        pos->mailbox[undo.captured_square] = static_cast<int8_t>(undo.captured_piece);
     }
 
     if (castling)
@@ -666,24 +665,32 @@ void unmake_move(thrawn::Position* pos, int ply)
             pop_bit(pos->piece_bitboards[R], f1);
             set_bit(pos->piece_bitboards[R], h1);
             pos->occupancies[white] ^= square_bb(f1) | square_bb(h1);
+            pos->mailbox[f1] = -1;
+            pos->mailbox[h1] = R;
         }
         else if (target == c1)
         {
             pop_bit(pos->piece_bitboards[R], d1);
             set_bit(pos->piece_bitboards[R], a1);
             pos->occupancies[white] ^= square_bb(d1) | square_bb(a1);
+            pos->mailbox[d1] = -1;
+            pos->mailbox[a1] = R;
         }
         else if (target == g8)
         {
             pop_bit(pos->piece_bitboards[r], f8);
             set_bit(pos->piece_bitboards[r], h8);
             pos->occupancies[black] ^= square_bb(f8) | square_bb(h8);
+            pos->mailbox[f8] = -1;
+            pos->mailbox[h8] = r;
         }
         else if (target == c8)
         {
             pop_bit(pos->piece_bitboards[r], d8);
             set_bit(pos->piece_bitboards[r], a8);
             pos->occupancies[black] ^= square_bb(d8) | square_bb(a8);
+            pos->mailbox[d8] = -1;
+            pos->mailbox[a8] = r;
         }
     }
 

@@ -105,7 +105,6 @@ ThreadData::ThreadData() {
     static_eval_stack.fill(no_hashmap_entry);
 
     follow_pv_flag = false;
-    score_pv_flag  = false;
     allowNullMovePruning = true;
 
     nodes = 0;
@@ -137,7 +136,6 @@ void ThreadData::resetThreadData() {
     static_eval_stack.fill(no_hashmap_entry);
 
     follow_pv_flag = false;
-    score_pv_flag  = false;
     allowNullMovePruning = true;
 
     nodes = 0;

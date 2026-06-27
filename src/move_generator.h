@@ -11,7 +11,10 @@ constexpr int MAX_GENERATED_MOVES = 256;
 using MoveConsumer = void (*)(int move, void* context);
 
 struct MoveList {
-    std::array<int, MAX_GENERATED_MOVES> moves{};
+    // Intentionally left uninitialized: only [0, count) is ever read (via
+    // begin()/end()/operator[]), so zero-initializing all 256 slots on every
+    // construction is pure wasted memset on the per-node hot path.
+    std::array<int, MAX_GENERATED_MOVES> moves;
     int count = 0;
     MoveConsumer consumer = nullptr;
     void* consumerContext = nullptr;

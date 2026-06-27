@@ -134,6 +134,15 @@ void parse_fen(thrawn::Position* pos, const char* fen)
     pos->occupancies[0] = get_white_occupancy(pos);
     pos->occupancies[1] = get_black_occupancy(pos);
     pos->occupancies[2] = get_both_occupancy(pos);
+
+    // rebuild the piece-on-square mailbox from the freshly parsed bitboards
+    pos->mailbox.fill(-1);
+    for (int piece = P; piece <= k; piece++)
+    {
+        uint64_t bb = pos->piece_bitboards[piece];
+        while (bb)
+            pos->mailbox[pop_lsb(bb)] = static_cast<int8_t>(piece);
+    }
     
     // init hashkeys
     pos->zobristKey = gen_hashkey(pos);
