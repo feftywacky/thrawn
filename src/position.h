@@ -87,6 +87,13 @@ public:
     uint64_t zobristKey;
     int fifty_move;
 
+    // Piece-on-square lookup (mailbox) kept in sync with piece_bitboards.
+    // Holds the piece index (P..k) on each square, or -1 when empty. Lets the
+    // make-move hot path resolve a captured piece with one load instead of a
+    // branchy linear scan over the 12 piece bitboards. Placed next to the board
+    // state so the make/unmake working set stays cache-line local.
+    std::array<int8_t, 64> mailbox;
+
     std::array<uint64_t, 1028> repetition_table; 
     int repetition_index;
 
@@ -100,9 +107,23 @@ public:
     static std::array<uint64_t, 64> king_attacks;
 
     static std::array<uint64_t, 64> bishop_masks;
-    static std::array<std::array<uint64_t, 512>, 64> bishop_attacks;
     static std::array<uint64_t, 64> rook_masks;
+
+#if defined(USE_PEXT)
+    // PEXT path: each square owns exactly 2^relevant_bits slots in a flat table
+    // addressed via *_attack_offset[square]; index = pext(occupancy, mask).
+    // Shrinks rook 2MB->~800KB and bishop 256KB->~41KB (better L2/L3 residency
+    // on x86, where this matters more than on M4's 4MB L2).
+    static constexpr int BISHOP_TABLE_SIZE = 5248;
+    static constexpr int ROOK_TABLE_SIZE = 102400;
+    static std::array<int, 64> bishop_attack_offset;
+    static std::array<int, 64> rook_attack_offset;
+    static std::array<uint64_t, BISHOP_TABLE_SIZE> bishop_attacks;
+    static std::array<uint64_t, ROOK_TABLE_SIZE> rook_attacks;
+#else
+    static std::array<std::array<uint64_t, 512>, 64> bishop_attacks;
     static std::array<std::array<uint64_t, 4096>, 64> rook_attacks;
+#endif
 
     static uint64_t piece_hashkey[12][64];
     static uint64_t enpassant_hashkey[64];

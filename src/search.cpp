@@ -95,8 +95,12 @@ int reverse_futility_margin(int depth, const StaticEvalContext& context) {
         margin += 24;
     if (context.opponentWorsening)
         margin -= 16;
-    if (context.cutNode)
-        margin -= 16;
+    // RFP only fires when static_eval - margin >= beta, which implies
+    // static_eval >= beta and (with the !isPvNode guard at the call site) makes
+    // context.cutNode necessarily true here. The cutNode term is therefore a
+    // constant -16 for RFP rather than a discriminating signal; apply it
+    // unconditionally so its effect is explicit.
+    margin -= 16;
     return std::max(80, margin);
 }
 
@@ -319,16 +323,10 @@ int captured_piece(thrawn::Position* pos, int move) {
         return pos->colour_to_move == white ? p : P;
     }
 
-    const int target = get_move_target(move);
-    const int start_piece = pos->colour_to_move == white ? p : P;
-    const int end_piece = pos->colour_to_move == white ? k : K;
-    for (int piece = start_piece; piece <= end_piece; piece++) {
-        if (get_bit(pos->piece_bitboards[piece], target)) {
-            return piece;
-        }
-    }
-
-    return -1;
+    // The victim of a (non-en-passant) capture is exactly the occupant of the
+    // target square, which the mailbox holds in O(1) — identical to the old
+    // 6-way piece-bitboard scan, but this runs on the hot SEE/move-ordering path.
+    return pos->mailbox[get_move_target(move)];
 }
 
 int promotion_gain(int move) {
@@ -367,22 +365,23 @@ int least_valuable_attacker(thrawn::Position* pos, int target, int side,
         return side == white ? N : n;
     }
 
-    attackers = get_bishop_attacks(pos, target, occupancy) &
-                side_pieces(pos, side, B, b) & occupancy;
+    const uint64_t bishopAttacks = get_bishop_attacks(pos, target, occupancy);
+    attackers = bishopAttacks & side_pieces(pos, side, B, b) & occupancy;
     if (attackers) {
         from = get_lsb_index(attackers);
         return side == white ? B : b;
     }
 
-    attackers = get_rook_attacks(pos, target, occupancy) &
-                side_pieces(pos, side, R, r) & occupancy;
+    const uint64_t rookAttacks = get_rook_attacks(pos, target, occupancy);
+    attackers = rookAttacks & side_pieces(pos, side, R, r) & occupancy;
     if (attackers) {
         from = get_lsb_index(attackers);
         return side == white ? R : r;
     }
 
-    attackers = get_queen_attacks(pos, target, occupancy) &
-                side_pieces(pos, side, Q, q) & occupancy;
+    // get_queen_attacks(target, occ) == bishop|rook attacks; reuse the sets
+    // already computed above instead of issuing two more slider-table lookups.
+    attackers = (bishopAttacks | rookAttacks) & side_pieces(pos, side, Q, q) & occupancy;
     if (attackers) {
         from = get_lsb_index(attackers);
         return side == white ? Q : q;
@@ -410,7 +409,10 @@ int static_exchange_eval(thrawn::Position* pos, int move) {
         return 0;
     }
 
-    std::array<int, 32> gains{};
+    // Uninitialized: the swap-off loop writes gains[0] then each gains[d] before
+    // it is ever read, and only [0, depth] is touched. Zero-init would memset
+    // 128 bytes on every SEE call (run per capture during move ordering/pruning).
+    std::array<int, 32> gains;
     int depth = 0;
     gains[0] = (victim == -1 ? 0 : piece_value(victim)) + promotion_gain(move);
 
@@ -421,7 +423,9 @@ int static_exchange_eval(thrawn::Position* pos, int move) {
         const int captured_square = pos->colour_to_move == white ? target + 8 : target - 8;
         occupancy &= ~(1ULL << captured_square);
         occupancy |= (1ULL << target);
-    } else if (!get_is_capture_move(move)) {
+    } else if (victim == -1) {
+        // victim == -1 here (non-en-passant branch) is exactly !get_is_capture_move:
+        // captured_piece() returns -1 iff the move is not a capture.
         occupancy |= (1ULL << target);
     }
 
@@ -454,8 +458,9 @@ int static_exchange_eval(thrawn::Position* pos, int move) {
     return gains[0];
 }
 
-bool qsearch_delta_prune(thrawn::Position* pos, int move, int static_eval, int alpha) {
-    if (is_mate_score(alpha) || noMajorsOrMinorsPieces(pos)) {
+bool qsearch_delta_prune(thrawn::Position* pos, int move, int static_eval, int alpha,
+                         bool pawnOnlyEndgame) {
+    if (is_mate_score(alpha) || pawnOnlyEndgame) {
         return false;
     }
 
@@ -932,16 +937,24 @@ struct PickedMove {
     bool seeKnown = false;
 };
 
+// No default member initializers: this keeps ScoredMove trivially default-
+// constructible so a FixedBuffer<ScoredMove, 256> can be left uninitialized on
+// construction (no per-element ctor loop). Every push_back below fully
+// brace-initializes all four fields, and only [0, count) is ever read.
 struct ScoredMove {
-    int move = 0;
-    int score = 0;
-    int seeScore = 0;
-    bool seeKnown = false;
+    int move;
+    int score;
+    int seeScore;
+    bool seeKnown;
 };
 
 template <typename T, std::size_t Capacity>
 struct FixedBuffer {
-    std::array<T, Capacity> values{};
+    // Backing storage is deliberately uninitialized: every access goes through
+    // count (push_back / operator[] / begin()..end()), so only [0, count) is
+    // touched. Value-initializing all Capacity (256) slots would memset several
+    // KB per buffer on every node — these buffers live on the negamax hot path.
+    std::array<T, Capacity> values;
     std::size_t count = 0;
 
     void clear() { count = 0; }
@@ -1118,13 +1131,11 @@ bool move_respects_absolute_pin(thrawn::Position* pos, int move) {
 
     const int enemyStart = side == white ? p : P;
     const int enemyEnd = side == white ? k : K;
-    int slider = -1;
-    for (int enemyPiece = enemyStart; enemyPiece <= enemyEnd; ++enemyPiece) {
-        if (get_bit(pos->piece_bitboards[enemyPiece], sliderSquare)) {
-            slider = enemyPiece;
-            break;
-        }
-    }
+    // sliderSquare is occupied (first_occupied_square_on_ray returned non-null),
+    // so its occupant is in the mailbox; the old loop matched only an enemy piece
+    // there, so reproduce that by keeping the occupant only when it is enemy-side.
+    const int occupant = pos->mailbox[sliderSquare];
+    const int slider = (occupant >= enemyStart && occupant <= enemyEnd) ? occupant : -1;
 
     if (slider == -1 || !slider_matches_pin_ray(slider, step))
         return true;
@@ -1250,7 +1261,7 @@ private:
     std::size_t tacticalIndex = 0;
     std::size_t badIndex = 0;
     std::size_t quietIndex = 0;
-    std::array<int, 8> triedMoves{};
+    std::array<int, 8> triedMoves;  // only [0, triedCount) is ever read
     int triedCount = 0;
 
     bool includes_quiets() const {
@@ -1659,9 +1670,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 td->ply_moves[parentPly] = move;
 
                 const bool savedFollowPv = td->follow_pv_flag;
-                const bool savedScorePv = td->score_pv_flag;
                 td->follow_pv_flag = false;
-                td->score_pv_flag = false;
 
                 score = -quiescence(pos, td, -probCutBeta, -probCutBeta + 1);
                 if (score >= probCutBeta)
@@ -1671,7 +1680,6 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 }
 
                 td->follow_pv_flag = savedFollowPv;
-                td->score_pv_flag = savedScorePv;
 
                 unmake_move(pos, pos->ply);
                 pos->ply--;
@@ -1684,22 +1692,38 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 {
                     update_correction_history(td, pos, raw_static_eval, beta, depth,
                                               BOUND_LOWER);
-                    tt->store(pos, depth, beta, BOUND_LOWER, move, raw_static_eval);
+                    // The fail-high was only proven by a search at probCutDepth
+                    // (plus the qsearch screen), so record the bound at that
+                    // verified depth, not the full node depth. Storing it at the
+                    // unreduced `depth` would let a later node take a TT cutoff as
+                    // though a full-depth search had confirmed beta.
+                    tt->store(pos, probCutDepth + 1, beta, BOUND_LOWER, move, raw_static_eval);
                     return beta;
                 }
             }
         }
     }
 
+    // --------------------------------------
+    // Internal Iterative Reductions (IIR)
+    // No usable TT move means move ordering at this node is poor, so a full-depth
+    // search would waste effort. Reduce one ply; the shallower search populates
+    // the TT with a best move that guides a later (re-)search of this node.
+    // Mutually exclusive with the singular extension below (which requires a TT
+    // move), and placed after all eval-based pruning so those use the true depth.
+    // --------------------------------------
+    if (!excludedNode && ttMove == 0 && depth >= SEARCH_IIR_MIN_DEPTH)
+    {
+        depth -= SEARCH_IIR_REDUCTION;
+    }
+
     const bool nodeFollowPv = td->follow_pv_flag;
-    td->score_pv_flag = false;
     MovePicker movePicker(pos, td, ttMove, nodeFollowPv, all_moves, inCheck);
 
     // We are about to search each move
     int valid_moves = 0;
     int moves_searched = 0;
     int quiet_moves_seen = 0;
-    bool pruned_moves = false;
     FixedBuffer<int, MAX_GENERATED_MOVES> failed_quiet_moves;
     FixedBuffer<int, MAX_GENERATED_MOVES> failed_capture_moves;
 
@@ -1742,7 +1766,6 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 static_eval + futility_margin_for_context(depth, evalContext) <= alpha &&
                 !gives_check())
             {
-                pruned_moves = true;
                 continue;
             }
 
@@ -1751,7 +1774,18 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 quiet_moves_seen > futility_move_count_for_context(depth, evalContext) &&
                 !gives_check())
             {
-                pruned_moves = true;
+                continue;
+            }
+
+            // History pruning: a quiet move with clearly bad history at shallow
+            // depth is very unlikely to raise alpha; skip it. Threshold scales
+            // linearly with depth, matching the futility/LMP gating above.
+            if (quietMove && !pawnMove && !castleMove &&
+                depth <= SEARCH_HISTORY_PRUNING_MAX_DEPTH &&
+                quiet_history_score(td, parentSide, parentPly, move) <
+                    -SEARCH_HISTORY_PRUNING_DEPTH_MARGIN * depth &&
+                !gives_check())
+            {
                 continue;
             }
 
@@ -1763,7 +1797,6 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                     : static_exchange_eval(pos, move);
                 if (seeScore < -SEARCH_SEE_PRUNE_DEPTH_MARGIN * depth && !gives_check())
                 {
-                    pruned_moves = true;
                     continue;
                 }
             }
@@ -1792,26 +1825,36 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             const int singularDepth = std::max(1, (depth - 1) / 2);
 
             const bool savedFollowPv = td->follow_pv_flag;
-            const bool savedScorePv = td->score_pv_flag;
             const int savedPvLength = td->pv_length[pos->ply];
-            const auto savedPvRow = td->pv_table[pos->ply];
+            // The singular re-search runs at this same ply and clobbers
+            // td->pv_table[ply]/pv_length[ply]. Only the valid prefix
+            // [ply, savedPvLength) is ever read afterwards (reads are bounded by
+            // pv_length, and a later alpha-raise rewrites the row from `ply`),
+            // so save/restore just that slice instead of memcpy-ing all 64 ints.
+            std::array<int, MAX_DEPTH> savedPvRow;
+            for (int i = pos->ply; i < savedPvLength; ++i)
+                savedPvRow[i] = td->pv_table[pos->ply][i];
             td->follow_pv_flag = false;
-            td->score_pv_flag = false;
 
             const int singularScore = negamax_impl(pos, td, singularDepth,
                                                    singularBeta - 1,
                                                    singularBeta, move);
 
             td->follow_pv_flag = savedFollowPv;
-            td->score_pv_flag = savedScorePv;
             td->pv_length[pos->ply] = savedPvLength;
-            td->pv_table[pos->ply] = savedPvRow;
+            for (int i = pos->ply; i < savedPvLength; ++i)
+                td->pv_table[pos->ply][i] = savedPvRow[i];
 
             if (stopped.load(std::memory_order_relaxed) == 1)
                 return alpha;
 
             if (singularScore < singularBeta)
                 extension = SEARCH_SINGULAR_EXTENSION;
+            // Negative extension: the TT move is not singular and the table
+            // already proves a fail-high here, so other moves are likely just as
+            // good. Spend one ply less on this subtree.
+            else if (ttScore >= beta)
+                extension = -SEARCH_SINGULAR_EXTENSION;
         }
 
         pos->ply++;
@@ -1831,13 +1874,10 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
         auto search_child = [&](int searchDepth, int childAlpha, int childBeta) {
             const bool savedFollowPv = td->follow_pv_flag;
-            const bool savedScorePv = td->score_pv_flag;
             td->follow_pv_flag = nodeFollowPv && td->pv_table[0][parentPly] == move;
-            td->score_pv_flag = false;
             const int childScore = -negamax_impl(pos, td, searchDepth, childAlpha,
                                                  childBeta, 0);
             td->follow_pv_flag = savedFollowPv;
-            td->score_pv_flag = savedScorePv;
             return childScore;
         };
 
@@ -1870,6 +1910,19 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 int reduction = late_move_reduction(depth, moves_searched + 1,
                                                     isPvNode, counterMove, quietHistory,
                                                     evalContext);
+                int reducedDepth = std::max(1, childDepth - reduction);
+                score = search_child(reducedDepth, -alpha - 1, -alpha);
+            }
+            else if (captureMove && picked.seeKnown && picked.seeScore < 0 &&
+                     !get_promoted_piece(move) &&
+                     depth >= SEARCH_LMR_REDUCTION_DEPTH_LIMIT &&
+                     !inCheck && !gives_check())
+            {
+                // Late losing captures (negative SEE) are very unlikely to be
+                // best; reduce them like late quiets. A PVS re-search below
+                // restores full depth if the reduced search still beats alpha.
+                int reduction = late_move_reduction(depth, moves_searched + 1,
+                                                    isPvNode, false, 0, evalContext);
                 int reducedDepth = std::max(1, childDepth - reduction);
                 score = search_child(reducedDepth, -alpha - 1, -alpha);
             }
@@ -1981,11 +2034,9 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         if (excludedNode)
             return alpha;
 
-        if (pruned_moves)
-            return alpha;
-
-        // (should not happen because we handle moves.empty() above,
-        //  but just in case)
+        // Note: pruning (futility/LMP/SEE) is gated on !firstMove, so it never
+        // fires before a legal move has been searched. Reaching valid_moves == 0
+        // therefore means a genuine stalemate/checkmate, handled below.
         if (inCheck)
             return -mateVal + pos->ply;
         else
@@ -2096,21 +2147,26 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     int bestMove = 0;
     int bestScore = inCheck ? -SEARCH_INFINITY : alpha;
 
+    // Both are invariant across this node's move loop (each move is made then
+    // unmade, leaving pos unchanged), so compute them once instead of per move.
+    const bool pawnOnlyEndgame = noMajorsOrMinorsPieces(pos);
+    const uint64_t enemyKing =
+        pos->piece_bitboards[pos->colour_to_move == white ? k : K];
+
     PickedMove picked;
     while (movePicker.next(picked))
     {
         const int move = picked.move;
         const bool promotionMove = get_promoted_piece(move) != 0;
         const bool deltaPruned = !inCheck && !promotionMove &&
-                                 qsearch_delta_prune(pos, move, static_eval, alpha);
+                                 qsearch_delta_prune(pos, move, static_eval, alpha,
+                                                     pawnOnlyEndgame);
         bool seePruned = false;
         if (!inCheck && !promotionMove &&
             get_is_capture_move(move) &&
             get_move_piece(move) != K && get_move_piece(move) != k)
         {
             const int target = get_move_target(move);
-            const uint64_t enemyKing =
-                pos->piece_bitboards[pos->colour_to_move == white ? k : K];
             if (!(pos->king_attacks[target] & enemyKing))
             {
                 const int seeScore = picked.seeKnown

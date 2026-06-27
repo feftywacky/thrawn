@@ -324,37 +324,53 @@ void init_magic_nums()
 // is <square> under attacked by <side> pieces
 bool is_square_under_attack(const thrawn::Position* pos, int square, int side)
 {
-    if ((side == white) && (pos->pawn_attacks[black][square] & pos->piece_bitboards[P]))
+    // Leaping attackers (pawn, knight, king) are resolved with cheap, L1-resident
+    // table lookups. Fuse them into a single branch so the common "in check by a
+    // leaping piece / king-adjacency" cases return before touching the large
+    // (2 MB rook + 256 KB bishop) magic-attack tables below.
+    const uint64_t leaping = (side == white)
+        ? (pos->pawn_attacks[black][square] & pos->piece_bitboards[P])
+          | (pos->knight_attacks[square]    & pos->piece_bitboards[N])
+          | (pos->king_attacks[square]      & pos->piece_bitboards[K])
+        : (pos->pawn_attacks[white][square] & pos->piece_bitboards[p])
+          | (pos->knight_attacks[square]    & pos->piece_bitboards[n])
+          | (pos->king_attacks[square]      & pos->piece_bitboards[k]);
+    if (leaping)
         return true;
 
-    if ((side == black) && (pos->pawn_attacks[white][square] & pos->piece_bitboards[p]))
-        return true;
-
-    const uint64_t knights = (side == white) ? pos->piece_bitboards[N] : pos->piece_bitboards[n];
-    if (pos->knight_attacks[square] & knights)
-        return true;
+    const uint64_t occupancy = pos->occupancies[both];
 
     const uint64_t diagonal_sliders = (side == white)
         ? (pos->piece_bitboards[B] | pos->piece_bitboards[Q])
         : (pos->piece_bitboards[b] | pos->piece_bitboards[q]);
-    if (get_bishop_attacks(pos, square, pos->occupancies[both]) & diagonal_sliders)
-        return true;
-
     const uint64_t orthogonal_sliders = (side == white)
         ? (pos->piece_bitboards[R] | pos->piece_bitboards[Q])
         : (pos->piece_bitboards[r] | pos->piece_bitboards[q]);
-    if (get_rook_attacks(pos, square, pos->occupancies[both]) & orthogonal_sliders)
-        return true;
 
-    const uint64_t king = (side == white) ? pos->piece_bitboards[K] : pos->piece_bitboards[k];
-    if (pos->king_attacks[square] & king)
-        return true;
-
-    return false;
+    // Issue both magic-table lookups without an intervening branch so the
+    // out-of-order core overlaps the two (latency-bound) loads instead of
+    // serialising them. The not-in-check case (the common one) touches both
+    // tables anyway, so there is no extra work on the hot path.
+    const uint64_t bishop_hits = get_bishop_attacks(pos, square, occupancy) & diagonal_sliders;
+    const uint64_t rook_hits   = get_rook_attacks(pos, square, occupancy) & orthogonal_sliders;
+    return (bishop_hits | rook_hits) != 0ULL;
 }
 
 void init_sliding_attacks(thrawn::Position* pos, int isBishop)
 {
+#if defined(USE_PEXT)
+    // Assign each square a contiguous slice (2^relevant_bits) of the flat table.
+    int running_offset = 0;
+    for (int square = 0; square < 64; square++)
+    {
+        if (isBishop)
+            pos->bishop_attack_offset[square] = running_offset;
+        else
+            pos->rook_attack_offset[square] = running_offset;
+        running_offset += 1 << (isBishop ? bishop_relevant_bits[square] : rook_relevant_bits[square]);
+    }
+#endif
+
     for (int square = 0;square<64;square++)
     {
         if (isBishop)
@@ -373,15 +389,25 @@ void init_sliding_attacks(thrawn::Position* pos, int isBishop)
             if (isBishop)
             {
                 uint64_t occupancy = set_occupancy(i, relevant_bits_count, curr_attack_mask);
+#if defined(USE_PEXT)
+                int index = pext_u64(occupancy, pos->bishop_masks[square]);
+                pos->bishop_attacks[pos->bishop_attack_offset[square] + index] = bishop_attack_runtime_gen(square, occupancy);
+#else
                 int magic_index = (occupancy * bishop_magic_nums[square]) >> (64-bishop_relevant_bits[square]);
                 pos->bishop_attacks[square][magic_index] = bishop_attack_runtime_gen(square, occupancy);
+#endif
             }
             else
             {
 
                 uint64_t occupancy = set_occupancy(i, relevant_bits_count, curr_attack_mask);
+#if defined(USE_PEXT)
+                int index = pext_u64(occupancy, pos->rook_masks[square]);
+                pos->rook_attacks[pos->rook_attack_offset[square] + index] = rook_attack_runtime_gen(square, occupancy);
+#else
                 int magic_index = (occupancy * rook_magic_nums[square]) >> (64-rook_relevant_bits[square]);
                 pos->rook_attacks[square][magic_index] = rook_attack_runtime_gen(square, occupancy);
+#endif
             }
         }
     }

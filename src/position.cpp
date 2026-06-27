@@ -25,9 +25,16 @@ std::array<uint64_t, 64> Position::knight_attacks{};
 std::array<uint64_t, 64> Position::king_attacks{};
 
 std::array<uint64_t, 64> Position::bishop_masks{};
-std::array<std::array<uint64_t, 512>, 64> Position::bishop_attacks{};
 std::array<uint64_t, 64> Position::rook_masks{};
+#if defined(USE_PEXT)
+std::array<int, 64> Position::bishop_attack_offset{};
+std::array<int, 64> Position::rook_attack_offset{};
+std::array<uint64_t, Position::BISHOP_TABLE_SIZE> Position::bishop_attacks{};
+std::array<uint64_t, Position::ROOK_TABLE_SIZE> Position::rook_attacks{};
+#else
+std::array<std::array<uint64_t, 512>, 64> Position::bishop_attacks{};
 std::array<std::array<uint64_t, 4096>, 64> Position::rook_attacks{};
+#endif
 
 uint64_t Position::piece_hashkey[12][64]{};
 uint64_t Position::enpassant_hashkey[64]{};
@@ -83,6 +90,7 @@ Position::Position()
       ply(0),
       nnue_stack(),
       undo_stack{} {
+    mailbox.fill(-1);
     std::call_once(position_tables_once, init_position_tables, this);
 }
 
@@ -94,6 +102,7 @@ Position::Position(const Position& other)
       castle_rights(other.castle_rights),
       zobristKey(other.zobristKey),
       fifty_move(other.fifty_move),
+      mailbox(other.mailbox),
       repetition_table(other.repetition_table),
       repetition_index(other.repetition_index),
       ply(other.ply),
@@ -118,6 +127,7 @@ Position& Position::operator=(const Position& other) {
     castle_rights = other.castle_rights;
     zobristKey = other.zobristKey;
     fifty_move = other.fifty_move;
+    mailbox = other.mailbox;
     repetition_table = other.repetition_table;
     repetition_index = other.repetition_index;
     ply = other.ply;

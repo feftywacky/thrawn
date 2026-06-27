@@ -49,10 +49,15 @@ uint64_t get_bishop_mask(const int& square);
 uint64_t bishop_attack_runtime_gen(int square, const uint64_t& blockers);
 inline uint64_t get_bishop_attacks(const thrawn::Position* pos, int square, uint64_t occupancy)
 {
+#if defined(USE_PEXT)
+    return pos->bishop_attacks[pos->bishop_attack_offset[square] +
+                               pext_u64(occupancy, pos->bishop_masks[square])];
+#else
     occupancy &= pos->bishop_masks[square];
     occupancy *= bishop_magic_nums[square];
     occupancy >>= 64 - bishop_relevant_bits[square];
     return pos->bishop_attacks[square][occupancy];
+#endif
 }
 
 // rooks
@@ -60,10 +65,15 @@ uint64_t get_rook_mask(const int& square);
 uint64_t rook_attack_runtime_gen(int square, uint64_t& blockers);
 inline uint64_t get_rook_attacks(const thrawn::Position* pos, int square, uint64_t occupancy)
 {
+#if defined(USE_PEXT)
+    return pos->rook_attacks[pos->rook_attack_offset[square] +
+                             pext_u64(occupancy, pos->rook_masks[square])];
+#else
     occupancy &= pos->rook_masks[square];
     occupancy *= rook_magic_nums[square];
     occupancy >>= 64 - rook_relevant_bits[square];
     return pos->rook_attacks[square][occupancy];
+#endif
 }
 
 // queen

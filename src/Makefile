@@ -104,6 +104,20 @@ else
 endif
 
 # -----------------------------------------------------------------------------
+# PEXT bitboards (opt-in: `make PEXT=1`)
+# -----------------------------------------------------------------------------
+# Replaces magic-multiply slider indexing with the BMI2 PEXT instruction and
+# packed (fancy) attack tables. Recommended ONLY on Intel Haswell+ and AMD Zen3+
+# where PEXT is fast; it is microcoded/slow on pre-Zen3 AMD. On non-BMI2 targets
+# (e.g. arm64) a portable software-PEXT fallback is used (correct, but slow).
+ifeq ($(PEXT),1)
+    CPPFLAGS += -DUSE_PEXT
+    ifneq ($(filter x86_64 AMD64,$(ARCH_DETECTED)),)
+        ARCH_FLAGS += -mbmi2
+    endif
+endif
+
+# -----------------------------------------------------------------------------
 # Build Types
 # -----------------------------------------------------------------------------
 ifeq ($(BUILD),debug)
