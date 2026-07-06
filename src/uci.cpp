@@ -593,7 +593,7 @@ void uci_loop(thrawn::Position* pos)
     #define INPUT_BUFFER 20000
     
     int max_hashmap_size = 1024; // 1GB
-    int mb = 128; // default 128 MB
+    int mb = 256; // default 256 MB
 
     // reset STDIN & STDOUT buffers
     setbuf(stdin, NULL);
@@ -656,7 +656,7 @@ void uci_loop(thrawn::Position* pos)
             cout << "id author Feiyu Lin\n";
             cout << "option name Hash type spin default 256 min 4 max " << max_hashmap_size << "\n";
             cout << "option name Threads type spin default 1 min 1 max 16" << "\n";
-            cout << "option name EvalFile type string default thrawn-nn-1.nnue" << "\n";
+            cout << "option name EvalFile type string default thrawn-nn-2.nnue" << "\n";
             cout << "uciok\n";
         }
         
@@ -686,7 +686,7 @@ void uci_loop(thrawn::Position* pos)
             else if (option_name_equals(optionName, "EvalFile")) {
                 std::string path = optionValue;
                 if (path.empty()) {
-                    path = "thrawn-nn-1.nnue";
+                    path = "thrawn-nn-2.nnue";
                 }
                 nnue_init(path.c_str());
                 nnue_refresh_root(pos);

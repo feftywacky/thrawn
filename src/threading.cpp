@@ -377,6 +377,14 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             std::cout.flush();
         }
     }
+
+    // Lazy SMP: only the master thread is gated on the requested search depth
+    // (mirrors Stockfish's `limits.depth && mainThread` loop condition). Once
+    // the master has completed maxDepth, signal all helper threads to stop so
+    // they abort their in-progress iteration instead of independently grinding
+    // to maxDepth and gating the join on the slowest straggler.
+    if (threadID == 0)
+        stopped.store(1, std::memory_order_relaxed);
 }
 
 /**
