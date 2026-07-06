@@ -1328,15 +1328,15 @@ private:
 
     bool next_scored(FixedBuffer<ScoredMove, MAX_GENERATED_MOVES>& moves, std::size_t& index,
                      PickedMove& picked) {
-        while (index < moves.size()) {
+        // No already_tried()/mark_tried() here: quietMoves and badTacticals are
+        // both built after every special move (tt/pv/killers/counter) has been
+        // marked tried, and add_quiet()/add_tactical()/next_good_tactical() all
+        // exclude tried moves at insertion time. So nothing in these buffers is
+        // ever a tried move, and no later stage reads the tried set for them.
+        if (index < moves.size()) {
             const std::size_t best = select_best(moves, index);
-            ScoredMove scored = moves[best];
+            const ScoredMove scored = moves[best];
             ++index;
-            if (already_tried(scored.move)) {
-                continue;
-            }
-
-            mark_tried(scored.move);
             picked = {scored.move, scored.seeScore, scored.seeKnown};
             return true;
         }

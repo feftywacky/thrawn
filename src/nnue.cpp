@@ -34,20 +34,24 @@
 namespace {
 
 constexpr char kExpectedMagic[8] = {'T', 'H', 'N', 'N', 'U', 'E', '\0', '\1'};
-constexpr uint32_t kCurrentVersion = 8;
+constexpr uint32_t kCurrentVersion = 9;
 constexpr uint32_t kExpectedNumFeatures = thrawn::NNUE_INPUT_FEATURES;
 constexpr uint32_t kExpectedPsNb = thrawn::NNUE_PS_NB;
 constexpr uint32_t kExpectedFtSize = thrawn::NNUE_FT_SIZE;
 constexpr uint32_t kExpectedHiddenSize = thrawn::NNUE_HIDDEN_SIZE;
 constexpr uint32_t kExpectedForwardSize = thrawn::NNUE_FORWARD_SIZE;
 constexpr uint32_t kExpectedFc0OutputSize = thrawn::NNUE_FC0_OUTPUT_SIZE;
+constexpr uint32_t kExpectedFc0InputSize = thrawn::NNUE_FT_SIZE;   // pairwise SqrCReLU: 2*FtSize -> FtSize
 constexpr uint32_t kExpectedFc1InputSize = thrawn::NNUE_FC1_INPUT_SIZE;
 constexpr uint32_t kExpectedFc1OutputSize = thrawn::NNUE_FC1_OUTPUT_SIZE;
 constexpr uint32_t kExpectedOutputPerspective = 1;
 constexpr const char* kExpectedFeatureSet = "HalfKAv2_hm";
-constexpr const char* kDefaultEvalFile = "thrawn-nn-1.nnue";
+constexpr const char* kDefaultEvalFile = "thrawn-nn-2.nnue";
 
-constexpr int kFc0InputSize = static_cast<int>(kExpectedFtSize) * 2;
+// The FT output is activated (pairwise SqrCReLU) before fc0, so fc0 is a
+// u8 x i8 layer whose input width equals the accumulator width, not twice it.
+constexpr int kFc0InputSize = static_cast<int>(kExpectedFtSize);
+constexpr int kFtActivationHalf = static_cast<int>(kExpectedFtSize) / 2;
 constexpr int kFc1InputPaddedSize = 64;
 constexpr int kFc2OutputSize = 1;
 constexpr int kKingPlaneOffset = 10 * 64;
@@ -67,8 +71,8 @@ static_assert(kExpectedFc1OutputSize % 4 == 0, "fc1 output must fit x4 dense ker
 static_assert(kFc1InputPaddedSize >= static_cast<int>(kExpectedFc1InputSize),
               "fc1 padding too small");
 static_assert(kFc1InputPaddedSize % 32 == 0, "fc1 padded input must fit AVX2 kernels");
-static_assert(kExpectedFtSize <= 4096,
-              "NEON int16*int8 dot kernels keep per-lane sums in int32");
+static_assert(kFc0InputSize % 64 == 0, "fc0 u8 x i8 dense kernels consume 64 inputs per step");
+static_assert(kFtActivationHalf % 32 == 0, "pairwise SqrCReLU processes 32 lanes per step");
 
 constexpr std::array<int, 64> kKingBuckets{{
     28, 29, 30, 31, 31, 30, 29, 28,
@@ -196,6 +200,13 @@ struct LoadedNetwork {
     int32_t qfc1 = 0;
     int32_t qfc2 = 0;
 
+    // Pairwise SqrCReLU realization of the FT activation. `ft_one` is the int16
+    // value representing 1.0 (== qft). The clamped product is renormalized by
+    // `>> act_shift` so its "one" is `act_one` (a uint8, e.g. 127 for ft_one=255).
+    int32_t ft_one = 0;
+    int32_t act_shift = 0;
+    int32_t act_one = 0;
+
     float inv_ft_scale = 0.0f;
     float inv_fc0_scale = 0.0f;
     float inv_fc1_scale = 0.0f;
@@ -206,7 +217,6 @@ struct LoadedNetwork {
 
     std::array<int32_t, kExpectedFc0OutputSize> fc0_bias{};
     alignas(64) std::array<std::array<int8_t, kFc0InputSize>, kExpectedFc0OutputSize> fc0_weight_t{};
-    alignas(64) std::array<std::array<int16_t, kFc0InputSize>, kExpectedFc0OutputSize> fc0_weight_i16_t{};
 
     std::array<int32_t, kExpectedFc1OutputSize> fc1_bias{};
     alignas(64) std::array<std::array<int8_t, kFc1InputPaddedSize>, kExpectedFc1OutputSize> fc1_weight_t{};
@@ -584,325 +594,211 @@ struct AccumulatorFeatureUpdate {
 };
 
 #if defined(USE_AVX2)
+// The 1024-int16 (2 KB) accumulator is patched on every make-move, so each kernel
+// is unrolled 2x (two independent 256-bit chains) to expose ILP and hide load
+// latency instead of a single load->op->store dependency per iteration. FtSize is
+// a multiple of 32, so the unrolled stride divides evenly. All ops are wrapping
+// (non-saturating), so the reordering/fusion below is bit-identical to the naive
+// element-by-element version.
 static inline void acc_add_row_avx2(int16_t* acc, const int16_t* row) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
-        const __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i));
-        const __m256i r = _mm256_load_si256(reinterpret_cast<const __m256i*>(row + i));
-        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i), _mm256_add_epi16(a, r));
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_add_epi16(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i)),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(row + i)));
+        const __m256i a1 = _mm256_add_epi16(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i + 16)),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(row + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i + 16), a1);
     }
 }
 
 static inline void acc_sub_row_avx2(int16_t* acc, const int16_t* row) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
-        const __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i));
-        const __m256i r = _mm256_load_si256(reinterpret_cast<const __m256i*>(row + i));
-        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i), _mm256_sub_epi16(a, r));
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_sub_epi16(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i)),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(row + i)));
+        const __m256i a1 = _mm256_sub_epi16(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i + 16)),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(row + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i + 16), a1);
     }
 }
 
 static inline void acc_add_sub_row_avx2(int16_t* acc, const int16_t* add, const int16_t* sub) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
-        __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i));
-        const __m256i add_row = _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i));
-        const __m256i sub_row = _mm256_load_si256(reinterpret_cast<const __m256i*>(sub + i));
-        a = _mm256_sub_epi16(_mm256_add_epi16(a, add_row), sub_row);
-        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i), a);
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_sub_epi16(
+            _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i)),
+                             _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub + i)));
+        const __m256i a1 = _mm256_sub_epi16(
+            _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i + 16)),
+                             _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i + 16))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(acc + i + 16), a1);
     }
 }
 
-int64_t dot_i16_i8_avx2(const int16_t* x, const int8_t* w, int count) {
-    __m256i acc0 = _mm256_setzero_si256();
-    __m256i acc1 = _mm256_setzero_si256();
-
-    int i = 0;
-    for (; i + 31 < count; i += 32) {
-        const __m256i x0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(x + i));
-        const __m256i x1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(x + i + 16));
-        const __m256i w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + i)));
-        const __m256i w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + i + 16)));
-
-        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(x0, w0));
-        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(x1, w1));
-    }
-
-    acc0 = _mm256_add_epi32(acc0, acc1);
-
-    alignas(32) int32_t lanes[8];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc0);
-
-    int64_t sum = 0;
-    for (int lane : lanes) {
-        sum += lane;
-    }
-    for (; i < count; ++i) {
-        sum += static_cast<int32_t>(x[i]) * static_cast<int32_t>(w[i]);
-    }
-    return sum;
-}
-
-static inline int64_t reduce_add_i16_i8_epi32(__m256i acc) {
-    alignas(32) int32_t lanes[8];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), acc);
-
-    int64_t sum = 0;
-    for (int lane : lanes) {
-        sum += lane;
-    }
-    return sum;
-}
-
-void dot_i16_i8_x4_avx2(const int16_t* x,
-                        const int8_t* w0,
-                        const int8_t* w1,
-                        const int8_t* w2,
-                        const int8_t* w3,
-                        int count,
-                        int64_t& s0,
-                        int64_t& s1,
-                        int64_t& s2,
-                        int64_t& s3) {
-    __m256i a00 = _mm256_setzero_si256();
-    __m256i a01 = _mm256_setzero_si256();
-    __m256i a10 = _mm256_setzero_si256();
-    __m256i a11 = _mm256_setzero_si256();
-    __m256i a20 = _mm256_setzero_si256();
-    __m256i a21 = _mm256_setzero_si256();
-    __m256i a30 = _mm256_setzero_si256();
-    __m256i a31 = _mm256_setzero_si256();
-
-    int i = 0;
-    for (; i + 31 < count; i += 32) {
-        const __m256i x0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(x + i));
-        const __m256i x1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(x + i + 16));
-
-        a00 = _mm256_add_epi32(a00, _mm256_madd_epi16(x0, _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w0 + i)))));
-        a01 = _mm256_add_epi32(a01, _mm256_madd_epi16(x1, _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w0 + i + 16)))));
-        a10 = _mm256_add_epi32(a10, _mm256_madd_epi16(x0, _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w1 + i)))));
-        a11 = _mm256_add_epi32(a11, _mm256_madd_epi16(x1, _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w1 + i + 16)))));
-        a20 = _mm256_add_epi32(a20, _mm256_madd_epi16(x0, _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w2 + i)))));
-        a21 = _mm256_add_epi32(a21, _mm256_madd_epi16(x1, _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w2 + i + 16)))));
-        a30 = _mm256_add_epi32(a30, _mm256_madd_epi16(x0, _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w3 + i)))));
-        a31 = _mm256_add_epi32(a31, _mm256_madd_epi16(x1, _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w3 + i + 16)))));
-    }
-
-    s0 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a00, a01));
-    s1 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a10, a11));
-    s2 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a20, a21));
-    s3 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a30, a31));
-
-    for (; i < count; ++i) {
-        const int32_t xi = x[i];
-        s0 += xi * static_cast<int32_t>(w0[i]);
-        s1 += xi * static_cast<int32_t>(w1[i]);
-        s2 += xi * static_cast<int32_t>(w2[i]);
-        s3 += xi * static_cast<int32_t>(w3[i]);
+// Fused copy+patch variants: write dst = src (+add) (-sub) in a single pass,
+// reading from a separate source accumulator. Used when a child ply still shares
+// an ancestor's accumulator: instead of a 2 KB memcpy(dst,src) followed by an
+// in-place patch (2 reads + 2 writes of the accumulator), this does 1 read of src
+// + 1 write of dst, halving accumulator memory traffic on the make-move hot path.
+// Bit-identical to copy-then-patch (wrapping arithmetic). See the NEON twins.
+static inline void acc_add_row_from_avx2(int16_t* dst, const int16_t* src, const int16_t* add) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_add_epi16(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(src + i)),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i)));
+        const __m256i a1 = _mm256_add_epi16(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(src + i + 16)),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i + 16), a1);
     }
 }
 
-void dot_i16_i16_x4_avx2(const int16_t* x,
-                         const int16_t* w0,
-                         const int16_t* w1,
-                         const int16_t* w2,
-                         const int16_t* w3,
-                         int count,
-                         int64_t& s0,
-                         int64_t& s1,
-                         int64_t& s2,
-                         int64_t& s3) {
-    __m256i a00 = _mm256_setzero_si256();
-    __m256i a01 = _mm256_setzero_si256();
-    __m256i a10 = _mm256_setzero_si256();
-    __m256i a11 = _mm256_setzero_si256();
-    __m256i a20 = _mm256_setzero_si256();
-    __m256i a21 = _mm256_setzero_si256();
-    __m256i a30 = _mm256_setzero_si256();
-    __m256i a31 = _mm256_setzero_si256();
-
-    int i = 0;
-    for (; i + 31 < count; i += 32) {
-        const __m256i x0 = _mm256_load_si256(reinterpret_cast<const __m256i*>(x + i));
-        const __m256i x1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(x + i + 16));
-
-        a00 = _mm256_add_epi32(a00, _mm256_madd_epi16(x0, _mm256_load_si256(reinterpret_cast<const __m256i*>(w0 + i))));
-        a01 = _mm256_add_epi32(a01, _mm256_madd_epi16(x1, _mm256_load_si256(reinterpret_cast<const __m256i*>(w0 + i + 16))));
-        a10 = _mm256_add_epi32(a10, _mm256_madd_epi16(x0, _mm256_load_si256(reinterpret_cast<const __m256i*>(w1 + i))));
-        a11 = _mm256_add_epi32(a11, _mm256_madd_epi16(x1, _mm256_load_si256(reinterpret_cast<const __m256i*>(w1 + i + 16))));
-        a20 = _mm256_add_epi32(a20, _mm256_madd_epi16(x0, _mm256_load_si256(reinterpret_cast<const __m256i*>(w2 + i))));
-        a21 = _mm256_add_epi32(a21, _mm256_madd_epi16(x1, _mm256_load_si256(reinterpret_cast<const __m256i*>(w2 + i + 16))));
-        a30 = _mm256_add_epi32(a30, _mm256_madd_epi16(x0, _mm256_load_si256(reinterpret_cast<const __m256i*>(w3 + i))));
-        a31 = _mm256_add_epi32(a31, _mm256_madd_epi16(x1, _mm256_load_si256(reinterpret_cast<const __m256i*>(w3 + i + 16))));
+static inline void acc_sub_row_from_avx2(int16_t* dst, const int16_t* src, const int16_t* sub) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_sub_epi16(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(src + i)),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub + i)));
+        const __m256i a1 = _mm256_sub_epi16(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(src + i + 16)),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i + 16), a1);
     }
+}
 
-    s0 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a00, a01));
-    s1 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a10, a11));
-    s2 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a20, a21));
-    s3 = reduce_add_i16_i8_epi32(_mm256_add_epi32(a30, a31));
+static inline void acc_add_sub_row_from_avx2(int16_t* dst, const int16_t* src,
+                                             const int16_t* add, const int16_t* sub) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_sub_epi16(
+            _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i)),
+                             _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub + i)));
+        const __m256i a1 = _mm256_sub_epi16(
+            _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i + 16)),
+                             _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i + 16))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i + 16), a1);
+    }
+}
 
-    for (; i < count; ++i) {
-        const int32_t xi = x[i];
-        s0 += xi * static_cast<int32_t>(w0[i]);
-        s1 += xi * static_cast<int32_t>(w1[i]);
-        s2 += xi * static_cast<int32_t>(w2[i]);
-        s3 += xi * static_cast<int32_t>(w3[i]);
+// Pairwise SqrCReLU on one perspective's accumulator: for i in [0, half)
+//   out[i] = (clamp(acc[i], 0, ft_one) * clamp(acc[i + half], 0, ft_one)) >> shift
+// ft_one <= 255 keeps clamp(a)*clamp(b) < 2^16, so _mm256_mullo_epi16 yields the
+// exact product and _mm256_srl_epi16 (logical) renormalizes it into [0, act_one].
+void ft_pairwise_screlu_avx2(const int16_t* acc, uint8_t* out, int half, int ft_one, int shift) {
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i vmax = _mm256_set1_epi16(static_cast<int16_t>(ft_one));
+    const __m128i vshift = _mm_cvtsi32_si128(shift);
+
+    for (int i = 0; i < half; i += 32) {
+        __m256i lo_a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i));
+        __m256i lo_b = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i + half));
+        lo_a = _mm256_min_epi16(_mm256_max_epi16(lo_a, zero), vmax);
+        lo_b = _mm256_min_epi16(_mm256_max_epi16(lo_b, zero), vmax);
+        const __m256i lo = _mm256_srl_epi16(_mm256_mullo_epi16(lo_a, lo_b), vshift);
+
+        __m256i hi_a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i + 16));
+        __m256i hi_b = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc + i + 16 + half));
+        hi_a = _mm256_min_epi16(_mm256_max_epi16(hi_a, zero), vmax);
+        hi_b = _mm256_min_epi16(_mm256_max_epi16(hi_b, zero), vmax);
+        const __m256i hi = _mm256_srl_epi16(_mm256_mullo_epi16(hi_a, hi_b), vshift);
+
+        __m256i packed = _mm256_packus_epi16(lo, hi);
+        packed = _mm256_permute4x64_epi64(packed, 0xD8);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(out + i), packed);
     }
 }
 
 #endif
 
 #if defined(USE_NEON)
+// The accumulator is 1024 int16 (16 KB) and these run on every make-move, so the
+// loops are unrolled 4x (four independent 128-bit chains) to expose ILP across
+// Apple/ARM's multiple NEON units instead of a single load->op->store dependency
+// per iteration. All ops are wrapping (non-saturating) so the reordering/fusion
+// below is bit-identical to the naive element-by-element version.
 static inline void acc_add_row_neon(int16_t* acc, const int16_t* row) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
-        const int16x8_t a = vld1q_s16(acc + i);
-        const int16x8_t r = vld1q_s16(row + i);
-        vst1q_s16(acc + i, vaddq_s16(a, r));
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        vst1q_s16(acc + i,      vaddq_s16(vld1q_s16(acc + i),      vld1q_s16(row + i)));
+        vst1q_s16(acc + i + 8,  vaddq_s16(vld1q_s16(acc + i + 8),  vld1q_s16(row + i + 8)));
+        vst1q_s16(acc + i + 16, vaddq_s16(vld1q_s16(acc + i + 16), vld1q_s16(row + i + 16)));
+        vst1q_s16(acc + i + 24, vaddq_s16(vld1q_s16(acc + i + 24), vld1q_s16(row + i + 24)));
     }
 }
 
 static inline void acc_sub_row_neon(int16_t* acc, const int16_t* row) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
-        const int16x8_t a = vld1q_s16(acc + i);
-        const int16x8_t r = vld1q_s16(row + i);
-        vst1q_s16(acc + i, vsubq_s16(a, r));
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        vst1q_s16(acc + i,      vsubq_s16(vld1q_s16(acc + i),      vld1q_s16(row + i)));
+        vst1q_s16(acc + i + 8,  vsubq_s16(vld1q_s16(acc + i + 8),  vld1q_s16(row + i + 8)));
+        vst1q_s16(acc + i + 16, vsubq_s16(vld1q_s16(acc + i + 16), vld1q_s16(row + i + 16)));
+        vst1q_s16(acc + i + 24, vsubq_s16(vld1q_s16(acc + i + 24), vld1q_s16(row + i + 24)));
     }
 }
 
 static inline void acc_add_sub_row_neon(int16_t* acc, const int16_t* add, const int16_t* sub) {
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
-        const int16x8_t a = vld1q_s16(acc + i);
-        const int16x8_t add_row = vld1q_s16(add + i);
-        const int16x8_t sub_row = vld1q_s16(sub + i);
-        vst1q_s16(acc + i, vsubq_s16(vaddq_s16(a, add_row), sub_row));
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        const int16x8_t a0 = vsubq_s16(vaddq_s16(vld1q_s16(acc + i),     vld1q_s16(add + i)),     vld1q_s16(sub + i));
+        const int16x8_t a1 = vsubq_s16(vaddq_s16(vld1q_s16(acc + i + 8), vld1q_s16(add + i + 8)), vld1q_s16(sub + i + 8));
+        vst1q_s16(acc + i, a0);
+        vst1q_s16(acc + i + 8, a1);
     }
 }
 
-int64_t dot_i16_i8_neon(const int16_t* x, const int8_t* w, int count) {
-    int32x4_t acc_lo = vdupq_n_s32(0);
-    int32x4_t acc_hi = vdupq_n_s32(0);
-
-    int i = 0;
-    for (; i + 7 < count; i += 8) {
-        const int16x8_t xv = vld1q_s16(x + i);
-        const int16x8_t wv = vmovl_s8(vld1_s8(w + i));
-        acc_lo = vmlal_s16(acc_lo, vget_low_s16(xv), vget_low_s16(wv));
-        acc_hi = vmlal_s16(acc_hi, vget_high_s16(xv), vget_high_s16(wv));
-    }
-
-    const int64x2_t lo64 = vpaddlq_s32(acc_lo);
-    const int64x2_t hi64 = vpaddlq_s32(acc_hi);
-    int64_t sum = vgetq_lane_s64(lo64, 0) + vgetq_lane_s64(lo64, 1) +
-                  vgetq_lane_s64(hi64, 0) + vgetq_lane_s64(hi64, 1);
-    for (; i < count; ++i) {
-        sum += static_cast<int32_t>(x[i]) * static_cast<int32_t>(w[i]);
-    }
-    return sum;
-}
-
-void dot_i16_i8_x4_neon(const int16_t* x,
-                        const int8_t* w0,
-                        const int8_t* w1,
-                        const int8_t* w2,
-                        const int8_t* w3,
-                        int count,
-                        int64_t& s0,
-                        int64_t& s1,
-                        int64_t& s2,
-                        int64_t& s3) {
-    int32x4_t a0_lo = vdupq_n_s32(0);
-    int32x4_t a0_hi = vdupq_n_s32(0);
-    int32x4_t a1_lo = vdupq_n_s32(0);
-    int32x4_t a1_hi = vdupq_n_s32(0);
-    int32x4_t a2_lo = vdupq_n_s32(0);
-    int32x4_t a2_hi = vdupq_n_s32(0);
-    int32x4_t a3_lo = vdupq_n_s32(0);
-    int32x4_t a3_hi = vdupq_n_s32(0);
-
-    auto accumulate = [](int32x4_t& acc_lo, int32x4_t& acc_hi, int16x8_t xv, int8x8_t w8) {
-        const int16x8_t wv = vmovl_s8(w8);
-        acc_lo = vmlal_s16(acc_lo, vget_low_s16(xv), vget_low_s16(wv));
-        acc_hi = vmlal_s16(acc_hi, vget_high_s16(xv), vget_high_s16(wv));
-    };
-
-    auto reduce = [](int32x4_t acc_lo, int32x4_t acc_hi) {
-        const int64x2_t lo64 = vpaddlq_s32(acc_lo);
-        const int64x2_t hi64 = vpaddlq_s32(acc_hi);
-        return vgetq_lane_s64(lo64, 0) + vgetq_lane_s64(lo64, 1) +
-               vgetq_lane_s64(hi64, 0) + vgetq_lane_s64(hi64, 1);
-    };
-
-    int i = 0;
-    for (; i + 7 < count; i += 8) {
-        const int16x8_t xv = vld1q_s16(x + i);
-        accumulate(a0_lo, a0_hi, xv, vld1_s8(w0 + i));
-        accumulate(a1_lo, a1_hi, xv, vld1_s8(w1 + i));
-        accumulate(a2_lo, a2_hi, xv, vld1_s8(w2 + i));
-        accumulate(a3_lo, a3_hi, xv, vld1_s8(w3 + i));
-    }
-
-    s0 = reduce(a0_lo, a0_hi);
-    s1 = reduce(a1_lo, a1_hi);
-    s2 = reduce(a2_lo, a2_hi);
-    s3 = reduce(a3_lo, a3_hi);
-
-    for (; i < count; ++i) {
-        const int32_t xi = x[i];
-        s0 += xi * static_cast<int32_t>(w0[i]);
-        s1 += xi * static_cast<int32_t>(w1[i]);
-        s2 += xi * static_cast<int32_t>(w2[i]);
-        s3 += xi * static_cast<int32_t>(w3[i]);
+// Fused copy+patch variants: write dst = src (+adds) (-subs) in a single pass,
+// reading from a separate source accumulator. Used when a child ply still shares
+// an ancestor's accumulator: instead of memcpy(dst,src) followed by an in-place
+// patch (2 reads + 2 writes of the 16 KB accumulator), this does 1 read of src +
+// 1 write of dst, halving accumulator memory traffic on the make-move hot path.
+static inline void acc_add_sub_row_from_neon(int16_t* dst, const int16_t* src,
+                                             const int16_t* add, const int16_t* sub) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        const int16x8_t a0 = vsubq_s16(vaddq_s16(vld1q_s16(src + i),     vld1q_s16(add + i)),     vld1q_s16(sub + i));
+        const int16x8_t a1 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(add + i + 8)), vld1q_s16(sub + i + 8));
+        vst1q_s16(dst + i, a0);
+        vst1q_s16(dst + i + 8, a1);
     }
 }
 
-void dot_i16_i16_x4_neon(const int16_t* x,
-                         const int16_t* w0,
-                         const int16_t* w1,
-                         const int16_t* w2,
-                         const int16_t* w3,
-                         int count,
-                         int64_t& s0,
-                         int64_t& s1,
-                         int64_t& s2,
-                         int64_t& s3) {
-    int32x4_t a0_lo = vdupq_n_s32(0);
-    int32x4_t a0_hi = vdupq_n_s32(0);
-    int32x4_t a1_lo = vdupq_n_s32(0);
-    int32x4_t a1_hi = vdupq_n_s32(0);
-    int32x4_t a2_lo = vdupq_n_s32(0);
-    int32x4_t a2_hi = vdupq_n_s32(0);
-    int32x4_t a3_lo = vdupq_n_s32(0);
-    int32x4_t a3_hi = vdupq_n_s32(0);
-
-    auto accumulate = [](int32x4_t& acc_lo, int32x4_t& acc_hi, int16x8_t xv, int16x8_t wv) {
-        acc_lo = vmlal_s16(acc_lo, vget_low_s16(xv), vget_low_s16(wv));
-        acc_hi = vmlal_s16(acc_hi, vget_high_s16(xv), vget_high_s16(wv));
-    };
-
-    auto reduce = [](int32x4_t acc_lo, int32x4_t acc_hi) {
-        const int64x2_t lo64 = vpaddlq_s32(acc_lo);
-        const int64x2_t hi64 = vpaddlq_s32(acc_hi);
-        return vgetq_lane_s64(lo64, 0) + vgetq_lane_s64(lo64, 1) +
-               vgetq_lane_s64(hi64, 0) + vgetq_lane_s64(hi64, 1);
-    };
-
-    int i = 0;
-    for (; i + 7 < count; i += 8) {
-        const int16x8_t xv = vld1q_s16(x + i);
-        accumulate(a0_lo, a0_hi, xv, vld1q_s16(w0 + i));
-        accumulate(a1_lo, a1_hi, xv, vld1q_s16(w1 + i));
-        accumulate(a2_lo, a2_hi, xv, vld1q_s16(w2 + i));
-        accumulate(a3_lo, a3_hi, xv, vld1q_s16(w3 + i));
+static inline void acc_add_row_from_neon(int16_t* dst, const int16_t* src, const int16_t* add) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        vst1q_s16(dst + i,     vaddq_s16(vld1q_s16(src + i),     vld1q_s16(add + i)));
+        vst1q_s16(dst + i + 8, vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(add + i + 8)));
     }
+}
 
-    s0 = reduce(a0_lo, a0_hi);
-    s1 = reduce(a1_lo, a1_hi);
-    s2 = reduce(a2_lo, a2_hi);
-    s3 = reduce(a3_lo, a3_hi);
+static inline void acc_sub_row_from_neon(int16_t* dst, const int16_t* src, const int16_t* sub) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        vst1q_s16(dst + i,     vsubq_s16(vld1q_s16(src + i),     vld1q_s16(sub + i)));
+        vst1q_s16(dst + i + 8, vsubq_s16(vld1q_s16(src + i + 8), vld1q_s16(sub + i + 8)));
+    }
+}
 
-    for (; i < count; ++i) {
-        const int32_t xi = x[i];
-        s0 += xi * static_cast<int32_t>(w0[i]);
-        s1 += xi * static_cast<int32_t>(w1[i]);
-        s2 += xi * static_cast<int32_t>(w2[i]);
-        s3 += xi * static_cast<int32_t>(w3[i]);
+// Pairwise SqrCReLU (see the AVX2 twin for the math). vmulq_s16 keeps the exact
+// low 16 bits (ft_one <= 255 so the product stays below 2^16); vshlq_u16 by a
+// negative count is a per-lane logical right shift, matching the scalar >>.
+void ft_pairwise_screlu_neon(const int16_t* acc, uint8_t* out, int half, int ft_one, int shift) {
+    const int16x8_t zero = vdupq_n_s16(0);
+    const int16x8_t vmax = vdupq_n_s16(static_cast<int16_t>(ft_one));
+    const int16x8_t vneg_shift = vdupq_n_s16(static_cast<int16_t>(-shift));
+
+    for (int i = 0; i < half; i += 16) {
+        int16x8_t a0 = vminq_s16(vmaxq_s16(vld1q_s16(acc + i), zero), vmax);
+        int16x8_t b0 = vminq_s16(vmaxq_s16(vld1q_s16(acc + i + half), zero), vmax);
+        uint16x8_t p0 = vshlq_u16(vreinterpretq_u16_s16(vmulq_s16(a0, b0)), vneg_shift);
+
+        int16x8_t a1 = vminq_s16(vmaxq_s16(vld1q_s16(acc + i + 8), zero), vmax);
+        int16x8_t b1 = vminq_s16(vmaxq_s16(vld1q_s16(acc + i + 8 + half), zero), vmax);
+        uint16x8_t p1 = vshlq_u16(vreinterpretq_u16_s16(vmulq_s16(a1, b1)), vneg_shift);
+
+        vst1q_u8(out + i, vcombine_u8(vqmovn_u16(p0), vqmovn_u16(p1)));
     }
 }
 
@@ -949,6 +845,119 @@ bool update_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
 }
 
 bool update_accumulator_rows(std::array<int16_t, kExpectedFtSize>& accumulator,
+                             const AlignedFtWeights& weights,
+                             const AccumulatorFeatureUpdate* updates,
+                             int update_count);
+
+// Compute dst = src (+ add rows) (- sub rows) in a single pass. When src and dst
+// alias (already-local accumulator) this is an in-place patch; when they differ
+// (child ply still sharing an ancestor's accumulator) it fuses the materialize
+// copy into the patch, so the 16 KB accumulator is read once and written once
+// instead of copied and then re-read/re-written. Bit-identical to a plain copy
+// followed by update_accumulator_rows since every op is wrapping arithmetic.
+bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
+                                  const std::array<int16_t, kExpectedFtSize>& src,
+                                  const AlignedFtWeights& weights,
+                                  const AccumulatorFeatureUpdate* updates,
+                                  int update_count) {
+    if (update_count <= 0) {
+        if (&dst != &src) {
+            dst = src;
+        }
+        return true;
+    }
+    if (updates == nullptr || update_count > kMaxBatchedPieceUpdates) {
+        return false;
+    }
+
+    const int16_t* add_rows[kMaxBatchedPieceUpdates];
+    const int16_t* sub_rows[kMaxBatchedPieceUpdates];
+    int add_count = 0;
+    int sub_count = 0;
+
+    for (int i = 0; i < update_count; ++i) {
+        const int feature = updates[i].feature;
+        if (feature < 0) {
+            return false;
+        }
+
+        const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
+        if (offset + kExpectedFtSize > weights.size()) {
+            return false;
+        }
+
+        if (updates[i].op == AccumulatorUpdateOp::Add) {
+            add_rows[add_count++] = weights.data() + offset;
+        } else {
+            sub_rows[sub_count++] = weights.data() + offset;
+        }
+    }
+
+    int16_t* d = dst.data();
+    const int16_t* s = src.data();
+#if defined(USE_AVX2)
+    if (add_count == 1 && sub_count == 0) {
+        acc_add_row_from_avx2(d, s, add_rows[0]);
+        return true;
+    }
+    if (add_count == 0 && sub_count == 1) {
+        acc_sub_row_from_avx2(d, s, sub_rows[0]);
+        return true;
+    }
+    if (add_count == 1 && sub_count == 1) {
+        acc_add_sub_row_from_avx2(d, s, add_rows[0], sub_rows[0]);
+        return true;
+    }
+    // General case (castling / multi-piece batches): still a single fused pass —
+    // read src once, fold every add/sub row, write dst once.
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(s + i));
+        for (int j = 0; j < add_count; ++j) {
+            a = _mm256_add_epi16(a, _mm256_load_si256(reinterpret_cast<const __m256i*>(add_rows[j] + i)));
+        }
+        for (int j = 0; j < sub_count; ++j) {
+            a = _mm256_sub_epi16(a, _mm256_load_si256(reinterpret_cast<const __m256i*>(sub_rows[j] + i)));
+        }
+        _mm256_store_si256(reinterpret_cast<__m256i*>(d + i), a);
+    }
+    return true;
+#elif defined(USE_NEON)
+    if (add_count == 1 && sub_count == 0) {
+        acc_add_row_from_neon(d, s, add_rows[0]);
+        return true;
+    }
+    if (add_count == 0 && sub_count == 1) {
+        acc_sub_row_from_neon(d, s, sub_rows[0]);
+        return true;
+    }
+    if (add_count == 1 && sub_count == 1) {
+        acc_add_sub_row_from_neon(d, s, add_rows[0], sub_rows[0]);
+        return true;
+    }
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
+        int16x8_t a = vld1q_s16(s + i);
+        for (int j = 0; j < add_count; ++j) {
+            a = vaddq_s16(a, vld1q_s16(add_rows[j] + i));
+        }
+        for (int j = 0; j < sub_count; ++j) {
+            a = vsubq_s16(a, vld1q_s16(sub_rows[j] + i));
+        }
+        vst1q_s16(d + i, a);
+    }
+    return true;
+#else
+    // Portable scalar fallback: materialize (if needed) then patch in place.
+    if (d != s) {
+        dst = src;
+    }
+    return update_accumulator_rows(dst, weights, updates, update_count);
+#endif
+}
+
+// In-place patch: accumulator += add rows, -= sub rows. Retained as the fallback
+// kernel for the non-NEON path of update_accumulator_rows_from (hence
+// maybe_unused on NEON, where the fused kernel is always used instead).
+[[maybe_unused]] bool update_accumulator_rows(std::array<int16_t, kExpectedFtSize>& accumulator,
                              const AlignedFtWeights& weights,
                              const AccumulatorFeatureUpdate* updates,
                              int update_count) {
@@ -1295,6 +1304,37 @@ bool collect_feature_update_for_perspective(const thrawn::NnueState& state,
     return true;
 }
 
+// Resolve the source accumulator for this perspective (the nearest materialized
+// ancestor, or the local one) and write state's accumulator = source ± feature
+// rows in a single fused pass, then mark it local. This replaces the previous
+// two-step materialize (2 KB copy) + in-place patch with one read/write pass.
+bool materialize_and_apply_rows(thrawn::Position* pos,
+                                int ply,
+                                thrawn::NnueState& state,
+                                bool white_perspective,
+                                const AlignedFtWeights& weights,
+                                const AccumulatorFeatureUpdate* updates,
+                                int update_count) {
+    auto& dst = white_perspective ? state.white_acc : state.black_acc;
+    int8_t& source = white_perspective ? state.white_acc_source_ply
+                                       : state.black_acc_source_ply;
+
+    const std::array<int16_t, kExpectedFtSize>* src_acc = &dst;
+    if (source != kLocalAccumulatorSource) {
+        if (!resolve_accumulator(pos, ply, white_perspective, src_acc) ||
+            src_acc == nullptr) {
+            return false;
+        }
+    }
+
+    if (!update_accumulator_rows_from(dst, *src_acc, weights, updates, update_count)) {
+        return false;
+    }
+
+    source = kLocalAccumulatorSource;
+    return true;
+}
+
 bool apply_piece_updates_to_state(thrawn::Position* pos,
                                   int ply,
                                   thrawn::NnueState& state,
@@ -1331,14 +1371,14 @@ bool apply_piece_updates_to_state(thrawn::Position* pos,
     }
 
     if (white_update_count > 0) {
-        if (!materialize_accumulator(pos, ply, true) ||
-            !update_accumulator_rows(state.white_acc, network.ft_weight, white_updates, white_update_count)) {
+        if (!materialize_and_apply_rows(pos, ply, state, true, network.ft_weight,
+                                        white_updates, white_update_count)) {
             return false;
         }
     }
     if (black_update_count > 0) {
-        if (!materialize_accumulator(pos, ply, false) ||
-            !update_accumulator_rows(state.black_acc, network.ft_weight, black_updates, black_update_count)) {
+        if (!materialize_and_apply_rows(pos, ply, state, false, network.ft_weight,
+                                        black_updates, black_update_count)) {
             return false;
         }
     }
@@ -1627,126 +1667,31 @@ void dot_u8_i8_x4_neon(const uint8_t* x_u8,
 }
 #endif
 
-int64_t dot_i16_i8(const int16_t* x, const int8_t* w, int count) {
-#if defined(USE_AVX2)
-    if (count % 32 == 0) {
-        return dot_i16_i8_avx2(x, w, count);
+void ft_pairwise_screlu_scalar(const int16_t* acc, uint8_t* out, int half, int ft_one, int shift) {
+    for (int i = 0; i < half; ++i) {
+        const int a = std::clamp<int>(acc[i], 0, ft_one);
+        const int b = std::clamp<int>(acc[i + half], 0, ft_one);
+        out[i] = static_cast<uint8_t>((a * b) >> shift);
     }
-#elif defined(USE_NEON)
-    if (count % 8 == 0) {
-        return dot_i16_i8_neon(x, w, count);
-    }
-#endif
-
-    int64_t sum = 0;
-    for (int i = 0; i < count; ++i) {
-        sum += static_cast<int32_t>(x[i]) * static_cast<int32_t>(w[i]);
-    }
-    return sum;
 }
 
-void dot_i16_i8_x4_scalar(const int16_t* x,
-                          const int8_t* w0,
-                          const int8_t* w1,
-                          const int8_t* w2,
-                          const int8_t* w3,
-                          int count,
-                          int64_t& s0,
-                          int64_t& s1,
-                          int64_t& s2,
-                          int64_t& s3) {
-    int64_t a0 = 0;
-    int64_t a1 = 0;
-    int64_t a2 = 0;
-    int64_t a3 = 0;
-    for (int i = 0; i < count; ++i) {
-        const int32_t xi = x[i];
-        a0 += xi * static_cast<int32_t>(w0[i]);
-        a1 += xi * static_cast<int32_t>(w1[i]);
-        a2 += xi * static_cast<int32_t>(w2[i]);
-        a3 += xi * static_cast<int32_t>(w3[i]);
-    }
-    s0 = a0;
-    s1 = a1;
-    s2 = a2;
-    s3 = a3;
-}
-
-void dot_i16_i8_x4(const int16_t* x,
-                   const int8_t* w0,
-                   const int8_t* w1,
-                   const int8_t* w2,
-                   const int8_t* w3,
-                   int count,
-                   int64_t& s0,
-                   int64_t& s1,
-                   int64_t& s2,
-                   int64_t& s3) {
+// Realize the FT activation (pairwise SqrCReLU) for one perspective into `out`,
+// producing `half` uint8 activations. The SIMD paths are bit-identical to the
+// scalar reference so incremental/refresh parity holds on every target.
+void ft_pairwise_screlu(const int16_t* acc, uint8_t* out, int half, int ft_one, int shift) {
 #if defined(USE_AVX2)
-    if (count % 32 == 0) {
-        dot_i16_i8_x4_avx2(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+    if (half % 32 == 0) {
+        ft_pairwise_screlu_avx2(acc, out, half, ft_one, shift);
         return;
     }
 #elif defined(USE_NEON)
-    if (count % 8 == 0) {
-        dot_i16_i8_x4_neon(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+    if (half % 16 == 0) {
+        ft_pairwise_screlu_neon(acc, out, half, ft_one, shift);
         return;
     }
 #endif
 
-    dot_i16_i8_x4_scalar(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
-}
-
-void dot_i16_i16_x4_scalar(const int16_t* x,
-                           const int16_t* w0,
-                           const int16_t* w1,
-                           const int16_t* w2,
-                           const int16_t* w3,
-                           int count,
-                           int64_t& s0,
-                           int64_t& s1,
-                           int64_t& s2,
-                           int64_t& s3) {
-    int64_t a0 = 0;
-    int64_t a1 = 0;
-    int64_t a2 = 0;
-    int64_t a3 = 0;
-    for (int i = 0; i < count; ++i) {
-        const int32_t xi = x[i];
-        a0 += xi * static_cast<int32_t>(w0[i]);
-        a1 += xi * static_cast<int32_t>(w1[i]);
-        a2 += xi * static_cast<int32_t>(w2[i]);
-        a3 += xi * static_cast<int32_t>(w3[i]);
-    }
-    s0 = a0;
-    s1 = a1;
-    s2 = a2;
-    s3 = a3;
-}
-
-void dot_i16_i16_x4(const int16_t* x,
-                    const int16_t* w0,
-                    const int16_t* w1,
-                    const int16_t* w2,
-                    const int16_t* w3,
-                    int count,
-                    int64_t& s0,
-                    int64_t& s1,
-                    int64_t& s2,
-                    int64_t& s3) {
-#if defined(USE_AVX2)
-    if (count % 32 == 0) {
-        dot_i16_i16_x4_avx2(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
-        return;
-    }
-#elif defined(USE_NEON)
-    if (count % 8 == 0) {
-        dot_i16_i16_x4_neon(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
-        return;
-    }
-#endif
-
-    dot_i16_i16_x4_scalar(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+    ft_pairwise_screlu_scalar(acc, out, half, ft_one, shift);
 }
 
 int32_t dot_u8_i8(const uint8_t* x, const int8_t* w, int count) {
@@ -1836,6 +1781,7 @@ uint8_t screlu_to_u8(uint8_t crelu, int32_t scale) {
 IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& accumulators,
                                                         const LoadedNetwork& network,
                                                         int colour_to_move) {
+    alignas(64) std::array<uint8_t, kFc0InputSize> act;
     alignas(64) std::array<int32_t, kExpectedFc0OutputSize> fc0;
     alignas(64) std::array<uint8_t, kFc1InputPaddedSize> a0;
     alignas(64) std::array<uint8_t, kExpectedFc1OutputSize> a1;
@@ -1843,37 +1789,34 @@ IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& a
     const auto& us = (colour_to_move == white) ? *accumulators.white : *accumulators.black;
     const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
 
-    for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 4) {
-        const int16_t* w0 = network.fc0_weight_i16_t[j].data();
-        const int16_t* w1 = network.fc0_weight_i16_t[j + 1].data();
-        const int16_t* w2 = network.fc0_weight_i16_t[j + 2].data();
-        const int16_t* w3 = network.fc0_weight_i16_t[j + 3].data();
-        int64_t d0;
-        int64_t d1;
-        int64_t d2;
-        int64_t d3;
+    // FT activation (pairwise SqrCReLU): [us_pairwise | them_pairwise], width FtSize.
+    // The result carries an activation "one" of act_one, so the u8 x i8 fc0 dot is
+    // renormalized by act_one to land the pre-bias sum back at the fc0 scale.
+    ft_pairwise_screlu(us.data(), act.data(), kFtActivationHalf, network.ft_one, network.act_shift);
+    ft_pairwise_screlu(them.data(), act.data() + kFtActivationHalf,
+                       kFtActivationHalf, network.ft_one, network.act_shift);
 
-        dot_i16_i16_x4(us.data(), w0, w1, w2, w3, kExpectedFtSize, d0, d1, d2, d3);
-        int64_t t0;
-        int64_t t1;
-        int64_t t2;
-        int64_t t3;
-        dot_i16_i16_x4(them.data(),
-                       w0 + kExpectedFtSize,
-                       w1 + kExpectedFtSize,
-                       w2 + kExpectedFtSize,
-                       w3 + kExpectedFtSize,
-                       kExpectedFtSize,
-                       t0, t1, t2, t3);
+    for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 4) {
+        int32_t d0;
+        int32_t d1;
+        int32_t d2;
+        int32_t d3;
+        dot_u8_i8_x4(act.data(),
+                     network.fc0_weight_t[j].data(),
+                     network.fc0_weight_t[j + 1].data(),
+                     network.fc0_weight_t[j + 2].data(),
+                     network.fc0_weight_t[j + 3].data(),
+                     kFc0InputSize,
+                     d0, d1, d2, d3);
 
         fc0[j] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j]) +
-                                      div_round_by_scale(d0 + t0, network.qft));
+                                      div_round_by_scale(d0, network.act_one));
         fc0[j + 1] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j + 1]) +
-                                          div_round_by_scale(d1 + t1, network.qft));
+                                          div_round_by_scale(d1, network.act_one));
         fc0[j + 2] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j + 2]) +
-                                          div_round_by_scale(d2 + t2, network.qft));
+                                          div_round_by_scale(d2, network.act_one));
         fc0[j + 3] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j + 3]) +
-                                          div_round_by_scale(d3 + t3, network.qft));
+                                          div_round_by_scale(d3, network.act_one));
     }
 
     for (int i = 0; i < static_cast<int>(kExpectedHiddenSize); ++i) {
@@ -1958,6 +1901,7 @@ double crelu(double value) {
 double evaluate_accumulators_float_raw_output(const AccumulatorView& accumulators,
                                              const LoadedNetwork& network,
                                              int colour_to_move) {
+    std::array<double, kExpectedFtSize> act{};
     std::array<double, kExpectedFc0OutputSize> fc0{};
     std::array<double, kExpectedFc1InputSize> a0{};
     std::array<double, kExpectedFc1OutputSize> a1{};
@@ -1965,15 +1909,20 @@ double evaluate_accumulators_float_raw_output(const AccumulatorView& accumulator
     const auto& us = (colour_to_move == white) ? *accumulators.white : *accumulators.black;
     const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
 
+    // FT activation (pairwise SqrCReLU): [us_pairwise | them_pairwise], width FtSize.
+    for (int i = 0; i < kFtActivationHalf; ++i) {
+        act[i] = crelu(static_cast<double>(us[i]) * network.inv_ft_scale) *
+                 crelu(static_cast<double>(us[i + kFtActivationHalf]) * network.inv_ft_scale);
+        act[kFtActivationHalf + i] =
+            crelu(static_cast<double>(them[i]) * network.inv_ft_scale) *
+            crelu(static_cast<double>(them[i + kFtActivationHalf]) * network.inv_ft_scale);
+    }
+
     for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); ++j) {
         double s = static_cast<double>(network.fc0_bias[j]) * network.inv_fc0_scale;
         const int8_t* weights = network.fc0_weight_t[j].data();
-        for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-            s += static_cast<double>(us[i]) * network.inv_ft_scale *
-                 static_cast<double>(weights[i]) * network.inv_fc0_scale;
-            s += static_cast<double>(them[i]) * network.inv_ft_scale *
-                 static_cast<double>(weights[static_cast<int>(kExpectedFtSize) + i]) *
-                 network.inv_fc0_scale;
+        for (int i = 0; i < static_cast<int>(kFc0InputSize); ++i) {
+            s += act[i] * static_cast<double>(weights[i]) * network.inv_fc0_scale;
         }
         fc0[j] = s;
     }
@@ -2145,6 +2094,7 @@ bool load_network_from_file(const std::string& path,
     uint32_t hidden_size = 0;
     uint32_t forward_size = 0;
     uint32_t fc0_output_size = 0;
+    uint32_t fc0_input_size = 0;
     uint32_t fc1_input_size = 0;
     uint32_t fc1_output_size = 0;
     uint32_t output_perspective = 0;
@@ -2170,6 +2120,7 @@ bool load_network_from_file(const std::string& path,
         !read_scalar_le(stream, hidden_size) ||
         !read_scalar_le(stream, forward_size) ||
         !read_scalar_le(stream, fc0_output_size) ||
+        !read_scalar_le(stream, fc0_input_size) ||
         !read_scalar_le(stream, fc1_input_size) ||
         !read_scalar_le(stream, fc1_output_size) ||
         !read_scalar_le(stream, output_perspective) ||
@@ -2196,9 +2147,15 @@ bool load_network_from_file(const std::string& path,
         hidden_size != kExpectedHiddenSize ||
         forward_size != kExpectedForwardSize ||
         fc0_output_size != kExpectedFc0OutputSize ||
+        fc0_input_size != kExpectedFc0InputSize ||
         fc1_input_size != kExpectedFc1InputSize ||
         fc1_output_size != kExpectedFc1OutputSize) {
         error = "unexpected network dimensions";
+        return false;
+    }
+    // The pairwise SqrCReLU activation halves the fc0 input to the accumulator width.
+    if (fc0_input_size != ft_size) {
+        error = "fc0_input_size must equal ft_size";
         return false;
     }
     if (output_perspective != kExpectedOutputPerspective) {
@@ -2211,7 +2168,7 @@ bool load_network_from_file(const std::string& path,
     int32_t qfc1 = 0;
     int32_t qfc2 = 0;
 
-    if (!parse_integer_scale(ft_scale, "ft_scale", 32767, qft, error) ||
+    if (!parse_integer_scale(ft_scale, "ft_scale", 255, qft, error) ||
         !parse_integer_scale(fc0_scale, "fc0_scale", 255, qfc0, error) ||
         !parse_integer_scale(fc1_scale, "fc1_scale", 255, qfc1, error) ||
         !parse_integer_scale(fc2_scale, "fc2_scale", 1 << 20, qfc2, error)) {
@@ -2219,6 +2176,29 @@ bool load_network_from_file(const std::string& path,
     }
     if (!std::isfinite(score_scale) || score_scale <= 0.0f) {
         error = "invalid score_scale";
+        return false;
+    }
+
+    // Integer realization of the pairwise SqrCReLU FT activation. Require ft_one+1
+    // to be a power of two so the `>> act_shift` renormalization is exact, and
+    // ft_one <= 255 so clamp(a)*clamp(b) < 2^16 (the SIMD 16-bit multiply relies on
+    // this). act_shift = 2*log2(ft_one+1) - 7; act_one = (ft_one*ft_one) >> act_shift.
+    const int32_t ft_one = qft;
+    if (((ft_one + 1) & ft_one) != 0) {
+        error = "ft_scale must be a power of two minus one";
+        return false;
+    }
+    int32_t act_shift = -7;
+    for (int32_t v = ft_one + 1; v > 1; v >>= 1) {
+        act_shift += 2;
+    }
+    if (act_shift < 0) {
+        error = "ft_scale too small for pairwise activation";
+        return false;
+    }
+    const int32_t act_one = (ft_one * ft_one) >> act_shift;
+    if (act_one <= 0 || act_one > 255) {
+        error = "pairwise activation range invalid";
         return false;
     }
     if (description_length > (1U << 20)) {
@@ -2280,6 +2260,10 @@ bool load_network_from_file(const std::string& path,
     network.qfc1 = qfc1;
     network.qfc2 = qfc2;
 
+    network.ft_one = ft_one;
+    network.act_shift = act_shift;
+    network.act_one = act_one;
+
     network.inv_ft_scale = 1.0f / ft_scale;
     network.inv_fc0_scale = 1.0f / fc0_scale;
     network.inv_fc1_scale = 1.0f / fc1_scale;
@@ -2294,7 +2278,6 @@ bool load_network_from_file(const std::string& path,
         for (int i = 0; i < kFc0InputSize; ++i) {
             network.fc0_weight_t[j][i] =
                 fc0_weight_q[static_cast<std::size_t>(i) * kExpectedFc0OutputSize + j];
-            network.fc0_weight_i16_t[j][i] = network.fc0_weight_t[j][i];
         }
     }
 
