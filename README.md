@@ -1,6 +1,6 @@
 # Thrawn
 
-Thrawn is a free high performance uci-compliant chess engine.
+Thrawn is a high performance uci-compliant chess engine written in C++.
 
 ## Rating
 Thrawn's ratings are tracked by [CCRL](https://computerchess.org.uk/ccrl/404/).
