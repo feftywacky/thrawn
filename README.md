@@ -7,7 +7,7 @@ Thrawn's ratings are tracked by [CCRL](https://computerchess.org.uk/ccrl/404/).
 
 | Version | Rating | Eval |
 | --- | --- | --- |
-| [v3.1](https://computerchess.org.uk/404/cgi/compare_engines.cgi?family=Thrawn&print=Rating+list&print=Results+table&print=LOS+table&print=Ponder+hit+table&print=Eval+difference+table&print=Comopp+gamenum+table&print=Overlap+table&print=Score+with+common+opponents) | ~3400 ELO | [thrawn-nn-2](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-2) |
+| [v3.1 in testing](https://computerchess.org.uk/404/cgi/compare_engines.cgi?family=Thrawn&print=Rating+list&print=Results+table&print=LOS+table&print=Ponder+hit+table&print=Eval+difference+table&print=Comopp+gamenum+table&print=Overlap+table&print=Score+with+common+opponents) | ~3400 ELO | [thrawn-nn-2](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-2) |
 | [v3.0](https://computerchess.org.uk/404/cgi/compare_engines.cgi?family=Thrawn&print=Rating+list&print=Results+table&print=LOS+table&print=Ponder+hit+table&print=Eval+difference+table&print=Comopp+gamenum+table&print=Overlap+table&print=Score+with+common+opponents) | ~2941 ELO | [thrawn-nn-1](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-1) |
 | v2.2 | ~2900 ELO | Stockfish NNUE |
 | v2.0 | ~2800 ELO | Stockfish NNUE |
