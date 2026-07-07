@@ -5,7 +5,7 @@
 #include "nnue.h"
 #include "globals.h"
 
-const std::string version = " v3";
+const std::string version = " v3.1";
 
 
 void init_all()
