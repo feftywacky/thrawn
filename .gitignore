@@ -8,6 +8,9 @@
 *.exe
 Thrawn
 
+# Build output directory (all distributable binaries land here)
+build/
+
 # Code Editors
 *.vscode
 *.idea

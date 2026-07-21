@@ -12,10 +12,12 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <istream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <streambuf>
 #include <string>
 #include <vector>
 
@@ -23,12 +25,26 @@
 #include <malloc.h>
 #endif
 
-#if defined(USE_AVX2)
+#if defined(USE_AVX2) || defined(USE_AVX512)
 #include <immintrin.h>
 #endif
 
 #if defined(USE_NEON)
 #include <arm_neon.h>
+#endif
+
+// Default NNUE network, embedded directly into the binary at build time (see
+// nnue_embedded_data.S). This lets the engine run standalone without the .nnue
+// file sitting next to the executable; an explicit EvalFile path still takes
+// priority when it resolves (see nnue_init).
+extern "C" const unsigned char g_embedded_nnue_data[];
+extern "C" const unsigned char g_embedded_nnue_end[];
+
+// Display name of the embedded network (e.g. "thrawn-nn-2"), injected by the
+// Makefile from NNUE_FILE's basename so UCI info strings can name it. Defaulted
+// here only so the file still compiles standalone (e.g. ad-hoc syntax checks).
+#ifndef NNUE_EMBED_NAME
+#define NNUE_EMBED_NAME "embedded"
 #endif
 
 namespace {
@@ -237,8 +253,18 @@ bool host_is_little_endian() {
     return *reinterpret_cast<const unsigned char*>(&endian_probe) == 0x02;
 }
 
+// Wraps a fixed memory range as a readable, seek-free std::streambuf so the
+// embedded network (see nnue_embedded_data.S) can be parsed by the exact same
+// read_scalar_le/read_vector_le/load_network_from_stream code as a file on disk.
+struct MemoryStreamBuf : std::streambuf {
+    MemoryStreamBuf(const unsigned char* data, std::size_t size) {
+        char* begin = reinterpret_cast<char*>(const_cast<unsigned char*>(data));
+        setg(begin, begin, begin + size);
+    }
+};
+
 template <typename T>
-bool read_scalar_le(std::ifstream& stream, T& value) {
+bool read_scalar_le(std::istream& stream, T& value) {
     std::array<unsigned char, sizeof(T)> bytes{};
     stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (!stream) {
@@ -259,7 +285,7 @@ bool read_scalar_le(std::ifstream& stream, T& value) {
 }
 
 template <typename T, typename Allocator>
-bool read_vector_le(std::ifstream& stream,
+bool read_vector_le(std::istream& stream,
                     std::vector<T, Allocator>& values,
                     std::size_t count) {
     values.resize(count);
@@ -319,7 +345,7 @@ std::vector<std::string> candidate_paths(const std::string& requested_path) {
     return candidates;
 }
 
-std::string read_feature_set(std::ifstream& stream) {
+std::string read_feature_set(std::istream& stream) {
     char feature_set_raw[16] = {};
     stream.read(feature_set_raw, sizeof(feature_set_raw));
     if (!stream) {
@@ -719,6 +745,123 @@ void ft_pairwise_screlu_avx2(const int16_t* acc, uint8_t* out, int half, int ft_
 
 #endif
 
+#if defined(USE_AVX512)
+// AVX-512 twins of the AVX2 accumulator kernels. Each 512-bit register holds 32
+// int16, and FtSize (1024) is a multiple of 64, so the loops are unrolled 2x (two
+// independent 512-bit chains, stride 64) to expose ILP and hide load latency
+// instead of a single load->op->store dependency per iteration. Accumulators and
+// FT weight rows are 64-byte aligned (NNUE_SIMD_ALIGNMENT), so aligned load/store
+// is valid. All ops are wrapping (non-saturating), so this is bit-identical to the
+// scalar/AVX2/NEON versions.
+static inline void acc_add_row_avx512(int16_t* acc, const int16_t* row) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_add_epi16(
+            _mm512_load_si512(reinterpret_cast<const void*>(acc + i)),
+            _mm512_load_si512(reinterpret_cast<const void*>(row + i)));
+        const __m512i a1 = _mm512_add_epi16(
+            _mm512_load_si512(reinterpret_cast<const void*>(acc + i + 32)),
+            _mm512_load_si512(reinterpret_cast<const void*>(row + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(acc + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(acc + i + 32), a1);
+    }
+}
+
+static inline void acc_sub_row_avx512(int16_t* acc, const int16_t* row) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_sub_epi16(
+            _mm512_load_si512(reinterpret_cast<const void*>(acc + i)),
+            _mm512_load_si512(reinterpret_cast<const void*>(row + i)));
+        const __m512i a1 = _mm512_sub_epi16(
+            _mm512_load_si512(reinterpret_cast<const void*>(acc + i + 32)),
+            _mm512_load_si512(reinterpret_cast<const void*>(row + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(acc + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(acc + i + 32), a1);
+    }
+}
+
+static inline void acc_add_sub_row_avx512(int16_t* acc, const int16_t* add, const int16_t* sub) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_sub_epi16(
+            _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(acc + i)),
+                             _mm512_load_si512(reinterpret_cast<const void*>(add + i))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub + i)));
+        const __m512i a1 = _mm512_sub_epi16(
+            _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(acc + i + 32)),
+                             _mm512_load_si512(reinterpret_cast<const void*>(add + i + 32))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(acc + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(acc + i + 32), a1);
+    }
+}
+
+// Fused copy+patch variants: write dst = src (+add) (-sub) in a single pass,
+// reading from a separate source accumulator. See the AVX2/NEON twins for why this
+// halves accumulator memory traffic on the make-move hot path. Bit-identical to
+// copy-then-patch (wrapping arithmetic).
+static inline void acc_add_row_from_avx512(int16_t* dst, const int16_t* src, const int16_t* add) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_add_epi16(
+            _mm512_load_si512(reinterpret_cast<const void*>(src + i)),
+            _mm512_load_si512(reinterpret_cast<const void*>(add + i)));
+        const __m512i a1 = _mm512_add_epi16(
+            _mm512_load_si512(reinterpret_cast<const void*>(src + i + 32)),
+            _mm512_load_si512(reinterpret_cast<const void*>(add + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i + 32), a1);
+    }
+}
+
+static inline void acc_sub_row_from_avx512(int16_t* dst, const int16_t* src, const int16_t* sub) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_sub_epi16(
+            _mm512_load_si512(reinterpret_cast<const void*>(src + i)),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub + i)));
+        const __m512i a1 = _mm512_sub_epi16(
+            _mm512_load_si512(reinterpret_cast<const void*>(src + i + 32)),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i + 32), a1);
+    }
+}
+
+static inline void acc_add_sub_row_from_avx512(int16_t* dst, const int16_t* src,
+                                               const int16_t* add, const int16_t* sub) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_sub_epi16(
+            _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i)),
+                             _mm512_load_si512(reinterpret_cast<const void*>(add + i))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub + i)));
+        const __m512i a1 = _mm512_sub_epi16(
+            _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i + 32)),
+                             _mm512_load_si512(reinterpret_cast<const void*>(add + i + 32))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i + 32), a1);
+    }
+}
+
+// Pairwise SqrCReLU (see the AVX2 twin for the math). ft_one <= 255 keeps
+// clamp(a)*clamp(b) < 2^16, so _mm512_mullo_epi16 yields the exact product and
+// _mm512_srl_epi16 (logical) renormalizes it into [0, act_one]. Since every result
+// lane is in [0, act_one] <= 255, _mm512_cvtepi16_epi8 (vpmovwb, order-preserving,
+// no lane-crossing shuffle) truncates each lane to exactly its value.
+void ft_pairwise_screlu_avx512(const int16_t* acc, uint8_t* out, int half, int ft_one, int shift) {
+    const __m512i zero = _mm512_setzero_si512();
+    const __m512i vmax = _mm512_set1_epi16(static_cast<int16_t>(ft_one));
+    const __m128i vshift = _mm_cvtsi32_si128(shift);
+
+    for (int i = 0; i < half; i += 32) {
+        __m512i a = _mm512_load_si512(reinterpret_cast<const void*>(acc + i));
+        __m512i b = _mm512_load_si512(reinterpret_cast<const void*>(acc + i + half));
+        a = _mm512_min_epi16(_mm512_max_epi16(a, zero), vmax);
+        b = _mm512_min_epi16(_mm512_max_epi16(b, zero), vmax);
+        const __m512i p = _mm512_srl_epi16(_mm512_mullo_epi16(a, b), vshift);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(out + i), _mm512_cvtepi16_epi8(p));
+    }
+}
+
+#endif
+
 #if defined(USE_NEON)
 // The accumulator is 1024 int16 (16 KB) and these run on every make-move, so the
 // loops are unrolled 4x (four independent 128-bit chains) to expose ILP across
@@ -820,7 +963,13 @@ bool update_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
     const int16_t* row = weights.data() + offset;
     int16_t* acc = accumulator.data();
 
-#if defined(USE_AVX2)
+#if defined(USE_AVX512)
+    if (op == AccumulatorUpdateOp::Add) {
+        acc_add_row_avx512(acc, row);
+    } else {
+        acc_sub_row_avx512(acc, row);
+    }
+#elif defined(USE_AVX2)
     if (op == AccumulatorUpdateOp::Add) {
         acc_add_row_avx2(acc, row);
     } else {
@@ -895,7 +1044,33 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
 
     int16_t* d = dst.data();
     const int16_t* s = src.data();
-#if defined(USE_AVX2)
+#if defined(USE_AVX512)
+    if (add_count == 1 && sub_count == 0) {
+        acc_add_row_from_avx512(d, s, add_rows[0]);
+        return true;
+    }
+    if (add_count == 0 && sub_count == 1) {
+        acc_sub_row_from_avx512(d, s, sub_rows[0]);
+        return true;
+    }
+    if (add_count == 1 && sub_count == 1) {
+        acc_add_sub_row_from_avx512(d, s, add_rows[0], sub_rows[0]);
+        return true;
+    }
+    // General case (castling / multi-piece batches): still a single fused pass —
+    // read src once, fold every add/sub row, write dst once.
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        __m512i a = _mm512_load_si512(reinterpret_cast<const void*>(s + i));
+        for (int j = 0; j < add_count; ++j) {
+            a = _mm512_add_epi16(a, _mm512_load_si512(reinterpret_cast<const void*>(add_rows[j] + i)));
+        }
+        for (int j = 0; j < sub_count; ++j) {
+            a = _mm512_sub_epi16(a, _mm512_load_si512(reinterpret_cast<const void*>(sub_rows[j] + i)));
+        }
+        _mm512_store_si512(reinterpret_cast<void*>(d + i), a);
+    }
+    return true;
+#elif defined(USE_AVX2)
     if (add_count == 1 && sub_count == 0) {
         acc_add_row_from_avx2(d, s, add_rows[0]);
         return true;
@@ -992,7 +1167,32 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
     }
 
     int16_t* acc = accumulator.data();
-#if defined(USE_AVX2)
+#if defined(USE_AVX512)
+    if (add_count == 1 && sub_count == 0) {
+        acc_add_row_avx512(acc, add_rows[0]);
+        return true;
+    }
+    if (add_count == 0 && sub_count == 1) {
+        acc_sub_row_avx512(acc, sub_rows[0]);
+        return true;
+    }
+    if (add_count == 1 && sub_count == 1) {
+        acc_add_sub_row_avx512(acc, add_rows[0], sub_rows[0]);
+        return true;
+    }
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        __m512i a = _mm512_load_si512(reinterpret_cast<const void*>(acc + i));
+        for (int j = 0; j < add_count; ++j) {
+            const __m512i r = _mm512_load_si512(reinterpret_cast<const void*>(add_rows[j] + i));
+            a = _mm512_add_epi16(a, r);
+        }
+        for (int j = 0; j < sub_count; ++j) {
+            const __m512i r = _mm512_load_si512(reinterpret_cast<const void*>(sub_rows[j] + i));
+            a = _mm512_sub_epi16(a, r);
+        }
+        _mm512_store_si512(reinterpret_cast<void*>(acc + i), a);
+    }
+#elif defined(USE_AVX2)
     if (add_count == 1 && sub_count == 0) {
         acc_add_row_avx2(acc, add_rows[0]);
         return true;
@@ -1553,6 +1753,113 @@ void dot_u8_i8_x4_avx2(const uint8_t* x,
 }
 #endif
 
+#if defined(USE_AVX512)
+// u8 x i8 -> i32 fused multiply-add. VNNI's vpdpbusd accumulates the four byte
+// products per dword directly into int32 (no intermediate saturation), so it is
+// the exact integer dot product. The maddubs+madd fallback matches the AVX2 twin
+// for targets built without VNNI; the Makefile's x86-64-avx512 arch always passes
+// -mavx512vnni, so the VNNI path is what actually compiles here.
+static inline __m512i add_dot_u8_i8_epi32_512(__m512i acc, __m512i x, __m512i w) {
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbusd_epi32(acc, x, w);
+#else
+    const __m512i ones = _mm512_set1_epi16(1);
+    return _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(x, w), ones));
+#endif
+}
+
+int32_t dot_u8_i8_avx512(const uint8_t* x, const int8_t* w, int count) {
+    __m512i acc0 = _mm512_setzero_si512();
+    __m512i acc1 = _mm512_setzero_si512();
+    __m512i acc2 = _mm512_setzero_si512();
+    __m512i acc3 = _mm512_setzero_si512();
+
+    int i = 0;
+    for (; i + 255 < count; i += 256) {
+        acc0 = add_dot_u8_i8_epi32_512(acc0,
+            _mm512_loadu_si512(reinterpret_cast<const void*>(x + i)),
+            _mm512_loadu_si512(reinterpret_cast<const void*>(w + i)));
+        acc1 = add_dot_u8_i8_epi32_512(acc1,
+            _mm512_loadu_si512(reinterpret_cast<const void*>(x + i + 64)),
+            _mm512_loadu_si512(reinterpret_cast<const void*>(w + i + 64)));
+        acc2 = add_dot_u8_i8_epi32_512(acc2,
+            _mm512_loadu_si512(reinterpret_cast<const void*>(x + i + 128)),
+            _mm512_loadu_si512(reinterpret_cast<const void*>(w + i + 128)));
+        acc3 = add_dot_u8_i8_epi32_512(acc3,
+            _mm512_loadu_si512(reinterpret_cast<const void*>(x + i + 192)),
+            _mm512_loadu_si512(reinterpret_cast<const void*>(w + i + 192)));
+    }
+
+    acc0 = _mm512_add_epi32(_mm512_add_epi32(acc0, acc1), _mm512_add_epi32(acc2, acc3));
+
+    for (; i + 63 < count; i += 64) {
+        acc0 = add_dot_u8_i8_epi32_512(acc0,
+            _mm512_loadu_si512(reinterpret_cast<const void*>(x + i)),
+            _mm512_loadu_si512(reinterpret_cast<const void*>(w + i)));
+    }
+
+    int32_t sum = _mm512_reduce_add_epi32(acc0);
+    // Tail for counts not divisible by 64 (e.g. the 32-wide fc2 dot). Integer add
+    // is associative, so folding the remainder in scalar is bit-identical.
+    for (; i < count; ++i) {
+        sum += static_cast<int32_t>(x[i]) * static_cast<int32_t>(w[i]);
+    }
+    return sum;
+}
+
+void dot_u8_i8_x4_avx512(const uint8_t* x,
+                         const int8_t* w0,
+                         const int8_t* w1,
+                         const int8_t* w2,
+                         const int8_t* w3,
+                         int count,
+                         int32_t& s0,
+                         int32_t& s1,
+                         int32_t& s2,
+                         int32_t& s3) {
+    __m512i a0 = _mm512_setzero_si512();
+    __m512i a1 = _mm512_setzero_si512();
+    __m512i a2 = _mm512_setzero_si512();
+    __m512i a3 = _mm512_setzero_si512();
+    __m512i b0 = _mm512_setzero_si512();
+    __m512i b1 = _mm512_setzero_si512();
+    __m512i b2 = _mm512_setzero_si512();
+    __m512i b3 = _mm512_setzero_si512();
+
+    int i = 0;
+    for (; i + 127 < count; i += 128) {
+        const __m512i xv0 = _mm512_loadu_si512(reinterpret_cast<const void*>(x + i));
+        const __m512i xv1 = _mm512_loadu_si512(reinterpret_cast<const void*>(x + i + 64));
+        a0 = add_dot_u8_i8_epi32_512(a0, xv0, _mm512_loadu_si512(reinterpret_cast<const void*>(w0 + i)));
+        b0 = add_dot_u8_i8_epi32_512(b0, xv1, _mm512_loadu_si512(reinterpret_cast<const void*>(w0 + i + 64)));
+        a1 = add_dot_u8_i8_epi32_512(a1, xv0, _mm512_loadu_si512(reinterpret_cast<const void*>(w1 + i)));
+        b1 = add_dot_u8_i8_epi32_512(b1, xv1, _mm512_loadu_si512(reinterpret_cast<const void*>(w1 + i + 64)));
+        a2 = add_dot_u8_i8_epi32_512(a2, xv0, _mm512_loadu_si512(reinterpret_cast<const void*>(w2 + i)));
+        b2 = add_dot_u8_i8_epi32_512(b2, xv1, _mm512_loadu_si512(reinterpret_cast<const void*>(w2 + i + 64)));
+        a3 = add_dot_u8_i8_epi32_512(a3, xv0, _mm512_loadu_si512(reinterpret_cast<const void*>(w3 + i)));
+        b3 = add_dot_u8_i8_epi32_512(b3, xv1, _mm512_loadu_si512(reinterpret_cast<const void*>(w3 + i + 64)));
+    }
+
+    a0 = _mm512_add_epi32(a0, b0);
+    a1 = _mm512_add_epi32(a1, b1);
+    a2 = _mm512_add_epi32(a2, b2);
+    a3 = _mm512_add_epi32(a3, b3);
+
+    for (; i + 63 < count; i += 64) {
+        const __m512i xv = _mm512_loadu_si512(reinterpret_cast<const void*>(x + i));
+        a0 = add_dot_u8_i8_epi32_512(a0, xv, _mm512_loadu_si512(reinterpret_cast<const void*>(w0 + i)));
+        a1 = add_dot_u8_i8_epi32_512(a1, xv, _mm512_loadu_si512(reinterpret_cast<const void*>(w1 + i)));
+        a2 = add_dot_u8_i8_epi32_512(a2, xv, _mm512_loadu_si512(reinterpret_cast<const void*>(w2 + i)));
+        a3 = add_dot_u8_i8_epi32_512(a3, xv, _mm512_loadu_si512(reinterpret_cast<const void*>(w3 + i)));
+    }
+
+    s0 = _mm512_reduce_add_epi32(a0);
+    s1 = _mm512_reduce_add_epi32(a1);
+    s2 = _mm512_reduce_add_epi32(a2);
+    s3 = _mm512_reduce_add_epi32(a3);
+}
+#endif
+
 #if defined(USE_NEON)
 int32_t dot_u8_i8_neon(const uint8_t* x_u8, const int8_t* w, int count) {
     const int8_t* x = reinterpret_cast<const int8_t*>(x_u8);
@@ -1679,7 +1986,12 @@ void ft_pairwise_screlu_scalar(const int16_t* acc, uint8_t* out, int half, int f
 // producing `half` uint8 activations. The SIMD paths are bit-identical to the
 // scalar reference so incremental/refresh parity holds on every target.
 void ft_pairwise_screlu(const int16_t* acc, uint8_t* out, int half, int ft_one, int shift) {
-#if defined(USE_AVX2)
+#if defined(USE_AVX512)
+    if (half % 32 == 0) {
+        ft_pairwise_screlu_avx512(acc, out, half, ft_one, shift);
+        return;
+    }
+#elif defined(USE_AVX2)
     if (half % 32 == 0) {
         ft_pairwise_screlu_avx2(acc, out, half, ft_one, shift);
         return;
@@ -1695,7 +2007,12 @@ void ft_pairwise_screlu(const int16_t* acc, uint8_t* out, int half, int ft_one, 
 }
 
 int32_t dot_u8_i8(const uint8_t* x, const int8_t* w, int count) {
-#if defined(USE_AVX2)
+#if defined(USE_AVX512)
+    // The kernel folds any sub-64 remainder in scalar, so a 32-multiple (fc2) is fine.
+    if (count % 32 == 0) {
+        return dot_u8_i8_avx512(x, w, count);
+    }
+#elif defined(USE_AVX2)
     if (count % 32 == 0) {
         return dot_u8_i8_avx2(x, w, count);
     }
@@ -1749,7 +2066,14 @@ void dot_u8_i8_x4(const uint8_t* x,
                   int32_t& s1,
                   int32_t& s2,
                   int32_t& s3) {
-#if defined(USE_AVX2)
+#if defined(USE_AVX512)
+    // Both callers pass counts that are multiples of 64 (fc0=1024, fc1=64); any
+    // other width falls through to the exact scalar path below.
+    if (count % 64 == 0) {
+        dot_u8_i8_x4_avx512(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+        return;
+    }
+#elif defined(USE_AVX2)
     if (count % 32 == 0) {
         dot_u8_i8_x4_avx2(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
         return;
@@ -2068,15 +2392,13 @@ bool run_halfkav2_index_self_test(std::string& error) {
     return true;
 }
 
-bool load_network_from_file(const std::string& path,
-                            LoadedNetwork& network,
-                            std::string& error) {
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) {
-        error = "could not open file";
-        return false;
-    }
-
+// Parses a network from any std::istream (a file on disk or an in-memory
+// buffer over the embedded default net). `source_label` is purely descriptive
+// (stored in network.loaded_path / surfaced in UCI info strings).
+bool load_network_from_stream(std::istream& stream,
+                              const std::string& source_label,
+                              LoadedNetwork& network,
+                              std::string& error) {
     char magic[8] = {};
     stream.read(magic, sizeof(magic));
     if (!stream) {
@@ -2240,7 +2562,7 @@ bool load_network_from_file(const std::string& path,
         error = "unexpected end of file";
         return false;
     }
-    if (stream.peek() != std::ifstream::traits_type::eof()) {
+    if (stream.peek() != std::char_traits<char>::eof()) {
         error = "unexpected trailing data";
         return false;
     }
@@ -2292,13 +2614,32 @@ bool load_network_from_file(const std::string& path,
     std::copy(fc2_weight_q.begin(), fc2_weight_q.end(), network.fc2_weight.begin());
 
     network.description = std::move(description);
-    network.loaded_path = path;
+    network.loaded_path = source_label;
 
     if (!run_halfkav2_index_self_test(error)) {
         return false;
     }
 
     return true;
+}
+
+bool load_network_from_file(const std::string& path,
+                            LoadedNetwork& network,
+                            std::string& error) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        error = "could not open file";
+        return false;
+    }
+    return load_network_from_stream(stream, path, network, error);
+}
+
+bool load_embedded_network(LoadedNetwork& network, std::string& error) {
+    const std::size_t size =
+        static_cast<std::size_t>(g_embedded_nnue_end - g_embedded_nnue_data);
+    MemoryStreamBuf buffer(g_embedded_nnue_data, size);
+    std::istream stream(&buffer);
+    return load_network_from_stream(stream, NNUE_EMBED_NAME, network, error);
 }
 
 #ifdef DEBUG_BUILD
@@ -2312,6 +2653,13 @@ bool load_network_from_file(const std::string& path,
 #endif
 
 } // namespace
+
+void activate_network(LoadedNetwork&& loaded) {
+    auto network = std::make_shared<LoadedNetwork>(std::move(loaded));
+    std::lock_guard<std::mutex> lock(g_network_mutex);
+    g_network_owner = network;
+    g_network_raw.store(network.get(), std::memory_order_release);
+}
 
 void nnue_init(const char* evalFile) {
     const std::string requested = evalFile == nullptr ? "" : std::string(evalFile);
@@ -2328,15 +2676,33 @@ void nnue_init(const char* evalFile) {
             continue;
         }
 
-        auto network = std::make_shared<LoadedNetwork>(std::move(loaded));
-        {
-            std::lock_guard<std::mutex> lock(g_network_mutex);
-            g_network_owner = network;
-            g_network_raw.store(network.get(), std::memory_order_release);
-        }
-
+        activate_network(std::move(loaded));
         std::cout << "info string Loaded NNUE from " << candidate << "\n";
         return;
+    }
+
+    // No usable file on disk (the common case now: no .nnue shipped alongside
+    // the executable). Fall back to the network embedded in the binary itself
+    // rather than leaving the engine without an evaluator.
+    {
+        LoadedNetwork loaded;
+        std::string embedded_error;
+        if (load_embedded_network(loaded, embedded_error)) {
+            const std::string embedded_name = loaded.loaded_path;
+            activate_network(std::move(loaded));
+            std::cout << "info string Loaded embedded default NNUE (" << embedded_name << ")";
+            // Only call out the failure if the caller asked for something other
+            // than the (now optional) default filename; that's the normal,
+            // expected path when no .nnue ships next to the executable.
+            if (!requested.empty() && requested != kDefaultEvalFile && !last_error.empty()) {
+                std::cout << " (EvalFile " << requested << " failed: " << last_error << ")";
+            }
+            std::cout << "\n";
+            return;
+        }
+        last_error = last_error.empty()
+            ? ("embedded NNUE failed: " + embedded_error)
+            : (last_error + "; embedded NNUE failed: " + embedded_error);
     }
 
     {
