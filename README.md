@@ -15,8 +15,25 @@ Thrawn's ratings are tracked by [CCRL](https://computerchess.org.uk/ccrl/404/).
 
 ## Getting Started
 Download from latest release or build from source. Released binaries have the
-NNUE network compiled in, so they run standalone — no `.nnue` file needs to sit
-next to the executable.
+NNUE network compiled in.
+
+### Build requirements
+
+For a normal native build, install:
+
+- GNU Make
+- A C++17 compiler (`g++` or `clang++`)
+- The default NNUE file at `nn/thrawn-nn-2.nnue`, or pass `NNUE_FILE=/path/to/net.nnue`
+
+The Makefile defaults to `g++` unless `CXX` is set. On macOS, install Apple's
+command line tools (`xcode-select --install`); they provide `make` and a `g++`
+shim for `clang++`, which is enough for the native Apple Silicon build. On
+Linux, install your distro's `g++` and `make` packages. On Windows, build
+through MSYS2/MinGW-w64 or cross-compile from another system.
+
+The selected CPU target must also match the machine that will run the binary:
+`native` auto-detects the current machine, `x86-64-avx2` requires AVX2, and
+`x86-64-avx512` requires AVX-512.
 
 ```bash
 git clone https://github.com/feftywacky/Thrawn.git
@@ -45,28 +62,11 @@ make NNUE_FILE=/path/to/other.nnue   # embed a different network instead
 ```
 
 A different net can still be swapped in at runtime without rebuilding, via the
-UCI `EvalFile` option — it's tried first, and the engine falls back to the
-embedded network if it fails to load:
+UCI `EvalFile` option.
 
 ```
 setoption name EvalFile value /path/to/other.nnue
 ```
-
-## Builds
-
-Pick the binary that matches your OS and CPU:
-
-| Binary | Platform | CPU requirement |
-| --- | --- | --- |
-| `thrawn-v3.1-macos-arm-neon` | macOS (Apple Silicon) | M1 or newer |
-| `thrawn-v3.1-windows-x64-avx2.exe` | Windows x64 | AVX2 (Haswell / Zen1 or newer) |
-| `thrawn-v3.1-windows-x64-avx512.exe` | Windows x64 | AVX-512 (Intel Ice Lake / AMD Zen4 or newer) |
-| `thrawn-v3.1-linux-x64-avx2` | Linux x64 | AVX2 (Haswell / Zen1 or newer) |
-| `thrawn-v3.1-linux-x64-avx512` | Linux x64 | AVX-512 (Intel Ice Lake / AMD Zen4 or newer) |
-
-If unsure, use the **avx2** build — it runs on virtually all x86-64 CPUs from the
-last decade. The Windows executables are statically linked (libstdc++ / libgcc /
-winpthread are baked in), so they have no external GCC DLL dependencies.
 
 ### Building a specific target
 
