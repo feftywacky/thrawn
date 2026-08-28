@@ -13,6 +13,7 @@
 #include "evaluation.h"
 #include "misc.h"
 #include "globals.h"
+#include "constants.h"
 #include "nnue.h"
 #include <stdlib.h>
 #include <vector>
@@ -67,11 +68,6 @@ std::atomic<int> stopped{0};
 
 // Number of threads use for search
 int numThreads = 1;
-
-// UCI "Hash" option bounds, in MB.
-static const int TT_DEFAULT_MB = 256;
-static const int TT_MIN_MB = 4;
-static const int TT_MAX_MB = 1024;
 
 // Requested table size. The table itself is allocated lazily (see
 // ensure_tt_allocated) so a process that is about to be told a different Hash
@@ -758,7 +754,8 @@ void uci_loop(thrawn::Position* pos)
             cout << "id author Feiyu Lin\n";
             cout << "option name Hash type spin default " << TT_DEFAULT_MB
                  << " min " << TT_MIN_MB << " max " << TT_MAX_MB << "\n";
-            cout << "option name Threads type spin default 1 min 1 max 16" << "\n";
+            cout << "option name Threads type spin default 1 min 1 max "
+                 << MAX_THREADS << "\n";
             cout << "option name EvalFile type string default thrawn-nn-2.nnue" << "\n";
             cout << "uciok\n";
         }
@@ -772,20 +769,16 @@ void uci_loop(thrawn::Position* pos)
             }
 
             if (option_name_equals(optionName, "Hash")) {
-                int requested = optionValue.empty() ? tt_size_mb
-                                                    : std::atoi(optionValue.c_str());
-                if (requested < TT_MIN_MB) requested = TT_MIN_MB;
-                if (requested > TT_MAX_MB) requested = TT_MAX_MB;
-                tt_size_mb = requested;
+                tt_size_mb = std::clamp(
+                    optionValue.empty() ? tt_size_mb : std::atoi(optionValue.c_str()),
+                    TT_MIN_MB, TT_MAX_MB);
 
                 std::cout << "info string Set hash table size to " << tt_size_mb << "MB\n";
                 tt->initTable(tt_size_mb);
             }
             else if (option_name_equals(optionName, "Threads")) {
                 int t = optionValue.empty() ? numThreads : std::atoi(optionValue.c_str());
-                if (t < 1) t = 1;
-                if (t > 16) t = 16;
-                numThreads = t;
+                numThreads = std::clamp(t, 1, MAX_THREADS);
                 std::cout << "info string Set threads = " << numThreads << std::endl;
             }
             else if (option_name_equals(optionName, "EvalFile")) {

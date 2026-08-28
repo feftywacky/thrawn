@@ -4,6 +4,7 @@
 #include "evaluation.h"
 #include "nnue.h"
 #include "globals.h"
+#include "constants.h"
 
 const std::string version = " v3.1";
 

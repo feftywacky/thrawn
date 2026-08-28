@@ -19,6 +19,12 @@ constexpr int SEARCH_INFINITY = 50000;
 constexpr int KILLER_MOVES   = 2;
 constexpr int HISTORY_SIZE   = 12;
 constexpr int MAX_THREADS    = 16;
+
+// UCI "Hash" option bounds, in MB. Declared in the `uci` handshake, used to
+// clamp `setoption`, and used for the startup allocation, so all three agree.
+constexpr int TT_DEFAULT_MB  = 256;
+constexpr int TT_MIN_MB      = 1;
+constexpr int TT_MAX_MB      = 16384;
 constexpr int NODE_COUNTER_BATCH = 1024;
 
 constexpr std::array<int, 6> PIECE_VALUES = {100, 320, 330, 500, 900, 20000};
