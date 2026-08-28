@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -121,28 +122,52 @@ void aligned_free_bytes(void* ptr) {
 
 // Zero the table in parallel; a 1 GB single-threaded memset costs ~100 ms on
 // every `ucinewgame`, which is real time lost at fast time controls.
+//
+// The worker count is capped rather than taken from hardware_concurrency():
+// under a tournament manager running many games at once, every engine process
+// would otherwise fan out across every core at the same moment, even one told
+// `Threads=1`. Thread creation can also simply fail under that load, and an
+// escaping std::system_error would kill the process with no output at all -
+// which the manager reports as "engine didn't respond to uciok". So the spawn
+// is bounded, and any failure falls back to finishing the job in place.
+constexpr std::size_t TTZeroMaxWorkers = 4;
+
 void parallel_zero(void* base, std::size_t bytes) {
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0)
         hw = 1;
     const std::size_t chunkMin = 8ULL * 1024ULL * 1024ULL;
     std::size_t workers = std::min<std::size_t>(hw, std::max<std::size_t>(1, bytes / chunkMin));
+    workers = std::min(workers, TTZeroMaxWorkers);
 
+    auto* bytePtr = static_cast<unsigned char*>(base);
     if (workers <= 1) {
-        std::memset(base, 0, bytes);
+        std::memset(bytePtr, 0, bytes);
         return;
     }
 
-    auto* bytePtr = static_cast<unsigned char*>(base);
     const std::size_t chunk = bytes / workers;
     std::vector<std::thread> pool;
     pool.reserve(workers - 1);
+
+    // Index of the first chunk no worker has taken; whatever is left when the
+    // spawn stops is zeroed by this thread.
+    std::size_t spawned = 1;
     for (std::size_t i = 1; i < workers; ++i) {
         const std::size_t begin = i * chunk;
         const std::size_t len = (i == workers - 1) ? bytes - begin : chunk;
-        pool.emplace_back([bytePtr, begin, len] { std::memset(bytePtr + begin, 0, len); });
+        try {
+            pool.emplace_back([bytePtr, begin, len] { std::memset(bytePtr + begin, 0, len); });
+        } catch (const std::system_error&) {
+            break;
+        }
+        ++spawned;
     }
+
     std::memset(bytePtr, 0, chunk);
+    if (spawned < workers)
+        std::memset(bytePtr + spawned * chunk, 0, bytes - spawned * chunk);
+
     for (std::thread& worker : pool)
         worker.join();
 }
