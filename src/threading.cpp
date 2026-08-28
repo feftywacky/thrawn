@@ -234,6 +234,52 @@ static void print_result_info(const SearchResult& result) {
  * Each worker thread performw iterative deepening
  * Use the local copy of the position and the thread's search data
  */
+// One "info depth ..." line for the main thread. `bound` is BOUND_EXACT for a
+// completed iteration, or BOUND_LOWER/BOUND_UPPER for an aspiration fail, which
+// UCI reports as lowerbound/upperbound. Printing the failing iterations too is
+// what keeps the last PV the GUI saw in sync with the move we finally play: a
+// fail-high leaves a new root PV behind, and if the clock then cuts the
+// re-search short that PV is what `bestmove` comes from.
+static void print_iteration_info(ThreadData* td, int depth, int score, int bound)
+{
+    const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
+    const std::uint64_t reportedNodes =
+        total_nodes.load(std::memory_order_relaxed) +
+        static_cast<std::uint64_t>(td->nodes & (NODE_COUNTER_BATCH - 1));
+
+    std::cout << "info depth " << depth
+              << " nodes " << reportedNodes
+              << " time " << currentTime;
+
+    // Determine whether to report a mate score or a centipawn score
+    if (score >= mateScore || score <= -mateScore)
+        std::cout << " score mate " << uci_mate_score(score);
+    else
+        std::cout << " score cp " << score;
+
+    if (bound == BOUND_LOWER)
+        std::cout << " lowerbound";
+    else if (bound == BOUND_UPPER)
+        std::cout << " upperbound";
+
+    if (td->pv_length[0] > 0)
+    {
+        std::cout << " pv ";
+        for (int i = 0; i < td->pv_length[0]; i++)
+        {
+            print_move(td->pv_table[0][i]);
+            std::cout << " ";
+        }
+    }
+    else
+    {
+        std::cout << " pv (none)";
+    }
+
+    std::cout << "\n";
+    std::cout.flush();
+}
+
 void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
 {
     ThreadData* td = &threadDatas[threadID];
@@ -302,11 +348,17 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
                 // Restore the previous PV since the current iteration did not complete properly
                 td->pv_table[0] = backup_pv;
                 td->pv_length[0] = backup_pv_length;
+
+                if (threadID == 0)
+                    print_iteration_info(td, curr_depth, score, BOUND_UPPER);
             }
             // If the search fails high, keep some overlap and expand upward.
             else if (score >= beta) {
                 alpha = std::max(alpha, beta - delta);
                 beta = std::min(mateVal, score + delta);
+
+                if (threadID == 0)
+                    print_iteration_info(td, curr_depth, score, BOUND_LOWER);
             }
             
             // Increase delta for the next iteration of the aspiration loop
@@ -340,42 +392,7 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         
         // print an info line from the master thread (thread 0)
         if (threadID == 0)
-        {   
-            const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
-            const std::uint64_t reportedNodes =
-                total_nodes.load(std::memory_order_relaxed) +
-                static_cast<std::uint64_t>(td->nodes & (NODE_COUNTER_BATCH - 1));
-            std::cout << "info depth " << curr_depth
-                      << " nodes " << reportedNodes
-                      << " time " << currentTime;
-            
-            // Determine whether to report a mate score or a centipawn score
-            if (score >= mateScore || score <= -mateScore)
-            {
-                std::cout << " score mate " << uci_mate_score(score);
-            }
-            else
-            {
-                std::cout << " score cp " << score;
-            }
-            
-            if (td->pv_length[0] > 0)
-            {
-                std::cout << " pv ";
-                for (int i = 0; i < td->pv_length[0]; i++)
-                {
-                    print_move(td->pv_table[0][i]);
-                    std::cout << " ";
-                }
-            }
-            else
-            {
-                std::cout << " pv (none)";
-            }
-            
-            std::cout << "\n";
-            std::cout.flush();
-        }
+            print_iteration_info(td, curr_depth, score, BOUND_EXACT);
     }
 
     // Lazy SMP: only the master thread is gated on the requested search depth

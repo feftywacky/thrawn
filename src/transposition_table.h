@@ -36,6 +36,11 @@ public:
     // Initialize or resize the table to 'mb' megabytes.
     void initTable(int mb);
 
+    // True once a table has actually been allocated. The allocation is deferred
+    // until the GUI is done configuring us, so callers that need a live table
+    // check this first.
+    bool isAllocated() const { return table != nullptr && numClusters > 0; }
+
     // Clears all entries and resets the current age.
     void reset();
 

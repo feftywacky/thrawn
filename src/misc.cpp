@@ -19,7 +19,11 @@ void init_all()
     // init hashkeys
     // init_hashkeys();
 
-    tt->initTable(256); // default of 256 MB
+    // The transposition table is deliberately NOT allocated here. A GUI or
+    // tournament manager sends `setoption name Hash` right after `uci`, so an
+    // eager allocation of the 256 MB default would be touched and thrown away
+    // moments later - painful when a match runs dozens of engine processes at
+    // once. uci.cpp allocates on demand instead.
 
     init_eval_masks();
 

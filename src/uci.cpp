@@ -68,6 +68,21 @@ std::atomic<int> stopped{0};
 // Number of threads use for search
 int numThreads = 1;
 
+// UCI "Hash" option bounds, in MB.
+static const int TT_DEFAULT_MB = 256;
+static const int TT_MIN_MB = 4;
+static const int TT_MAX_MB = 1024;
+
+// Requested table size. The table itself is allocated lazily (see
+// ensure_tt_allocated) so a process that is about to be told a different Hash
+// size never touches the default one.
+static int tt_size_mb = TT_DEFAULT_MB;
+
+static void ensure_tt_allocated() {
+    if (!tt->isAllocated())
+        tt->initTable(tt_size_mb);
+}
+
 static std::string trim_option_value(const char* value) {
     if (value == nullptr) {
         return {};
@@ -487,6 +502,7 @@ void uci_parse_position(thrawn::Position* pos, const char *command) {
 
 void uci_parse_go(thrawn::Position* pos, const char* command)
 {
+    ensure_tt_allocated();
     reset_time_control();
     int depth = -1;
 
@@ -592,9 +608,6 @@ void uci_loop(thrawn::Position* pos)
     // just make it big enough
     #define INPUT_BUFFER 20000
     
-    int max_hashmap_size = 1024; // 1GB
-    int mb = 256; // default 256 MB
-
     // reset STDIN & STDOUT buffers
     setbuf(stdin, NULL);
     setbuf(stdout, NULL);
@@ -621,6 +634,7 @@ void uci_loop(thrawn::Position* pos)
         // parse UCI "isready" command
         if (strncmp(input, "isready", 7) == 0)
         {
+            ensure_tt_allocated();
             std::cout << "readyok\n";
             continue;
         }
@@ -634,6 +648,7 @@ void uci_loop(thrawn::Position* pos)
         // parse UCI "ucinewgame" command
         else if (strncmp(input, "ucinewgame", 10) == 0)
         {
+            ensure_tt_allocated();
             tt->reset();
             uci_parse_position(pos, "position startpos");
         }
@@ -654,7 +669,8 @@ void uci_loop(thrawn::Position* pos)
             // print engine info
             cout << "id name Thrawn"<< version << "\n";
             cout << "id author Feiyu Lin\n";
-            cout << "option name Hash type spin default 256 min 4 max " << max_hashmap_size << "\n";
+            cout << "option name Hash type spin default " << TT_DEFAULT_MB
+                 << " min " << TT_MIN_MB << " max " << TT_MAX_MB << "\n";
             cout << "option name Threads type spin default 1 min 1 max 16" << "\n";
             cout << "option name EvalFile type string default thrawn-nn-2.nnue" << "\n";
             cout << "uciok\n";
@@ -669,12 +685,14 @@ void uci_loop(thrawn::Position* pos)
             }
 
             if (option_name_equals(optionName, "Hash")) {
-                mb = optionValue.empty() ? mb : std::atoi(optionValue.c_str());
-                if(mb < 4) mb = 4;
-                if(mb > max_hashmap_size) mb = max_hashmap_size;
+                int requested = optionValue.empty() ? tt_size_mb
+                                                    : std::atoi(optionValue.c_str());
+                if (requested < TT_MIN_MB) requested = TT_MIN_MB;
+                if (requested > TT_MAX_MB) requested = TT_MAX_MB;
+                tt_size_mb = requested;
 
-                std::cout << "info string Set hash table size to " << mb << "MB\n";
-                tt->initTable(mb);
+                std::cout << "info string Set hash table size to " << tt_size_mb << "MB\n";
+                tt->initTable(tt_size_mb);
             }
             else if (option_name_equals(optionName, "Threads")) {
                 int t = optionValue.empty() ? numThreads : std::atoi(optionValue.c_str());
