@@ -1623,11 +1623,11 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                     return alpha;
 
                 if (verification >= beta)
-                    return beta;
+                    return score;
             }
             else
             {
-                return beta;
+                return score;
             }
         }
     }
@@ -1695,17 +1695,22 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 if (stopped.load(std::memory_order_relaxed) == 1)
                     return alpha;
 
-                if (score >= probCutBeta)
+                if (score >= probCutBeta && !is_mate_score(score))
                 {
-                    update_correction_history(td, pos, raw_static_eval, beta, depth,
-                                              BOUND_LOWER);
                     // The fail-high was only proven by a search at probCutDepth
                     // (plus the qsearch screen), so record the bound at that
                     // verified depth, not the full node depth. Storing it at the
                     // unreduced `depth` would let a later node take a TT cutoff as
-                    // though a full-depth search had confirmed beta.
-                    tt->store(pos, probCutDepth + 1, beta, BOUND_LOWER, move, raw_static_eval);
-                    return beta;
+                    // though a full-depth search had confirmed beta. The stored
+                    // score is unadjusted: at that depth it is what was proven.
+                    tt->store(pos, probCutDepth + 1, score, BOUND_LOWER, move, raw_static_eval);
+
+                    // What the parent gets back is not `score`. probCutBeta sits a
+                    // full margin above beta, and that margin is the price of the
+                    // reduction rather than something this node earned - returning
+                    // `score` raw reports a bound ~160cp too high on every probcut.
+                    // Repay it, the way fail-hard's `return beta` used to.
+                    return score - (probCutBeta - beta);
                 }
             }
         }
@@ -1998,14 +2003,15 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             }
             td->pv_length[pos->ply] = std::max(td->pv_length[pos->ply + 1], pos->ply + 1);
 
-            // Fail-hard beta cutoff
+            // Fail-soft beta cutoff: report how far above beta we actually got,
+            // so the TT bound and the aspiration window both learn the real value.
             if (alpha >= beta)
             {
                 if (!excludedNode)
                 {
-                    update_correction_history(td, pos, raw_static_eval, beta, depth,
+                    update_correction_history(td, pos, raw_static_eval, bestScore, depth,
                                               BOUND_LOWER);
-                    tt->store(pos, depth, beta, BOUND_LOWER, bestMove,
+                    tt->store(pos, depth, bestScore, BOUND_LOWER, bestMove,
                               inCheck ? no_hashmap_entry : raw_static_eval);
                 }
 
@@ -2021,7 +2027,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                                            failed_quiet_moves, depth);
                     penalize_capture_history(td, pos, failed_capture_moves, depth);
                 }
-                return beta;
+                return bestScore;
             }
         }
 
@@ -2053,11 +2059,11 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     // Store in TT and return
     if (!excludedNode)
     {
-        update_correction_history(td, pos, raw_static_eval, alpha, depth, hashFlag);
-        tt->store(pos, depth, alpha, hashFlag, bestMove,
+        update_correction_history(td, pos, raw_static_eval, bestScore, depth, hashFlag);
+        tt->store(pos, depth, bestScore, hashFlag, bestMove,
                   inCheck ? no_hashmap_entry : raw_static_eval);
     }
-    return alpha;
+    return bestScore;
 }
 
 } // namespace
@@ -2136,8 +2142,8 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         // fail-hard beta cutoff
         if (static_eval >= beta)
         {
-            tt->store(pos, 0, beta, BOUND_LOWER, 0, raw_static_eval);
-            return beta; // fails high
+            tt->store(pos, 0, static_eval, BOUND_LOWER, 0, raw_static_eval);
+            return static_eval; // fails high
         }
 
         // found better move
@@ -2154,7 +2160,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
 
     int valid_moves = 0;
     int bestMove = 0;
-    int bestScore = inCheck ? -SEARCH_INFINITY : alpha;
+    int bestScore = inCheck ? -SEARCH_INFINITY : static_eval;
 
     // Both are invariant across this node's move loop (each move is made then
     // unmade, leaving pos unchanged), so compute them once instead of per move.
@@ -2228,9 +2234,9 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
             // fail-hard beta cutoff
             if (score >= beta)
             {
-                tt->store(pos, 0, beta, BOUND_LOWER, bestMove,
+                tt->store(pos, 0, bestScore, BOUND_LOWER, bestMove,
                           inCheck ? no_hashmap_entry : raw_static_eval);
-                return beta; // fails high
+                return bestScore; // fails high
             }
         }
     }
@@ -2243,9 +2249,9 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     }
 
     // move fails low (<= alpha)
-    tt->store(pos, 0, alpha, alpha > oldAlpha ? BOUND_EXACT : BOUND_UPPER,
+    tt->store(pos, 0, bestScore, bestScore > oldAlpha ? BOUND_EXACT : BOUND_UPPER,
               bestMove, inCheck ? no_hashmap_entry : raw_static_eval);
-    return alpha;
+    return bestScore;
 }
 
 // repetition check
