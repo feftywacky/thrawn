@@ -54,38 +54,45 @@ constexpr int SEARCH_QUEEN_PROMOTION_SCORE = 10499;
 constexpr int SEARCH_KILLER_MOVE_SCORE_1 = 9000;
 constexpr int SEARCH_KILLER_MOVE_SCORE_2 = 8000;
 
-constexpr int SEARCH_REVERSE_FUTILITY_MAX_DEPTH = 2;
+constexpr int SEARCH_REVERSE_FUTILITY_MAX_DEPTH = 7;
 constexpr int SEARCH_REVERSE_FUTILITY_MARGIN_1 = 160;
 constexpr int SEARCH_REVERSE_FUTILITY_MARGIN_2 = 300;
 constexpr int SEARCH_REVERSE_FUTILITY_DEPTH_FACTOR = 110;
 
-constexpr int SEARCH_RAZOR_MAX_DEPTH = 2;
+constexpr int SEARCH_RAZOR_MAX_DEPTH = 4;
 constexpr int SEARCH_RAZOR_MARGIN_1 = 250;
 constexpr int SEARCH_RAZOR_MARGIN_2 = 450;
 constexpr int SEARCH_RAZOR_MARGIN_DEPTH_N = 600;
 
 constexpr int SEARCH_NULL_MOVE_MIN_DEPTH = 4;
 constexpr int SEARCH_NULL_MOVE_BASE_REDUCTION = 2;
-constexpr int SEARCH_NULL_MOVE_DEPTH_DIVISOR = 6;
-constexpr int SEARCH_NULL_MOVE_EVAL_DIVISOR = 400;
-constexpr int SEARCH_NULL_MOVE_EVAL_BONUS_MAX = 1;
+constexpr int SEARCH_NULL_MOVE_DEPTH_DIVISOR = 4;
+constexpr int SEARCH_NULL_MOVE_EVAL_DIVISOR = 200;
+constexpr int SEARCH_NULL_MOVE_EVAL_BONUS_MAX = 3;
 constexpr int SEARCH_NULL_MOVE_VERIFICATION_DEPTH = 8;
 
-constexpr int SEARCH_FUTILITY_MAX_DEPTH = 3;
+constexpr int SEARCH_FUTILITY_MAX_DEPTH = 8;
 constexpr int SEARCH_FUTILITY_MARGIN_1 = 120;
 constexpr int SEARCH_FUTILITY_MARGIN_2 = 220;
-constexpr int SEARCH_FUTILITY_MARGIN_3 = 360;
+// Depth 3+ scales linearly. 120 * 3 == 360 reproduces the old MARGIN_3 exactly,
+// so extending the max depth only adds behaviour above depth 3 rather than
+// re-tuning what was already there.
+constexpr int SEARCH_FUTILITY_MARGIN_DEPTH_FACTOR = 120;
 
-constexpr int SEARCH_LATE_MOVE_PRUNING_MAX_DEPTH = 3;
-constexpr int SEARCH_LATE_MOVE_PRUNING_DEPTH_1 = 8;
-constexpr int SEARCH_LATE_MOVE_PRUNING_DEPTH_2 = 12;
-constexpr int SEARCH_LATE_MOVE_PRUNING_DEPTH_3 = 24;
+constexpr int SEARCH_LATE_MOVE_PRUNING_MAX_DEPTH = 8;
+// (BASE + depth^2) / (2 - improving): the standard quadratic, improving-aware
+// shape. 2/4 quiets at depth 1 against the old flat 8, 33/67 at depth 8.
+constexpr int SEARCH_LATE_MOVE_PRUNING_BASE = 3;
 
 // History pruning: skip late quiet moves with clearly bad history at low depth.
 constexpr int SEARCH_HISTORY_PRUNING_MAX_DEPTH = 4;
 constexpr int SEARCH_HISTORY_PRUNING_DEPTH_MARGIN = 2048;
 
-constexpr int SEARCH_LMR_FULL_DEPTH_MOVES = 3;
+// Moves searched at full depth before LMR starts, counted over ALL moves (the
+// gate in negamax reads moves_searched, matching the move number the reduction
+// amount is derived from). 2 keeps the old "reduce from the 3rd quiet" pacing in
+// quiet-heavy nodes while also catching late quiets that trail a run of captures.
+constexpr int SEARCH_LMR_FULL_DEPTH_MOVES = 2;
 constexpr int SEARCH_LMR_REDUCTION_DEPTH_LIMIT = 3;
 constexpr int SEARCH_LMR_BASE_REDUCTION = 0;
 constexpr int SEARCH_LMR_NON_PV_DEPTH = 5;
@@ -99,8 +106,9 @@ constexpr int SEARCH_LMR_BAD_HISTORY_DIVISOR = 4;
 constexpr int SEARCH_SINGULAR_EXTENSION = 1;
 constexpr int SEARCH_SINGULAR_EXTENSION_MIN_DEPTH = 6;
 constexpr int SEARCH_SINGULAR_EXTENSION_DEPTH_MARGIN = 2;
-constexpr int SEARCH_SINGULAR_EXTENSION_BASE_MARGIN = 32;
-constexpr int SEARCH_SINGULAR_EXTENSION_DEPTH_FACTOR = 8;
+constexpr int SEARCH_SINGULAR_EXTENSION_BASE_MARGIN = 0;
+constexpr int SEARCH_SINGULAR_EXTENSION_DEPTH_NUMERATOR = 3;
+constexpr int SEARCH_SINGULAR_EXTENSION_DEPTH_DENOMINATOR = 2;
 
 constexpr int SEARCH_PROBCUT_MIN_DEPTH = 5;
 constexpr int SEARCH_PROBCUT_REDUCTION = 3;
@@ -116,7 +124,10 @@ constexpr int SEARCH_QSEARCH_DELTA_MARGIN = 200;
 constexpr int SEARCH_SEE_PRUNE_MAX_DEPTH = 4;
 constexpr int SEARCH_SEE_PRUNE_DEPTH_MARGIN = 200;
 
-constexpr int SEARCH_LMR_LOG_DIVISOR = 5;
+// lmr_table[d][m] = int(SEARCH_LMR_TABLE_BASE + log(d) * log(m) / SEARCH_LMR_TABLE_DIVISOR)
+constexpr double SEARCH_LMR_TABLE_BASE = 0.78;
+constexpr double SEARCH_LMR_TABLE_DIVISOR = 2.47;
+constexpr int SEARCH_LMR_TABLE_MOVES = 64;
 constexpr int SEARCH_TACTICAL_CAPTURE_BASE_SCORE = 10000;
 constexpr int SEARCH_TACTICAL_VICTIM_MULTIPLIER = 8;
 constexpr int SEARCH_TACTICAL_ATTACKER_DIVISOR = 8;

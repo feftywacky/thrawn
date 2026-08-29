@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <numeric>
 #include <atomic>
+#include <cmath>
 
 /*
 some notes for negamax
@@ -36,13 +37,33 @@ bool is_mate_score(int score) {
     return score <= -mateScore || score >= mateScore;
 }
 
-int floor_log2_int(int value) {
-    int result = 0;
-    value = std::max(1, value);
-    while (value >>= 1) {
-        ++result;
+using LmrTable = std::array<std::array<int8_t, SEARCH_LMR_TABLE_MOVES>, MAX_DEPTH + 1>;
+
+// floor(base + log(depth) * log(move) / divisor), the reduction curve every
+// modern engine uses. The previous shape multiplied two integer logarithms and
+// divided the product, which quantized every depth in [8, 15] to the same
+// reduction and stepped at each power of two.
+LmrTable build_lmr_table() {
+    LmrTable table{};
+    for (int depth = 1; depth <= MAX_DEPTH; ++depth) {
+        for (int move = 1; move < SEARCH_LMR_TABLE_MOVES; ++move) {
+            const double reduction = SEARCH_LMR_TABLE_BASE +
+                                     std::log(static_cast<double>(depth)) *
+                                     std::log(static_cast<double>(move)) /
+                                     SEARCH_LMR_TABLE_DIVISOR;
+            table[depth][move] = static_cast<int8_t>(reduction);
+        }
     }
-    return result;
+    return table;
+}
+
+// Const and filled before main(), so every search thread reads it race-free.
+const LmrTable lmr_table = build_lmr_table();
+
+int lmr_table_reduction(int depth, int move_number) {
+    const int d = std::clamp(depth, 0, MAX_DEPTH);
+    const int m = std::clamp(move_number, 0, SEARCH_LMR_TABLE_MOVES - 1);
+    return lmr_table[d][m];
 }
 
 int reverse_futility_margin(int depth) {
@@ -127,15 +148,12 @@ int futility_margin_for_context(int depth, const StaticEvalContext& context) {
     return std::max(80, margin);
 }
 
+// `improving` is folded into futility_move_count() itself now. The old
+// +4/-2/-2 context deltas were calibrated against the flat 8/12/24 counts; at
+// the new quadratic scale (2 quiets at depth 1) they would prune the entire
+// move list, so the reference formula is used unadjusted.
 int futility_move_count_for_context(int depth, const StaticEvalContext& context) {
-    int count = futility_move_count(depth);
-    if (context.improving)
-        count += 4;
-    if (context.opponentWorsening)
-        count -= 2;
-    if (context.cutNode)
-        count -= 2;
-    return std::max(1, count);
+    return std::max(1, futility_move_count(depth, context.improving));
 }
 
 int probcut_margin_for_context(const StaticEvalContext& context) {
@@ -612,7 +630,7 @@ int late_move_reduction(int depth, int move_number, bool is_pv_node,
                         bool is_counter, int quiet_history,
                         const StaticEvalContext& context) {
     int reduction = SEARCH_LMR_BASE_REDUCTION +
-                    floor_log2_int(depth) * floor_log2_int(move_number) / SEARCH_LMR_LOG_DIVISOR;
+                    lmr_table_reduction(depth, move_number);
     if (!is_pv_node && depth >= SEARCH_LMR_NON_PV_DEPTH) {
         ++reduction;
     } else if (is_pv_node) {
@@ -655,7 +673,11 @@ int late_move_reduction(int depth, int move_number, bool is_pv_node,
         ++reduction;
     }
 
-    return std::clamp(reduction, 1, std::max(1, depth - 2));
+    // Floor of 0, not 1: a quiet with good history plus a counter-move bonus is
+    // meant to be able to buy its full depth back. The caller skips the
+    // null-window re-search when the reduction comes back 0, so a zero here
+    // costs nothing beyond the normal PVS shape.
+    return std::clamp(reduction, 0, std::max(0, depth - 2));
 }
 
 bool is_side_piece(int piece, int side) {
@@ -1460,6 +1482,16 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     // init local pv
     td->pv_length[pos->ply] = pos->ply;
 
+    // Killers are indexed by ply, so without this a subtree inherits whatever
+    // an unrelated sibling line left at ply+2 and orders on a refutation that
+    // has nothing to do with the current position. Clearing ahead (rather than
+    // on entry at ply+2) keeps the pair this node's own children write intact.
+    if (pos->ply + 2 < MAX_DEPTH)
+    {
+        td->killer_moves[0][pos->ply + 2] = 0;
+        td->killer_moves[1][pos->ply + 2] = 0;
+    }
+
     // 1) Check repetition or 50-move draw
     if ((pos->ply && isRepetition(pos)) || pos->fifty_move >= 100)
     {
@@ -1530,8 +1562,24 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     {
         raw_static_eval = evaluate_static(pos, ttStaticEval, ttHit != 0);
         static_eval = corrected_static_eval(td, pos, raw_static_eval);
+        // The stack (and therefore improving/opponentWorsening) keeps the
+        // unrefined corrected eval: it has to be comparable across plies, and
+        // the TT-refined value below is a search result, not an evaluation.
         td->static_eval_stack[pos->ply] = static_eval;
         evalContext = make_static_eval_context(td, pos->ply, static_eval, isPvNode, beta);
+
+        // A TT score whose bound points the same way as the correction is a
+        // strictly better estimate of this node's value than the static eval, so
+        // use it for the pruning decisions below. raw_static_eval is deliberately
+        // left alone: it is the correction-history training input, and feeding a
+        // TT-refined value back in would train the table on its own output.
+        if (ttHit && ttFlag != BOUND_NONE && !is_mate_score(ttScore) &&
+            (ttFlag == BOUND_EXACT ||
+             (ttFlag == BOUND_LOWER && ttScore > static_eval) ||
+             (ttFlag == BOUND_UPPER && ttScore < static_eval)))
+        {
+            static_eval = ttScore;
+        }
     }
     else
     {
@@ -1546,22 +1594,16 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         depth <= SEARCH_RAZOR_MAX_DEPTH && pos->ply > 0 &&
         !is_mate_score(alpha))
     {
-        score = static_eval + razor_margin(depth);
-        int razor_score;
+        // The margin table already had a depth >= 3 case; it was unreachable
+        // while the max depth was 2. The inner depth tests were the other half
+        // of that dead code, so they are generalized rather than duplicated.
+        const int razorBound = static_eval + razor_margin(depth);
         // If the position is very likely losing (or not better) vs beta, do a quick check
-        if (score <= alpha)
+        if (razorBound <= alpha)
         {
-            if (depth == 1)
-            {
-                razor_score = quiescence(pos, td, alpha, beta);
-                return (razor_score > score) ? razor_score : score;
-            }
-            if (depth <= 2)
-            {
-                razor_score = quiescence(pos,td, alpha, beta);
-                if (razor_score < beta) // quiescence says score fail-low node
-                    return (razor_score > score) ? razor_score : score;
-            }
+            const int razor_score = quiescence(pos, td, alpha, beta);
+            if (depth == 1 || razor_score < beta) // quiescence says score fail-low node
+                return std::max(razor_score, razorBound);
         }
     }
 
@@ -1623,11 +1665,11 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                     return alpha;
 
                 if (verification >= beta)
-                    return beta;
+                    return score;
             }
             else
             {
-                return beta;
+                return score;
             }
         }
     }
@@ -1697,15 +1739,15 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
                 if (score >= probCutBeta)
                 {
-                    update_correction_history(td, pos, raw_static_eval, beta, depth,
+                    update_correction_history(td, pos, raw_static_eval, score, depth,
                                               BOUND_LOWER);
                     // The fail-high was only proven by a search at probCutDepth
                     // (plus the qsearch screen), so record the bound at that
                     // verified depth, not the full node depth. Storing it at the
                     // unreduced `depth` would let a later node take a TT cutoff as
                     // though a full-depth search had confirmed beta.
-                    tt->store(pos, probCutDepth + 1, beta, BOUND_LOWER, move, raw_static_eval);
-                    return beta;
+                    tt->store(pos, probCutDepth + 1, score, BOUND_LOWER, move, raw_static_eval);
+                    return score;
                 }
             }
         }
@@ -1746,7 +1788,6 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         const int parentSide = pos->colour_to_move;
         const bool quietMove = is_quiet_move(move);
         const bool captureMove = get_is_capture_move(move);
-        const bool pawnMove = get_move_piece(move) == P || get_move_piece(move) == p;
         const bool firstMove = moves_searched == 0;
         bool givesCheck = false;
         bool givesCheckKnown = false;
@@ -1768,7 +1809,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         {
             const bool castleMove = get_is_move_castling(move);
 
-            if (quietMove && !pawnMove && !castleMove &&
+            if (quietMove && !castleMove &&
                 depth <= SEARCH_FUTILITY_MAX_DEPTH &&
                 static_eval + futility_margin_for_context(depth, evalContext) <= alpha &&
                 !gives_check())
@@ -1776,7 +1817,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 continue;
             }
 
-            if (quietMove && !pawnMove && !castleMove &&
+            if (quietMove && !castleMove &&
                 depth <= SEARCH_LATE_MOVE_PRUNING_MAX_DEPTH &&
                 quiet_moves_seen > futility_move_count_for_context(depth, evalContext) &&
                 !gives_check())
@@ -1787,7 +1828,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             // History pruning: a quiet move with clearly bad history at shallow
             // depth is very unlikely to raise alpha; skip it. Threshold scales
             // linearly with depth, matching the futility/LMP gating above.
-            if (quietMove && !pawnMove && !castleMove &&
+            if (quietMove && !castleMove &&
                 depth <= SEARCH_HISTORY_PRUNING_MAX_DEPTH &&
                 quiet_history_score(td, parentSide, parentPly, move) <
                     -SEARCH_HISTORY_PRUNING_DEPTH_MARGIN * depth &&
@@ -1825,7 +1866,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         {
             const int singularMargin =
                 SEARCH_SINGULAR_EXTENSION_BASE_MARGIN +
-                SEARCH_SINGULAR_EXTENSION_DEPTH_FACTOR * depth;
+                SEARCH_SINGULAR_EXTENSION_DEPTH_NUMERATOR * depth /
+                    SEARCH_SINGULAR_EXTENSION_DEPTH_DENOMINATOR;
             const int singularBeta =
                 std::max(-SEARCH_INFINITY + 1, std::min(SEARCH_INFINITY - 1,
                                                  ttScore - singularMargin));
@@ -1857,6 +1899,12 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
             if (singularScore < singularBeta)
                 extension = SEARCH_SINGULAR_EXTENSION;
+            // Multi-cut: the search we just paid for proved that some move other
+            // than the TT move already reaches singularBeta, and the TT move
+            // itself is worth at least ttScore >= singularBeta. Two moves at or
+            // above beta is enough to cut here without searching anything else.
+            else if (singularBeta >= beta && !is_mate_score(singularBeta))
+                return singularBeta;
             // Negative extension: the TT move is not singular and the table
             // already proves a fail-high here, so other moves are likely just as
             // good. Spend one ply less on this subtree.
@@ -1906,7 +1954,16 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 : 0;
             const bool counterMove = quietMove && is_counter_move(td, parentPly, move);
 
-            if (quiet_moves_seen >= SEARCH_LMR_FULL_DEPTH_MOVES &&
+            // The depth actually searched by the first (null-window) pass, and
+            // whether that pass ran at all. Both feed the re-search guard below.
+            int firstPassDepth = childDepth;
+            bool firstPassSearched = true;
+
+            // Gate on moves_searched, matching the move number the reduction
+            // amount itself is computed from. The old quiet_moves_seen gate let
+            // the first quiets after a run of captures through at full depth
+            // even though they were already move 11, 12, ... of the node.
+            if (moves_searched >= SEARCH_LMR_FULL_DEPTH_MOVES &&
                 depth >= SEARCH_LMR_REDUCTION_DEPTH_LIMIT &&
                 !inCheck &&
                 !givesCheck &&
@@ -1917,8 +1974,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 int reduction = late_move_reduction(depth, moves_searched + 1,
                                                     isPvNode, counterMove, quietHistory,
                                                     evalContext);
-                int reducedDepth = std::max(1, childDepth - reduction);
-                score = search_child(reducedDepth, -alpha - 1, -alpha);
+                firstPassDepth = std::max(1, childDepth - reduction);
+                score = search_child(firstPassDepth, -alpha - 1, -alpha);
             }
             else if (captureMove && picked.seeKnown && picked.seeScore < 0 &&
                      !get_promoted_piece(move) &&
@@ -1930,20 +1987,27 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 // restores full depth if the reduced search still beats alpha.
                 int reduction = late_move_reduction(depth, moves_searched + 1,
                                                     isPvNode, false, 0, evalContext);
-                int reducedDepth = std::max(1, childDepth - reduction);
-                score = search_child(reducedDepth, -alpha - 1, -alpha);
+                firstPassDepth = std::max(1, childDepth - reduction);
+                score = search_child(firstPassDepth, -alpha - 1, -alpha);
             }
             else
             {
                 // Force a normal re-search with a null window to see if it fails high
                 score = alpha + 1;
+                firstPassSearched = false;
             }
 
             // If we got a score above alpha after LMR attempt...
             if (score > alpha)
             {
-                // Do a PVS re-search with a narrow window
-                score = search_child(childDepth, -alpha - 1, -alpha);
+                // Do a PVS re-search with a narrow window - unless the first pass
+                // already was that search (reduction 0, or no first pass at all),
+                // in which case repeating it at the same depth and window would
+                // re-walk an identical subtree for an identical answer.
+                if (!firstPassSearched || firstPassDepth < childDepth)
+                {
+                    score = search_child(childDepth, -alpha - 1, -alpha);
+                }
 
                 // If it's still above alpha but not >= beta, do a full re-search
                 if (score > alpha && score < beta)
@@ -1998,14 +2062,19 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             }
             td->pv_length[pos->ply] = std::max(td->pv_length[pos->ply + 1], pos->ply + 1);
 
-            // Fail-hard beta cutoff
+            // Fail-soft beta cutoff: bestScore is the score actually proved
+            // here, and it can sit well above beta. Storing beta instead would
+            // cap the bound at the window we happened to be searched with, so a
+            // later node with a higher beta could not reuse the entry and would
+            // re-search a subtree already proved. It would also hand correction
+            // history a window bound in place of the real search score.
             if (alpha >= beta)
             {
                 if (!excludedNode)
                 {
-                    update_correction_history(td, pos, raw_static_eval, beta, depth,
+                    update_correction_history(td, pos, raw_static_eval, bestScore, depth,
                                               BOUND_LOWER);
-                    tt->store(pos, depth, beta, BOUND_LOWER, bestMove,
+                    tt->store(pos, depth, bestScore, BOUND_LOWER, bestMove,
                               inCheck ? no_hashmap_entry : raw_static_eval);
                 }
 
@@ -2021,7 +2090,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                                            failed_quiet_moves, depth);
                     penalize_capture_history(td, pos, failed_capture_moves, depth);
                 }
-                return beta;
+                return bestScore;
             }
         }
 
@@ -2050,14 +2119,16 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             return 0;
     }
 
-    // Store in TT and return
+    // Store in TT and return. On a fail-low bestScore is below alpha and is the
+    // real upper bound on this node; returning alpha instead would tell the
+    // aspiration loop nothing about how far the search actually failed.
     if (!excludedNode)
     {
-        update_correction_history(td, pos, raw_static_eval, alpha, depth, hashFlag);
-        tt->store(pos, depth, alpha, hashFlag, bestMove,
+        update_correction_history(td, pos, raw_static_eval, bestScore, depth, hashFlag);
+        tt->store(pos, depth, bestScore, hashFlag, bestMove,
                   inCheck ? no_hashmap_entry : raw_static_eval);
     }
-    return alpha;
+    return bestScore;
 }
 
 } // namespace
@@ -2133,11 +2204,11 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         static_eval = corrected_static_eval(td, pos, raw_static_eval);
         td->static_eval_stack[pos->ply] = static_eval;
 
-        // fail-hard beta cutoff
+        // fail-soft beta cutoff on the stand pat
         if (static_eval >= beta)
         {
-            tt->store(pos, 0, beta, BOUND_LOWER, 0, raw_static_eval);
-            return beta; // fails high
+            tt->store(pos, 0, static_eval, BOUND_LOWER, 0, raw_static_eval);
+            return static_eval; // fails high
         }
 
         // found better move
@@ -2154,7 +2225,9 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
 
     int valid_moves = 0;
     int bestMove = 0;
-    int bestScore = inCheck ? -SEARCH_INFINITY : alpha;
+    // Not `alpha`: the stand pat is a real lower bound on this node, and when it
+    // sits below alpha the node still has to report how far below.
+    int bestScore = inCheck ? -SEARCH_INFINITY : static_eval;
 
     // Both are invariant across this node's move loop (each move is made then
     // unmade, leaving pos unchanged), so compute them once instead of per move.
@@ -2225,12 +2298,12 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         {
             alpha = score; // principal variation PV node (best move)
 
-            // fail-hard beta cutoff
+            // fail-soft beta cutoff
             if (score >= beta)
             {
-                tt->store(pos, 0, beta, BOUND_LOWER, bestMove,
+                tt->store(pos, 0, bestScore, BOUND_LOWER, bestMove,
                           inCheck ? no_hashmap_entry : raw_static_eval);
-                return beta; // fails high
+                return bestScore; // fails high
             }
         }
     }
@@ -2243,9 +2316,9 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     }
 
     // move fails low (<= alpha)
-    tt->store(pos, 0, alpha, alpha > oldAlpha ? BOUND_EXACT : BOUND_UPPER,
+    tt->store(pos, 0, bestScore, bestScore > oldAlpha ? BOUND_EXACT : BOUND_UPPER,
               bestMove, inCheck ? no_hashmap_entry : raw_static_eval);
-    return alpha;
+    return bestScore;
 }
 
 // repetition check
@@ -2274,19 +2347,16 @@ int futility_margin(int depth)
     if (depth == 2) {
         return SEARCH_FUTILITY_MARGIN_2;
     }
-    return SEARCH_FUTILITY_MARGIN_3;
+    // Keeps scaling past depth 3 instead of flattening: futility now runs up to
+    // SEARCH_FUTILITY_MAX_DEPTH, and a constant margin there would prune far too
+    // much. 120 * 3 == the old depth-3 margin, so nothing below depth 4 moves.
+    return SEARCH_FUTILITY_MARGIN_DEPTH_FACTOR * depth;
 }
 
-int futility_move_count(int depth)
+int futility_move_count(int depth, bool improving)
 {
     if (depth <= 0) {
         return 0;
     }
-    if (depth == 1) {
-        return SEARCH_LATE_MOVE_PRUNING_DEPTH_1;
-    }
-    if (depth == 2) {
-        return SEARCH_LATE_MOVE_PRUNING_DEPTH_2;
-    }
-    return SEARCH_LATE_MOVE_PRUNING_DEPTH_3;
+    return (SEARCH_LATE_MOVE_PRUNING_BASE + depth * depth) / (improving ? 1 : 2);
 }
