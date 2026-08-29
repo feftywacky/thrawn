@@ -1,6 +1,8 @@
 #ifndef TRANSPOSITION_TABLE_H
 #define TRANSPOSITION_TABLE_H
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include "position.h"
 
@@ -12,10 +14,14 @@ static const int BOUND_UPPER      = 2;
 static const int BOUND_EXACT      = 3;
 static const int TT_CLUSTER_SIZE  = 4;
 
+// Entries are shared across search threads, so both words are atomic. All
+// accesses are relaxed: on every supported target these compile to a plain
+// load/store, but they make the concurrent access well-defined and stop the
+// compiler from re-reading a word between the tag check and its use.
 struct TTEntry 
 {
-    uint64_t smp_key;  // 48-bit zobrist/data tag + 16-bit static eval
-    uint64_t smp_data; // Encoding depth, score, hash_flag and best_move into a U64
+    std::atomic<uint64_t> smp_key;  // 48-bit zobrist/data tag + 16-bit static eval
+    std::atomic<uint64_t> smp_data; // Encoding depth, score, hash_flag and best_move into a U64
 };
 
 struct alignas(64) TTCluster
@@ -26,6 +32,8 @@ struct alignas(64) TTCluster
 static_assert(sizeof(TTEntry) == 16, "TTEntry must stay compact");
 static_assert(sizeof(TTCluster) == 64, "TTCluster should occupy one cache line");
 static_assert(alignof(TTCluster) == 64, "TTCluster should be cache-line aligned");
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+              "TT entries require lock-free 64-bit atomics");
 
 class TranspositionTable
 {
@@ -50,8 +58,14 @@ public:
     // Prefetch a cluster before a likely child-node TT probe.
     void prefetch(uint64_t zobristKey) const;
 
+    // Permille of the table holding entries from the current search.
+    int hashfull() const;
+
+    int hashfullMb() const;
+    int hashSizeMb() const;
+
     // Lookup a position in the tt
-    bool probe(const thrawn::Position* pos, int& depth, int alpha, int beta,
+    bool probe(const thrawn::Position* pos, int& depth,
                int& bestMove, int& score, int& flag, int& staticEval);
 
     // Store an entry in the tt
@@ -69,13 +83,15 @@ public:
     int extractTTHashFlag(uint64_t data);
 
 private:
-    int clusterIndex(uint64_t zobristKey) const;
+    std::size_t clusterIndex(uint64_t zobristKey) const;
+    void freeTable();
 
-    TTCluster* table;    // Array of 64-byte TT clusters.
-    int      numEntries; // Number of entries in the table.
-    int      numClusters;
-    int      clusterMask;
-    int      currentAge; // Current age, updated once per search before workers start.
+    TTCluster*  table;       // Array of 64-byte TT clusters.
+    void*       tableAlloc;  // Base of the (over-aligned) allocation backing `table`.
+    std::size_t allocBytes;
+    std::size_t numClusters;
+    std::size_t clusterMask; // Only used on targets without a 128-bit multiply.
+    int         currentAge;  // Current age, updated once per search before workers start.
 };
 
 #endif // TRANSPOSITION_TABLE_H

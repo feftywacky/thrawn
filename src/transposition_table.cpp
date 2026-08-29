@@ -1,9 +1,18 @@
 #include "transposition_table.h"
 #include "constants.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#include <malloc.h>
+#elif defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace {
 constexpr int TTAgeBits = 5;
@@ -13,6 +22,12 @@ constexpr int TTKeyBits = 48;
 constexpr int TTStaticEvalShift = TTKeyBits;
 constexpr uint64_t TTKeyMask = (UINT64_C(1) << TTKeyBits) - 1;
 constexpr int16_t TTStaticEvalNone = std::numeric_limits<int16_t>::min();
+
+// Back the table with 2 MB-aligned memory so Linux can serve it from huge
+// pages: one TLB entry then covers 32k clusters instead of 32.
+constexpr std::size_t TTHugePageSize = 2ULL * 1024ULL * 1024ULL;
+
+constexpr std::memory_order TTRelaxed = std::memory_order_relaxed;
 
 int relative_age(int currentAge, int entryAge) {
     return (currentAge - entryAge) & TTAgeMask;
@@ -71,75 +86,166 @@ uint64_t encode_key(uint64_t zobristKey, uint64_t data, int staticEval) {
 }
 
 bool update_static_eval_key(TTEntry& entry, uint64_t zobristKey, int staticEval) {
-    const uint64_t data = entry.smp_data;
-    const uint64_t key = entry.smp_key;
+    const uint64_t data = entry.smp_data.load(TTRelaxed);
+    const uint64_t key = entry.smp_key.load(TTRelaxed);
     if (!key_matches(key, zobristKey, data)) {
         return false;
     }
 
-    entry.smp_key = (key & TTKeyMask) |
-        (static_cast<uint64_t>(static_cast<uint16_t>(encode_static_eval(staticEval))) << TTStaticEvalShift);
+    entry.smp_key.store((key & TTKeyMask) |
+        (static_cast<uint64_t>(static_cast<uint16_t>(encode_static_eval(staticEval)))
+             << TTStaticEvalShift),
+        TTRelaxed);
     return true;
+}
+
+void* aligned_alloc_bytes(std::size_t bytes, std::size_t alignment) {
+#if defined(_WIN32)
+    return _aligned_malloc(bytes, alignment);
+#else
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, bytes) != 0) {
+        return nullptr;
+    }
+    return ptr;
+#endif
+}
+
+void aligned_free_bytes(void* ptr) {
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
+
+// Zero the table in parallel; a 1 GB single-threaded memset costs ~100 ms on
+// every `ucinewgame`, which is real time lost at fast time controls.
+void parallel_zero(void* base, std::size_t bytes) {
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0)
+        hw = 1;
+    const std::size_t chunkMin = 8ULL * 1024ULL * 1024ULL;
+    std::size_t workers = std::min<std::size_t>(hw, std::max<std::size_t>(1, bytes / chunkMin));
+
+    if (workers <= 1) {
+        std::memset(base, 0, bytes);
+        return;
+    }
+
+    auto* bytePtr = static_cast<unsigned char*>(base);
+    const std::size_t chunk = bytes / workers;
+    std::vector<std::thread> pool;
+    pool.reserve(workers - 1);
+    for (std::size_t i = 1; i < workers; ++i) {
+        const std::size_t begin = i * chunk;
+        const std::size_t len = (i == workers - 1) ? bytes - begin : chunk;
+        pool.emplace_back([bytePtr, begin, len] { std::memset(bytePtr + begin, 0, len); });
+    }
+    std::memset(bytePtr, 0, chunk);
+    for (std::thread& worker : pool)
+        worker.join();
 }
 } // namespace
 
 TranspositionTable::TranspositionTable()
-    : table(nullptr), numEntries(0), numClusters(0), clusterMask(0), currentAge(0)
+    : table(nullptr), tableAlloc(nullptr), allocBytes(0), numClusters(0), clusterMask(0),
+      currentAge(0)
 {
 }
 
 TranspositionTable::~TranspositionTable()
 {
-    if (table) {
-        delete[] table;
-        table = nullptr;
+    freeTable();
+}
+
+void TranspositionTable::freeTable()
+{
+    if (tableAlloc) {
+        aligned_free_bytes(tableAlloc);
+        tableAlloc = nullptr;
     }
+    table = nullptr;
+    allocBytes = 0;
+    numClusters = 0;
+    clusterMask = 0;
 }
 
 void TranspositionTable::initTable(int mb)
 {
-    const std::size_t bytes = static_cast<std::size_t>(mb) * 0x100000ULL;  // Convert MB to bytes
-    const int clusterCapacity = static_cast<int>(bytes / sizeof(TTCluster));
+    if (mb < 1)
+        mb = 1;
 
-    if (table) {
-        delete[] table;
-        table = nullptr;
-    }
+    const std::size_t bytes = static_cast<std::size_t>(mb) * 0x100000ULL;  // Convert MB to bytes
+    std::size_t clusterCapacity = bytes / sizeof(TTCluster);
+
+    freeTable();
 
     if (clusterCapacity < 1) {
-        std::cerr << "TT init: table too small, forcing 4 MB.\n";
+        std::cout << "info string TT init: table too small, forcing 4 MB\n";
         initTable(4);
         return;
     }
 
-    numClusters = 1;
-    while (numClusters <= clusterCapacity / 2) {
-        numClusters *= 2;
-    }
-    clusterMask = numClusters - 1;
-    numEntries = numClusters * TT_CLUSTER_SIZE;
+#if !defined(__SIZEOF_INT128__)
+    // Without a 128-bit multiply the index falls back to masking, which needs a
+    // power-of-two cluster count.
+    std::size_t pow2 = 1;
+    while (pow2 <= clusterCapacity / 2)
+        pow2 *= 2;
+    clusterCapacity = pow2;
+#endif
 
-    table = new TTCluster[numClusters];
+    numClusters = clusterCapacity;
+    clusterMask = numClusters - 1;
+    allocBytes = numClusters * sizeof(TTCluster);
+
+    tableAlloc = aligned_alloc_bytes(allocBytes, TTHugePageSize);
+    if (!tableAlloc) {
+        // Fall back to plain alignment; only huge-page backing is lost.
+        tableAlloc = aligned_alloc_bytes(allocBytes, alignof(TTCluster));
+    }
+    if (!tableAlloc) {
+        std::cout << "info string TT init: allocation of " << mb << " MB failed\n";
+        numClusters = 0;
+        clusterMask = 0;
+        allocBytes = 0;
+        if (mb > 4)
+            initTable(4);
+        return;
+    }
+
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    madvise(tableAlloc, allocBytes, MADV_HUGEPAGE);
+#endif
+
+    // Lock-free 64-bit atomics are plain words in memory, so a bulk zero is a
+    // valid way to bring every entry up as empty.
+    table = static_cast<TTCluster*>(tableAlloc);
     reset();
 
-    std::cout << "TT: allocated " << mb << " MB, entries = " << numEntries << std::endl;
+    std::cout << "info string TT allocated " << mb << " MB, entries = "
+              << numClusters * TT_CLUSTER_SIZE << "\n";
 }
 
 void TranspositionTable::reset()
 {
     if (table && numClusters > 0) {
-        std::memset(table, 0, static_cast<std::size_t>(numClusters) * sizeof(TTCluster));
+        parallel_zero(table, allocBytes);
     }
     currentAge = 0;
 }
 
-int TranspositionTable::clusterIndex(uint64_t zobristKey) const
+std::size_t TranspositionTable::clusterIndex(uint64_t zobristKey) const
 {
 #if defined(__SIZEOF_INT128__)
-    return static_cast<int>((static_cast<unsigned __int128>(zobristKey) *
-                             static_cast<uint64_t>(numClusters)) >> 64);
+    // Multiply-shift maps the key onto [0, numClusters) for any cluster count,
+    // so the table can use every byte the user asked for instead of rounding
+    // the capacity down to a power of two.
+    return static_cast<std::size_t>((static_cast<unsigned __int128>(zobristKey) *
+                                     static_cast<uint64_t>(numClusters)) >> 64);
 #else
-    return static_cast<int>(zobristKey & static_cast<uint64_t>(clusterMask));
+    return static_cast<std::size_t>(zobristKey) & clusterMask;
 #endif
 }
 
@@ -147,19 +253,50 @@ void TranspositionTable::prefetch(uint64_t zobristKey) const
 {
 #if defined(__GNUC__) || defined(__clang__)
     if (table && numClusters > 0) {
-        __builtin_prefetch(&table[clusterIndex(zobristKey)], 0, 1);
+        // rw=0, locality=3: the TT is re-read constantly, so keep the line in L1.
+        __builtin_prefetch(&table[clusterIndex(zobristKey)], 0, 3);
     }
 #else
     (void)zobristKey;
 #endif
 }
 
-bool TranspositionTable::probe(const thrawn::Position* pos, int& depth, int alpha, int beta,
+int TranspositionTable::hashfull() const
+{
+    if (!table || numClusters == 0)
+        return 0;
+
+    const std::size_t sampleClusters = std::min<std::size_t>(numClusters, 1000);
+    int used = 0;
+    int seen = 0;
+    for (std::size_t i = 0; i < sampleClusters; ++i) {
+        for (int j = 0; j < TT_CLUSTER_SIZE; ++j) {
+            const uint64_t data = table[i].entries[j].smp_data.load(TTRelaxed);
+            ++seen;
+            if (data != 0 && packed_age(data) == (currentAge & TTAgeMask))
+                ++used;
+        }
+    }
+    return seen ? static_cast<int>((static_cast<long long>(used) * 1000) / seen) : 0;
+}
+
+int TranspositionTable::hashfullMb() const
+{
+    const int sizeMb = hashSizeMb();
+    return (hashfull() * sizeMb + 500) / 1000;
+}
+
+int TranspositionTable::hashSizeMb() const
+{
+    return static_cast<int>(allocBytes / 0x100000ULL);
+}
+
+bool TranspositionTable::probe(const thrawn::Position* pos, int& depth,
                                int& bestMove, int& score, int& flag, int& staticEval)
 {
     staticEval = no_hashmap_entry;
 
-    if (!table || numClusters <= 0)
+    if (!table || numClusters == 0)
         return false;
 
     const TTCluster& cluster = table[clusterIndex(pos->zobristKey)];
@@ -167,32 +304,27 @@ bool TranspositionTable::probe(const thrawn::Position* pos, int& depth, int alph
     for (int i = 0; i < TT_CLUSTER_SIZE; i++)
     {
         const TTEntry& entry = cluster.entries[i];
-        const uint64_t entry_key = entry.smp_key;
-        const uint64_t entry_data = entry.smp_data;
+        const uint64_t entry_data = entry.smp_data.load(TTRelaxed);
+        if (entry_data == 0)
+            continue;
 
-        if (entry_data != 0 && key_matches(entry_key, pos->zobristKey, entry_data))
-        {
-            depth = extractTTDepth(entry_data);
-            bestMove = extractTTBestMove(entry_data);
-            flag = extractTTHashFlag(entry_data);
-            staticEval = decode_static_eval(entry_key);
-            
-            score = extractTTScore(entry_data);
-            // adjusted mate
-            if (score < -mateScore)
-                score += pos->ply;
-            if (score > mateScore) 
-                score -= pos->ply;
+        const uint64_t entry_key = entry.smp_key.load(TTRelaxed);
+        if (!key_matches(entry_key, pos->zobristKey, entry_data))
+            continue;
 
-            // if (entry_hash_flag == BOUND_EXACT) // pv node
-            //     return score;
-            // if (entry_hash_flag == BOUND_LOWER && score <= alpha) // fail-low score
-            //     return alpha;
-            // if (entry_hash_flag == BOUND_UPPER && score >= beta) // fail-high score
-            //     return beta;
+        depth = extractTTDepth(entry_data);
+        bestMove = extractTTBestMove(entry_data);
+        flag = extractTTHashFlag(entry_data);
+        staticEval = decode_static_eval(entry_key);
 
-            return true;
-        }
+        score = extractTTScore(entry_data);
+        // adjusted mate
+        if (score < -mateScore)
+            score += pos->ply;
+        if (score > mateScore)
+            score -= pos->ply;
+
+        return true;
     }
     return false;
 }
@@ -200,27 +332,30 @@ bool TranspositionTable::probe(const thrawn::Position* pos, int& depth, int alph
 void TranspositionTable::store(const thrawn::Position* pos, int depth, int score, int flag,
                                int bestMove, int staticEval)
 {
-    if (!table || numClusters <= 0)
+    if (!table || numClusters == 0)
         return;
 
     TTCluster& cluster = table[clusterIndex(pos->zobristKey)];
     TTEntry* replace = &cluster.entries[0];
-    uint64_t replace_data = replace->smp_data;
-    uint64_t replace_key = replace->smp_key;
-    const int current = currentAge;
+    uint64_t replace_data = 0;
+    uint64_t replace_key = 0;
+    const int current = currentAge & TTAgeMask;
     int worst_value = 1000000;
     bool replacingSamePosition = false;
 
     for (int i = 0; i < TT_CLUSTER_SIZE; i++)
     {
         TTEntry& candidate = cluster.entries[i];
-        const uint64_t old_data = candidate.smp_data;
-        const uint64_t old_key = candidate.smp_key;
+        const uint64_t old_data = candidate.smp_data.load(TTRelaxed);
+        const uint64_t old_key = candidate.smp_key.load(TTRelaxed);
         const bool samePosition = old_data != 0 && key_matches(old_key, pos->zobristKey, old_data);
 
         if (samePosition)
         {
-            if (flag != BOUND_EXACT && depth < extractTTDepth(old_data) - 2)
+            // Keep a deeper result from this same search, but never let an entry
+            // that survived from an earlier search block a fresh one.
+            const bool fromThisSearch = packed_age(old_data) == current;
+            if (fromThisSearch && flag != BOUND_EXACT && depth < extractTTDepth(old_data) - 2)
             {
                 if (staticEval != no_hashmap_entry)
                     update_static_eval_key(candidate, pos->zobristKey, staticEval);
@@ -234,7 +369,7 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
             break;
         }
 
-        const int value = replacement_value(old_data, current & TTAgeMask);
+        const int value = replacement_value(old_data, current);
         if (value < worst_value)
         {
             worst_value = value;
@@ -254,7 +389,7 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
         score += pos->ply;
 
     uint64_t data = encodeTTData(bestMove, depth, score, flag);
-    data |= (static_cast<uint64_t>(current & TTAgeMask) << TTAgeShift);
+    data |= (static_cast<uint64_t>(current) << TTAgeShift);
 
     int eval_to_store = no_hashmap_entry;
     if (staticEval != no_hashmap_entry)
@@ -263,13 +398,15 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
         eval_to_store = decode_static_eval(replace_key);
     
     const uint64_t key = encode_key(pos->zobristKey, data, eval_to_store);
-    replace->smp_data = data;
-    replace->smp_key = key;
+    // Publish data first, then the tag derived from it. A reader that catches
+    // the pair half-written sees a tag that does not match and skips the entry.
+    replace->smp_data.store(data, TTRelaxed);
+    replace->smp_key.store(key, TTRelaxed);
 }
 
 void TranspositionTable::storeStaticEval(const thrawn::Position* pos, int staticEval)
 {
-    if (!table || numClusters <= 0 || staticEval == no_hashmap_entry)
+    if (!table || numClusters == 0 || staticEval == no_hashmap_entry)
         return;
 
     TTCluster& cluster = table[clusterIndex(pos->zobristKey)];
@@ -277,13 +414,10 @@ void TranspositionTable::storeStaticEval(const thrawn::Position* pos, int static
     for (int i = 0; i < TT_CLUSTER_SIZE; i++)
     {
         TTEntry& entry = cluster.entries[i];
-        const uint64_t entry_key = entry.smp_key;
-        const uint64_t entry_data = entry.smp_data;
-        if (entry_data != 0 && key_matches(entry_key, pos->zobristKey, entry_data))
-        {
-            update_static_eval_key(entry, pos->zobristKey, staticEval);
+        if (entry.smp_data.load(TTRelaxed) == 0)
+            continue;
+        if (update_static_eval_key(entry, pos->zobristKey, staticEval))
             return;
-        }
     }
 }
 

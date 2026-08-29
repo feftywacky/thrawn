@@ -45,6 +45,8 @@ public:
     bool allowNullMovePruning;
 
     long long nodes;
+    // Ticks down to the next communicate() poll on the main thread.
+    int check_counter;
 
     int thread_id;
     int final_depth;

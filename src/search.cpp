@@ -160,13 +160,16 @@ void count_node(ThreadData* td) {
     }
 }
 
-int evaluate_static(thrawn::Position* pos, int cachedStaticEval = no_hashmap_entry) {
+int evaluate_static(thrawn::Position* pos, int cachedStaticEval, bool ttHit) {
     if (cachedStaticEval != no_hashmap_entry) {
         return cachedStaticEval;
     }
 
     const int value = evaluate(pos);
-    tt->storeStaticEval(pos, value);
+    // Without a TT entry for this position there is nothing to attach the eval
+    // to, so skip the cluster walk; the node's own store carries it instead.
+    if (ttHit)
+        tt->storeStaticEval(pos, value);
     return value;
 }
 
@@ -1437,8 +1440,12 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         return alpha;
 
     // Only the main worker consumes stdin; helpers just observe the shared stop flag.
-    if (td->thread_id == 0 && (td->nodes & 1023) == 0)
+    // Counted off a dedicated tick rather than td->nodes: TT cutoffs return
+    // before count_node(), which would otherwise pin nodes on a multiple of the
+    // batch and fire an ioctl at every node in a cutoff-heavy region.
+    if (td->thread_id == 0 && --td->check_counter <= 0)
     {
+        td->check_counter = NODE_COUNTER_BATCH;
         communicate();
         if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
@@ -1497,7 +1504,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     int ttFlag = BOUND_NONE;
     int ttScore = 0;
     int ttStaticEval = no_hashmap_entry;
-    if ((ttHit = tt->probe(pos, ttDepth, alpha, beta, ttMove, ttScore, ttFlag, ttStaticEval)))
+    if ((ttHit = tt->probe(pos, ttDepth, ttMove, ttScore, ttFlag, ttStaticEval)))
     {
         if (!excludedNode && ttDepth >= depth && !isPvNode)
         {
@@ -1521,7 +1528,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     // Compute static evaluation
     if (!inCheck)
     {
-        raw_static_eval = evaluate_static(pos, ttStaticEval);
+        raw_static_eval = evaluate_static(pos, ttStaticEval, ttHit != 0);
         static_eval = corrected_static_eval(td, pos, raw_static_eval);
         td->static_eval_stack[pos->ply] = static_eval;
         evalContext = make_static_eval_context(td, pos->ply, static_eval, isPvNode, beta);
@@ -2061,8 +2068,9 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     if (stopped.load(std::memory_order_relaxed) == 1)
         return alpha;
 
-    if (td->thread_id == 0 && (td->nodes & 1023) == 0)
+    if (td->thread_id == 0 && --td->check_counter <= 0)
     {
+        td->check_counter = NODE_COUNTER_BATCH;
         communicate();
         if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
@@ -2103,7 +2111,8 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     int ttFlag = BOUND_NONE;
     int ttScore = 0;
     int ttStaticEval = no_hashmap_entry;
-    if (tt->probe(pos, ttDepth, alpha, beta, ttMove, ttScore, ttFlag, ttStaticEval))
+    const bool ttHit = tt->probe(pos, ttDepth, ttMove, ttScore, ttFlag, ttStaticEval);
+    if (ttHit)
     {
         if (!isPvNode || ttFlag == BOUND_EXACT)
         {
@@ -2120,7 +2129,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     int raw_static_eval = no_hashmap_entry;
     if (!inCheck)
     {
-        raw_static_eval = evaluate_static(pos, ttStaticEval);
+        raw_static_eval = evaluate_static(pos, ttStaticEval, ttHit);
         static_eval = corrected_static_eval(td, pos, raw_static_eval);
         td->static_eval_stack[pos->ply] = static_eval;
 

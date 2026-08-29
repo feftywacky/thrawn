@@ -83,6 +83,11 @@ static void ensure_tt_allocated() {
         tt->initTable(tt_size_mb);
 }
 
+// While `bench` drives searches internally, stdin must be left alone:
+// read_input() consumes whole buffered chunks and would swallow the commands
+// queued behind the bench.
+static bool bench_running = false;
+
 static std::string trim_option_value(const char* value) {
     if (value == nullptr) {
         return {};
@@ -399,7 +404,8 @@ void communicate() {
 	}
 	
     // read GUI input
-	read_input();
+	if (!bench_running)
+		read_input();
 }
 
 /*
@@ -559,8 +565,6 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
 
     // Initialize start time
     starttime = get_time_ms();
-    
-    depth = depth;
 
     // If time control is available
     if (uci_time != -1) {
@@ -601,6 +605,75 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
 
     std::cout << "info depth 0 nodes 0 time 0 score cp 0 pv none"<<endl;
     search_position_threaded(pos, depth, numThreads);  
+}
+
+// Fixed position set for `bench`. Node counts are reproducible for a given
+// depth, so a search-neutral refactor must leave them unchanged, and the nps
+// figure is a stable speed measurement.
+static const char* BENCH_FENS[] = {
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+    "2rq1rk1/pp1bppbp/2np1np1/8/3NP3/1BN1BP2/PPPQ2PP/2KR3R w - - 0 1",
+    "4rrk1/pp1n1pp1/3bp2p/q2p4/2PP4/1P1BPN2/P4PPP/R2Q1RK1 w - - 0 1",
+    "r1bqkb1r/pp3ppp/2n1pn2/2pp4/3P1B2/2P1PN2/PP1N1PPP/R2QKB1R w KQkq - 0 1",
+    "r2q1rk1/1b1nbppp/p2ppn2/1p6/3NPP2/1BN1B3/PPPQ2PP/2KR3R w - - 0 1",
+    "3r1rk1/p3qppp/1pn1pn2/2bp4/8/1PN1PN2/PBQP1PPP/3R1RK1 w - - 0 1",
+    "rnbqkb1r/pp2pppp/3p1n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R w KQkq - 0 1",
+    "8/8/8/8/8/8/6k1/4K2R w K - 0 1",
+    "8/3k4/8/8/8/8/4P3/4K3 w - - 0 1",
+    "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1",
+    "8/pp3k2/2p2p2/3p4/3P4/2P2P2/PP3K2/8 w - - 0 1",
+};
+
+static void uci_bench(thrawn::Position* pos, int depth, int threads, int hashMb)
+{
+    const int savedThreads = numThreads;
+    const int benchThreads = std::clamp(threads, 1, MAX_THREADS);
+    numThreads = benchThreads;
+    tt->initTable(hashMb);
+
+    bench_running = true;
+    reset_time_control();   // fixed depth only: no clock, no move-time budget
+
+    const std::size_t count = sizeof(BENCH_FENS) / sizeof(BENCH_FENS[0]);
+    std::uint64_t nodes = 0;
+    const std::int64_t begin = get_time_ms();
+
+    for (std::size_t i = 0; i < count; i++) {
+        // Clear between positions so each node count depends only on the
+        // position and the depth, not on what the previous search left behind.
+        tt->reset();
+        parse_fen(pos, BENCH_FENS[i]);
+        nnue_refresh_root(pos);
+        stopped.store(0, std::memory_order_relaxed);
+        starttime = get_time_ms();
+
+        std::cout << "info string bench position " << (i + 1) << "/" << count << "\n";
+        search_position_threaded(pos, depth, numThreads);
+        nodes += total_nodes.load(std::memory_order_relaxed);
+    }
+
+    const std::int64_t elapsed = std::max<std::int64_t>(1, get_time_ms() - begin);
+
+    bench_running = false;
+    reset_time_control();
+    numThreads = savedThreads;
+
+    std::cout << "\n===========================\n"
+              << "Depth           : " << depth << "\n"
+              << "Threads         : " << benchThreads << "\n"
+              << "Hash            : " << hashMb << " MB\n"
+              << "Total time (ms) : " << elapsed << "\n"
+              << "Nodes searched  : " << nodes << "\n"
+              << "Nodes/second    : " << (nodes * 1000 / static_cast<std::uint64_t>(elapsed))
+              << "\n\n"
+              << nodes << " nodes " << (nodes * 1000 / static_cast<std::uint64_t>(elapsed))
+              << " nps\n";
+    std::cout.flush();
 }
 
 void uci_loop(thrawn::Position* pos)
@@ -659,6 +732,20 @@ void uci_loop(thrawn::Position* pos)
                 break;
         }
         
+        // `bench [depth] [threads] [hash_mb]` - fixed-position speed/node test.
+        else if (strncmp(input, "bench", 5) == 0)
+        {
+            int benchDepth = 13, benchThreads = 1, benchHash = 16;
+            std::istringstream args(input + 5);
+            int value = 0;
+            if (args >> value && value > 0) benchDepth = value;
+            if (args >> value && value > 0) benchThreads = value;
+            if (args >> value && value > 0) benchHash = value;
+            benchHash = std::clamp(benchHash, TT_MIN_MB, TT_MAX_MB);
+            uci_bench(pos, benchDepth, benchThreads, benchHash);
+            tt->initTable(tt_size_mb);
+        }
+
         // parse UCI "quit" command
         else if (strncmp(input, "quit", 4) == 0)
             break;

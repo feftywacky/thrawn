@@ -108,6 +108,7 @@ ThreadData::ThreadData() {
     allowNullMovePruning = true;
 
     nodes = 0;
+    check_counter = NODE_COUNTER_BATCH;
 
     thread_id = 0;
     final_depth = 0;
@@ -139,6 +140,7 @@ void ThreadData::resetThreadData() {
     allowNullMovePruning = true;
 
     nodes = 0;
+    check_counter = NODE_COUNTER_BATCH;
 
     thread_id = 0;
     final_depth = 0;
@@ -204,8 +206,13 @@ static void print_result_info(const SearchResult& result) {
         return;
 
     const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
+    const std::uint64_t nodes = total_nodes.load(std::memory_order_relaxed);
     std::cout << "info depth " << result.depth
-              << " nodes " << total_nodes.load(std::memory_order_relaxed)
+              << " nodes " << nodes
+              << " nps " << (currentTime > 0
+                    ? nodes * 1000 / static_cast<std::uint64_t>(currentTime)
+                    : nodes)
+              << " hashfull " << tt->hashfullMb() << "/" << tt->hashSizeMb()
               << " time " << currentTime
               << " score ";
 
@@ -249,6 +256,10 @@ static void print_iteration_info(ThreadData* td, int depth, int score, int bound
 
     std::cout << "info depth " << depth
               << " nodes " << reportedNodes
+              << " nps " << (currentTime > 0
+                    ? reportedNodes * 1000 / static_cast<std::uint64_t>(currentTime)
+                    : reportedNodes)
+              << " hashfull " << tt->hashfullMb() << "/" << tt->hashSizeMb()
               << " time " << currentTime;
 
     // Determine whether to report a mate score or a centipawn score
