@@ -304,8 +304,8 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         {
             // Use the previous iteration’s best score (final_score) to set the window.
             // Here we “clamp” alpha to at least –mateVal and beta to at most mateVal.
-            alpha = std::max(-mateVal, td->final_score - delta);
-            beta  = std::min(mateVal, td->final_score + delta);
+            alpha = std::max(-SEARCH_INFINITY, td->final_score - delta);
+            beta  = std::min(SEARCH_INFINITY, td->final_score + delta);
         }
         else
         {
@@ -341,10 +341,23 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
                 break;
             }
             
+            // The window is already as wide as it can get, so a further widening
+            // would not change anything and the loop would never terminate.
+            if (alpha <= -SEARCH_INFINITY && beta >= SEARCH_INFINITY)
+            {
+                completed_iteration = true;
+                break;
+            }
+
             // If the search fails low, shift the window around the returned score.
+            // beta only comes halfway down: dropping it onto alpha (which is what
+            // a fail-hard loop can get away with) collapses the window to zero
+            // width once alpha reaches its clamp, and a zero-width window can
+            // only fail low again - the loop then spins forever, widening delta
+            // until it overflows.
             if (score <= alpha) {
-                beta = alpha;
-                alpha = std::max(-mateVal, score - delta);
+                beta = alpha + (beta - alpha) / 2;
+                alpha = std::max(-SEARCH_INFINITY, score - delta);
                 // Restore the previous PV since the current iteration did not complete properly
                 td->pv_table[0] = backup_pv;
                 td->pv_length[0] = backup_pv_length;
@@ -352,17 +365,17 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
                 if (threadID == 0)
                     print_iteration_info(td, curr_depth, score, BOUND_UPPER);
             }
-            // If the search fails high, keep some overlap and expand upward.
+            // If the search fails high, keep alpha where it is and expand upward.
             else if (score >= beta) {
-                alpha = std::max(alpha, beta - delta);
-                beta = std::min(mateVal, score + delta);
+                beta = std::min(SEARCH_INFINITY, score + delta);
 
                 if (threadID == 0)
                     print_iteration_info(td, curr_depth, score, BOUND_LOWER);
             }
             
-            // Increase delta for the next iteration of the aspiration loop
-            delta = delta + delta / 2;
+            // Increase delta for the next iteration of the aspiration loop.
+            // Capped at the full window width so the growth cannot overflow.
+            delta = std::min(SEARCH_INFINITY, delta + delta / 2);
         }
 
         if (!completed_iteration)
