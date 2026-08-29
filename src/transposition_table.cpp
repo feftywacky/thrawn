@@ -377,10 +377,7 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
 
         if (samePosition)
         {
-            // Keep a deeper result from this same search, but never let an entry
-            // that survived from an earlier search block a fresh one.
-            const bool fromThisSearch = packed_age(old_data) == current;
-            if (fromThisSearch && flag != BOUND_EXACT && depth < extractTTDepth(old_data) - 2)
+            if (flag != BOUND_EXACT && depth < extractTTDepth(old_data) - 2)
             {
                 if (staticEval != no_hashmap_entry)
                     update_static_eval_key(candidate, pos->zobristKey, staticEval);
