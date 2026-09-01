@@ -111,6 +111,7 @@ ThreadData::ThreadData() {
     check_counter = NODE_COUNTER_BATCH;
 
     thread_id = 0;
+    root_depth = 0;
     final_depth = 0;
     final_score = 0;
     final_bound = BOUND_NONE;
@@ -143,6 +144,7 @@ void ThreadData::resetThreadData() {
     check_counter = NODE_COUNTER_BATCH;
 
     thread_id = 0;
+    root_depth = 0;
     final_depth = 0;
     final_score = 0;
     final_bound = BOUND_NONE;
@@ -306,15 +308,14 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             break;
         
         td->follow_pv_flag = true;
+        td->root_depth = curr_depth;
 
         // For configured aspiration depths, derive the window from the previous score.
         const int threadCycle = std::max(1, SEARCH_ASPIRATION_THREAD_CYCLE);
         int delta = SEARCH_ASPIRATION_WINDOW_SIZE +
                     (threadID % threadCycle) * SEARCH_ASPIRATION_THREAD_DELTA;
-        if(curr_depth>=SEARCH_ASPIRATION_WINDOW_DEPTH)
+        if (curr_depth >= SEARCH_ASPIRATION_WINDOW_DEPTH)
         {
-            // Use the previous iteration’s best score (final_score) to set the window.
-            // Here we “clamp” alpha to at least –mateVal and beta to at most mateVal.
             alpha = std::max(-mateVal, td->final_score - delta);
             beta  = std::min(mateVal, td->final_score + delta);
         }
@@ -383,17 +384,12 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
                 beta  = SEARCH_INFINITY;
             }
 
-            // Increase delta for the next iteration of the aspiration loop.
-            // Capped so the growth cannot overflow.
-            delta = std::min(SEARCH_INFINITY, delta + delta / 2);
+            // Widen for the next pass. Capped so the growth cannot overflow.
+            delta = std::min(SEARCH_INFINITY, delta + delta / 3);
         }
 
         if (!completed_iteration)
             break;
-
-        // Update the aspiration window.
-        alpha = score - SEARCH_ASPIRATION_WINDOW_SIZE;
-        beta = score + SEARCH_ASPIRATION_WINDOW_SIZE;
 
         td->final_depth = curr_depth;
         td->final_score = score;

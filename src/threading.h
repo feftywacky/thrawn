@@ -29,11 +29,15 @@ public:
     // Killer, history, and counter-move ordering tables.
     std::array<std::array<int, MAX_DEPTH>, KILLER_MOVES> killer_moves;
     std::array<std::array<std::array<int, BOARD_SIZE>, BOARD_SIZE>, 2> quiet_history;
+    // [plies back - 1][previous piece][previous to][piece][to]. int16_t so the
+    // two tables together cost what the single int table did.
     std::array<
         std::array<
-            std::array<std::array<int, BOARD_SIZE>, HISTORY_SIZE>,
-            BOARD_SIZE>,
-        HISTORY_SIZE> continuation_history;
+            std::array<
+                std::array<std::array<int16_t, BOARD_SIZE>, HISTORY_SIZE>,
+                BOARD_SIZE>,
+            HISTORY_SIZE>,
+        SEARCH_CONTINUATION_HISTORY_PLIES> continuation_history;
     std::array<std::array<std::array<int, HISTORY_SIZE>, BOARD_SIZE>, HISTORY_SIZE> capture_history;
     std::array<std::array<int, SEARCH_CORRECTION_HISTORY_SIZE>, 2> correction_history;
     std::array<std::array<int, BOARD_SIZE>, HISTORY_SIZE> counter_moves;
@@ -53,6 +57,8 @@ public:
     int check_counter;
 
     int thread_id;
+    // Depth of the iteration in progress, used to bound extension chains.
+    int root_depth;
     int final_depth;
     int final_score;
     int final_bound;

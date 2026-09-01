@@ -31,7 +31,7 @@ inline void append_moves_from_attacks(int source,
                                       MoveList& moves,
                                       int move_type)
 {
-    if (move_type == only_captures || move_type == only_checks)
+    if (move_type == only_captures)
     {
         uint64_t captures = attacks & enemies;
         while (captures)

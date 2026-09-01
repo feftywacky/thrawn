@@ -35,7 +35,7 @@ int relative_age(int currentAge, int entryAge) {
 }
 
 int packed_depth(uint64_t data) {
-    return static_cast<int>((data >> 24) & 0xFFFFULL);
+    return static_cast<int>((data >> 24) & 0xFFULL);
 }
 
 int packed_flag(uint64_t data) {
@@ -317,9 +317,11 @@ int TranspositionTable::hashSizeMb() const
 }
 
 bool TranspositionTable::probe(const thrawn::Position* pos, int& depth,
-                               int& bestMove, int& score, int& flag, int& staticEval)
+                               int& bestMove, int& score, int& flag, int& staticEval,
+                               bool& wasPv)
 {
     staticEval = no_hashmap_entry;
+    wasPv = false;
 
     if (!table || numClusters == 0)
         return false;
@@ -340,6 +342,7 @@ bool TranspositionTable::probe(const thrawn::Position* pos, int& depth,
         depth = extractTTDepth(entry_data);
         bestMove = extractTTBestMove(entry_data);
         flag = extractTTHashFlag(entry_data);
+        wasPv = extractTTWasPv(entry_data);
         staticEval = decode_static_eval(entry_key);
 
         score = extractTTScore(entry_data);
@@ -355,7 +358,7 @@ bool TranspositionTable::probe(const thrawn::Position* pos, int& depth,
 }
 
 void TranspositionTable::store(const thrawn::Position* pos, int depth, int score, int flag,
-                               int bestMove, int staticEval)
+                               int bestMove, int staticEval, bool wasPv)
 {
     if (!table || numClusters == 0)
         return;
@@ -410,7 +413,7 @@ void TranspositionTable::store(const thrawn::Position* pos, int depth, int score
     if (score > mateScore)
         score += pos->ply;
 
-    uint64_t data = encodeTTData(bestMove, depth, score, flag);
+    uint64_t data = encodeTTData(bestMove, depth, score, flag, wasPv);
     data |= (static_cast<uint64_t>(current) << TTAgeShift);
 
     int eval_to_store = no_hashmap_entry;
@@ -453,13 +456,15 @@ void TranspositionTable::storeStaticEval(const thrawn::Position* pos, int static
 // Note: Score is encoded as score + SEARCH_INFINITY so that the range
 // -50000...+50000 becomes 0...100000.
 
-uint64_t TranspositionTable::encodeTTData(int best_move, int depth, int score, int hash_flag) {
+uint64_t TranspositionTable::encodeTTData(int best_move, int depth, int score, int hash_flag,
+                                          bool wasPv) {
     // Offset the score to make it non-negative.
     int encoded_score = score + SEARCH_INFINITY; // now in the range 0 .. 100000
 
     uint64_t data = 0;
     data |= ((uint64_t)best_move & 0xFFFFFFULL);                // bits 0-23: best_move (24 bits)
-    data |= (((uint64_t)depth & 0xFFFFULL) << 24);                // bits 24-39: depth (16 bits)
+    data |= (((uint64_t)std::clamp(depth, 0, 255) & 0xFFULL) << 24); // bits 24-31: depth (8 bits)
+    data |= ((uint64_t)wasPv << 32);                              // bit 32: was a PV node
     data |= (((uint64_t)encoded_score & 0x1FFFFULL) << 40);       // bits 40-56: score (17 bits)
     data |= (((uint64_t)hash_flag & 0x3ULL) << 57);               // bits 57-58: hash_flag (2 bits)
     return data;
@@ -471,8 +476,12 @@ int TranspositionTable::extractTTBestMove(uint64_t data) {
 }
 
 int TranspositionTable::extractTTDepth(uint64_t data) {
-    // Extract bits 24-39.
-    return (int)((data >> 24) & 0xFFFFULL);
+    // Extract bits 24-31.
+    return (int)((data >> 24) & 0xFFULL);
+}
+
+bool TranspositionTable::extractTTWasPv(uint64_t data) {
+    return ((data >> 32) & 1ULL) != 0;
 }
 
 int TranspositionTable::extractTTScore(uint64_t data) {

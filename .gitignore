@@ -30,3 +30,6 @@ tools/fastchess
 tools/fastchess.exe
 tools/*.epd
 tools/*.pgn
+
+# Local notes and working documents (not part of the distribution)
+notes/
