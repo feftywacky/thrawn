@@ -1626,8 +1626,15 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     // --------------------------------------
     // Null-move pruning
     // --------------------------------------
+    // The only structural restriction is "no two null moves in a row": a pass
+    // answered by a pass is the same position two tempi later, so the child of
+    // a null move must play a real move. ply_moves[ply-1] is the move that
+    // reached this node and is set to 0 for a null move, so the previous-move
+    // test states that rule directly, one ply at a time, instead of switching
+    // null moves off for a whole subtree.
     if (!excludedNode && !inCheck && depth >= SEARCH_NULL_MOVE_MIN_DEPTH && !isPvNode && static_eval >= beta &&
-        !pawnOnlyEndgame && td->allowNullMovePruning &&
+        !pawnOnlyEndgame && previous_ply_move(td, pos->ply) != 0 &&
+        pos->ply >= td->nmpMinPly &&
         !is_mate_score(beta) && !is_mate_score(static_eval))
     {
         pos->ply++;
@@ -1639,10 +1646,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
         // Null-move search with reduced depth
         int reduction = null_move_reduction(depth, static_eval, beta, evalContext);
-        td->allowNullMovePruning = false;
         score = -negamax_impl(pos, td, depth - 1 - reduction, -beta, -beta + 1, 0);
-        td->allowNullMovePruning = true;
-        
+
         unmake_null_move(pos, pos->ply);
         pos->ply--;
         pos->repetition_index--;
@@ -1653,24 +1658,29 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         // If this "fake pass" search fails high, then cut
         if (score >= beta && !is_mate_score(score))
         {
-            if (depth >= SEARCH_NULL_MOVE_VERIFICATION_DEPTH)
-            {
-                const bool savedNullMoveState = td->allowNullMovePruning;
-                td->allowNullMovePruning = false;
-                const int verificationDepth = std::max(1, depth - reduction);
-                const int verification = negamax_impl(pos, td, verificationDepth, beta - 1, beta, 0);
-                td->allowNullMovePruning = savedNullMoveState;
-
-                if (stopped.load(std::memory_order_relaxed) == 1)
-                    return alpha;
-
-                if (verification >= beta)
-                    return score;
-            }
-            else
-            {
+            // Verification is what catches zugzwang, so it must not be able to
+            // reproduce the fail-high with the trick it is checking. nmpMinPly
+            // is already non-zero when this node is itself inside a
+            // verification search: recursive verification buys nothing and
+            // costs an exponential number of re-searches, so take the raw
+            // fail-high instead.
+            if (depth < SEARCH_NULL_MOVE_VERIFICATION_DEPTH || td->nmpMinPly != 0)
                 return score;
-            }
+
+            const int verificationDepth = std::max(1, depth - reduction);
+            // Suppress null moves over the shallow part of the verification
+            // subtree only. Deeper down the position has changed enough that a
+            // pass is informative again, and paying full price for the whole
+            // subtree is not worth the little it adds.
+            td->nmpMinPly = pos->ply + 3 * verificationDepth / 4;
+            const int verification = negamax_impl(pos, td, verificationDepth, beta - 1, beta, 0);
+            td->nmpMinPly = 0;
+
+            if (stopped.load(std::memory_order_relaxed) == 1)
+                return alpha;
+
+            if (verification >= beta)
+                return score;
         }
     }
 
