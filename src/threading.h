@@ -42,7 +42,11 @@ public:
 
     // Flags used for move ordering and search heuristics.
     bool follow_pv_flag;
-    bool allowNullMovePruning;
+    // Plies below this one may not use null-move pruning. Non-zero only while a
+    // null-move verification search is running, so that the verification cannot
+    // null-move its way back to the fail-high it exists to check. Whether a node
+    // follows a null move is read off ply_moves, not from here.
+    int nmpMinPly;
 
     long long nodes;
     // Ticks down to the next communicate() poll on the main thread.

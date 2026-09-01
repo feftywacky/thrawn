@@ -105,7 +105,7 @@ ThreadData::ThreadData() {
     static_eval_stack.fill(no_hashmap_entry);
 
     follow_pv_flag = false;
-    allowNullMovePruning = true;
+    nmpMinPly = 0;
 
     nodes = 0;
     check_counter = NODE_COUNTER_BATCH;
@@ -137,7 +137,7 @@ void ThreadData::resetThreadData() {
     static_eval_stack.fill(no_hashmap_entry);
 
     follow_pv_flag = false;
-    allowNullMovePruning = true;
+    nmpMinPly = 0;
 
     nodes = 0;
     check_counter = NODE_COUNTER_BATCH;
