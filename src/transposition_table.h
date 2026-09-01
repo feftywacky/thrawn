@@ -66,19 +66,20 @@ public:
 
     // Lookup a position in the tt
     bool probe(const thrawn::Position* pos, int& depth,
-               int& bestMove, int& score, int& flag, int& staticEval);
+               int& bestMove, int& score, int& flag, int& staticEval, bool& wasPv);
 
     // Store an entry in the tt
     void store(const thrawn::Position* pos, int depth, int score, int flag,
-               int bestMove, int staticEval = no_hashmap_entry);
+               int bestMove, int staticEval = no_hashmap_entry, bool wasPv = false);
 
     // Attach a static eval to an existing entry without creating eval-only TT entries.
     void storeStaticEval(const thrawn::Position* pos, int staticEval);
     
-    uint64_t encodeTTData(int bestMove, int depth, int score, int hash_flag);
+    uint64_t encodeTTData(int bestMove, int depth, int score, int hash_flag, bool wasPv);
 
     int extractTTBestMove(uint64_t data);
     int extractTTDepth(uint64_t data);
+    static bool extractTTWasPv(uint64_t data);
     int extractTTScore(uint64_t data);
     int extractTTHashFlag(uint64_t data);
 

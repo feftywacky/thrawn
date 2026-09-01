@@ -31,10 +31,4 @@ int quiescence(thrawn::Position* pos, ThreadData* td, int alpha, int beta);
  */
 int isRepetition(thrawn::Position* pos);
 
-/*
- * Some futility / LMP helpers
- */
-int futility_margin(int depth);
-int futility_move_count(int depth, bool improving);
-
 #endif // SEARCH_H

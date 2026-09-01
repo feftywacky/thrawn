@@ -101,6 +101,17 @@ inline bool noMajorsOrMinorsPieces(const thrawn::Position* pos)
              pos->piece_bitboards[r] | pos->piece_bitboards[q]);
 }
 
+// Zugzwang guard for null move and shallow pruning: only the side to move
+// matters, since it is the one being asked to pass or to skip its own moves.
+inline bool hasNonPawnMaterial(const thrawn::Position* pos, int side)
+{
+    return side == white
+        ? (pos->piece_bitboards[N] | pos->piece_bitboards[B] |
+           pos->piece_bitboards[R] | pos->piece_bitboards[Q]) != 0ULL
+        : (pos->piece_bitboards[n] | pos->piece_bitboards[b] |
+           pos->piece_bitboards[r] | pos->piece_bitboards[q]) != 0ULL;
+}
+
 // init all piece attacks
 void init_leaping_attacks(thrawn::Position* pos);
 void init_sliding_attacks(thrawn::Position* pos, int isBishop);

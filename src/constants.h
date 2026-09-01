@@ -30,104 +30,103 @@ constexpr int NODE_COUNTER_BATCH = 1024;
 constexpr std::array<int, 6> PIECE_VALUES = {100, 320, 330, 500, 900, 20000};
 
 constexpr int SEARCH_ASPIRATION_WINDOW_DEPTH = 4;
-constexpr int SEARCH_ASPIRATION_WINDOW_SIZE = 24;
+constexpr int SEARCH_ASPIRATION_WINDOW_SIZE = 12;
 constexpr int SEARCH_ASPIRATION_THREAD_DELTA = 2;
 constexpr int SEARCH_ASPIRATION_THREAD_CYCLE = 4;
 constexpr int SEARCH_CHECK_EXTENSION = 1;
 
+// History bonus/malus are linear in depth and capped well below the table
+// limit, so a single deep update cannot saturate an entry.
 constexpr int SEARCH_HISTORY_MAX = 16384;
-constexpr int SEARCH_HISTORY_SCORE_CAP = 6000;
-constexpr int SEARCH_HISTORY_BONUS_DEPTH_SQUARED = 16;
-constexpr int SEARCH_HISTORY_BONUS_DEPTH_LINEAR = 64;
+constexpr int SEARCH_HISTORY_BONUS_DEPTH = 180;
+constexpr int SEARCH_HISTORY_BONUS_BIAS = 16;
+constexpr int SEARCH_HISTORY_BONUS_MAX = 1500;
+constexpr int SEARCH_HISTORY_MALUS_DEPTH = 260;
+constexpr int SEARCH_HISTORY_MALUS_BIAS = -30;
+constexpr int SEARCH_HISTORY_MALUS_MAX = 1900;
 constexpr int SEARCH_CONTINUATION_HISTORY_NUMERATOR = 3;
 constexpr int SEARCH_CONTINUATION_HISTORY_DENOMINATOR = 4;
-constexpr int SEARCH_CORRECTION_HISTORY_SIZE = 16384;
-constexpr int SEARCH_CORRECTION_HISTORY_MAX = 8192;
-constexpr int SEARCH_CORRECTION_HISTORY_GRAIN = 16;
-constexpr int SEARCH_CORRECTION_HISTORY_WEIGHT_SCALE = 32;
+// Continuation history looks 1 and 2 plies back; the older ply carries less.
+constexpr int SEARCH_CONTINUATION_HISTORY_PLIES = 2;
+constexpr int SEARCH_CONTINUATION_HISTORY_DECAY_NUMERATOR = 3;
+constexpr int SEARCH_CONTINUATION_HISTORY_DECAY_DENOMINATOR = 4;
 
-constexpr int SEARCH_COUNTER_MOVE_SCORE = 7000;
-constexpr int SEARCH_COUNTER_MOVE_HISTORY_DIVISOR = 64;
-constexpr int SEARCH_COUNTER_MOVE_HISTORY_CAP = 250;
+// Correction history is keyed on pawn structure, so entries generalize across
+// positions that share it. Applied as weight * entry / 512.
+constexpr int SEARCH_CORRECTION_HISTORY_SIZE = 16384;
+constexpr int SEARCH_CORRECTION_HISTORY_MAX = 1024;
+constexpr int SEARCH_CORRECTION_HISTORY_WEIGHT = 64;
+constexpr int SEARCH_CORRECTION_HISTORY_DEPTH_DIVISOR = 8;
 
 constexpr int SEARCH_QUEEN_PROMOTION_SCORE = 10499;
-constexpr int SEARCH_KILLER_MOVE_SCORE_1 = 9000;
-constexpr int SEARCH_KILLER_MOVE_SCORE_2 = 8000;
 
-constexpr int SEARCH_REVERSE_FUTILITY_MAX_DEPTH = 7;
-constexpr int SEARCH_REVERSE_FUTILITY_MARGIN_1 = 160;
-constexpr int SEARCH_REVERSE_FUTILITY_MARGIN_2 = 300;
-constexpr int SEARCH_REVERSE_FUTILITY_DEPTH_FACTOR = 110;
+// Reverse futility: margin scales with depth, one depth step cheaper when the
+// eval trend is with us. No lower depth bound beyond the floor.
+constexpr int SEARCH_REVERSE_FUTILITY_MAX_DEPTH = 11;
+constexpr int SEARCH_REVERSE_FUTILITY_DEPTH_MUL = 87;
+constexpr int SEARCH_REVERSE_FUTILITY_MIN = 22;
 
-constexpr int SEARCH_RAZOR_MAX_DEPTH = 4;
-constexpr int SEARCH_RAZOR_MARGIN_1 = 250;
-constexpr int SEARCH_RAZOR_MARGIN_2 = 450;
-constexpr int SEARCH_RAZOR_MARGIN_DEPTH_N = 600;
+// Razoring: linear in depth and applied at every depth, since the margin
+// outruns any real eval gap long before the depth matters.
+constexpr int SEARCH_RAZOR_DEPTH_FACTOR = 352;
 
-constexpr int SEARCH_NULL_MOVE_MIN_DEPTH = 4;
-constexpr int SEARCH_NULL_MOVE_BASE_REDUCTION = 2;
-constexpr int SEARCH_NULL_MOVE_DEPTH_DIVISOR = 4;
-constexpr int SEARCH_NULL_MOVE_EVAL_DIVISOR = 200;
-constexpr int SEARCH_NULL_MOVE_EVAL_BONUS_MAX = 3;
-constexpr int SEARCH_NULL_MOVE_VERIFICATION_DEPTH = 8;
+constexpr int SEARCH_NULL_MOVE_MIN_DEPTH = 3;
+constexpr int SEARCH_NULL_MOVE_BASE_REDUCTION = 4;
+constexpr int SEARCH_NULL_MOVE_DEPTH_DIVISOR = 3;
+constexpr int SEARCH_NULL_MOVE_EVAL_DIVISOR = 120;
+constexpr int SEARCH_NULL_MOVE_EVAL_BONUS_MAX = 4;
+constexpr int SEARCH_NULL_MOVE_VERIFICATION_DEPTH = 16;
 
-constexpr int SEARCH_FUTILITY_MAX_DEPTH = 8;
-constexpr int SEARCH_FUTILITY_MARGIN_1 = 120;
-constexpr int SEARCH_FUTILITY_MARGIN_2 = 220;
-// Depth 3+ scales linearly. 120 * 3 == 360 reproduces the old MARGIN_3 exactly,
-// so extending the max depth only adds behaviour above depth 3 rather than
-// re-tuning what was already there.
-constexpr int SEARCH_FUTILITY_MARGIN_DEPTH_FACTOR = 120;
+// Move-loop futility, keyed on the LMR-reduced depth rather than node depth.
+constexpr int SEARCH_FUTILITY_MAX_DEPTH = 10;
+constexpr int SEARCH_FUTILITY_BASE_MARGIN = 159;
+constexpr int SEARCH_FUTILITY_DEPTH_FACTOR = 153;
 
-constexpr int SEARCH_LATE_MOVE_PRUNING_MAX_DEPTH = 8;
-// (BASE + depth^2) / (2 - improving): the standard quadratic, improving-aware
-// shape. 2/4 quiets at depth 1 against the old flat 8, 33/67 at depth 8.
+// Late move pruning: (BASE + depth^2) / (2 - improving) over all moves seen.
+// The quadratic bounds its own reach, so no separate depth limit.
 constexpr int SEARCH_LATE_MOVE_PRUNING_BASE = 3;
 
-// History pruning: skip late quiet moves with clearly bad history at low depth.
-constexpr int SEARCH_HISTORY_PRUNING_MAX_DEPTH = 4;
-constexpr int SEARCH_HISTORY_PRUNING_DEPTH_MARGIN = 2048;
+constexpr int SEARCH_HISTORY_PRUNING_MAX_DEPTH = 6;
+constexpr int SEARCH_HISTORY_PRUNING_DEPTH_MARGIN = 5900;
 
-// Moves searched at full depth before LMR starts, counted over ALL moves (the
-// gate in negamax reads moves_searched, matching the move number the reduction
-// amount is derived from). 2 keeps the old "reduce from the 3rd quiet" pacing in
-// quiet-heavy nodes while also catching late quiets that trail a run of captures.
-constexpr int SEARCH_LMR_FULL_DEPTH_MOVES = 2;
-constexpr int SEARCH_LMR_REDUCTION_DEPTH_LIMIT = 3;
-constexpr int SEARCH_LMR_BASE_REDUCTION = 0;
-constexpr int SEARCH_LMR_NON_PV_DEPTH = 5;
-constexpr int SEARCH_LMR_MOVE_DEPTH_1 = 6;
-constexpr int SEARCH_LMR_MOVE_NUMBER_1 = 8;
-constexpr int SEARCH_LMR_MOVE_DEPTH_2 = 8;
-constexpr int SEARCH_LMR_MOVE_NUMBER_2 = 16;
-constexpr int SEARCH_LMR_GOOD_HISTORY_DIVISOR = 4;
-constexpr int SEARCH_LMR_BAD_HISTORY_DIVISOR = 4;
+// LMR starts at the second move (fourth at the root) from depth 2 up.
+constexpr int SEARCH_LMR_FIRST_MOVE = 1;
+constexpr int SEARCH_LMR_ROOT_EXTRA_MOVES = 2;
+constexpr int SEARCH_LMR_MIN_DEPTH = 2;
+constexpr int SEARCH_LMR_CUT_NODE_REDUCTION = 2;
+constexpr int SEARCH_LMR_QUIET_HISTORY_DIVISOR = 10900;
+constexpr int SEARCH_LMR_CAPTURE_HISTORY_DIVISOR = 4096;
+constexpr int SEARCH_LMR_HISTORY_CAP = 5;
 
-constexpr int SEARCH_SINGULAR_EXTENSION = 1;
 constexpr int SEARCH_SINGULAR_EXTENSION_MIN_DEPTH = 6;
-constexpr int SEARCH_SINGULAR_EXTENSION_DEPTH_MARGIN = 2;
-constexpr int SEARCH_SINGULAR_EXTENSION_BASE_MARGIN = 0;
-constexpr int SEARCH_SINGULAR_EXTENSION_DEPTH_NUMERATOR = 3;
-constexpr int SEARCH_SINGULAR_EXTENSION_DEPTH_DENOMINATOR = 2;
+constexpr int SEARCH_SINGULAR_EXTENSION_DEPTH_MARGIN = 3;
+constexpr int SEARCH_SINGULAR_BETA_DEPTH_MARGIN = 1;
+constexpr int SEARCH_SINGULAR_DOUBLE_MARGIN = 14;
+constexpr int SEARCH_SINGULAR_NEGATIVE_EXTENSION = 2;
 
 constexpr int SEARCH_PROBCUT_MIN_DEPTH = 5;
 constexpr int SEARCH_PROBCUT_REDUCTION = 3;
-constexpr int SEARCH_PROBCUT_MARGIN = 160;
+constexpr int SEARCH_PROBCUT_MARGIN = 190;
+constexpr int SEARCH_PROBCUT_IMPROVING_MARGIN = 40;
 constexpr int SEARCH_PROBCUT_SEE_MARGIN = 0;
 
-// Internal Iterative Reductions: with no TT move to guide ordering at a deep
+// Internal iterative reductions: with no TT move to guide ordering at a deep
 // node, reduce one ply so the cheaper search can seed the TT with a move.
 constexpr int SEARCH_IIR_MIN_DEPTH = 4;
 constexpr int SEARCH_IIR_REDUCTION = 1;
 
-constexpr int SEARCH_QSEARCH_DELTA_MARGIN = 200;
-constexpr int SEARCH_SEE_PRUNE_MAX_DEPTH = 4;
-constexpr int SEARCH_SEE_PRUNE_DEPTH_MARGIN = 200;
+constexpr int SEARCH_QSEARCH_DELTA_MARGIN = 156;
+constexpr int SEARCH_QSEARCH_SEE_MARGIN = -32;
+
+constexpr int SEARCH_SEE_PRUNE_MAX_DEPTH = 10;
+constexpr int SEARCH_SEE_PRUNE_CAPTURE_MARGIN = 96;
+constexpr int SEARCH_SEE_PRUNE_QUIET_MARGIN = 21;
 
 // lmr_table[d][m] = int(SEARCH_LMR_TABLE_BASE + log(d) * log(m) / SEARCH_LMR_TABLE_DIVISOR)
-constexpr double SEARCH_LMR_TABLE_BASE = 0.78;
-constexpr double SEARCH_LMR_TABLE_DIVISOR = 2.47;
+constexpr double SEARCH_LMR_TABLE_BASE = 0.99;
+constexpr double SEARCH_LMR_TABLE_DIVISOR = 3.14;
 constexpr int SEARCH_LMR_TABLE_MOVES = 64;
+
 constexpr int SEARCH_TACTICAL_CAPTURE_BASE_SCORE = 10000;
 constexpr int SEARCH_TACTICAL_VICTIM_MULTIPLIER = 8;
 constexpr int SEARCH_TACTICAL_ATTACKER_DIVISOR = 8;
@@ -153,7 +152,7 @@ enum {P, N, B, R, Q, K, p, n, b, r, q, k};
 
 enum {rook, bishop};
 
-enum {all_moves, only_captures, only_quiets, only_checks};
+enum {all_moves, only_captures, only_quiets};
 
 enum {wks=1, wqs=2, bks=4, bqs=8};
 
