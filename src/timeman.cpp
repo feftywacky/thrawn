@@ -1,6 +1,7 @@
 #include "timeman.h"
 
 #include <algorithm>
+#include <limits>
 
 #include "constants.h"
 #include "uci.h" // for get_time_ms()
@@ -14,6 +15,7 @@ void TimeManager::clear()
     start   = 0;
     soft    = 0;
     hard    = 0;
+    panic   = 0;
     timeset = false;
     useSoft = false;
 }
@@ -31,6 +33,9 @@ void TimeManager::init(int timeLeft, int inc, int movestogo, int movetimeMs,
         useSoft = false;
         hard    = std::max<std::int64_t>(1, movetimeMs - move_overhead);
         soft    = hard;
+        // No clock to flag, so the depth-1 exemption stays open and a tiny
+        // movetime still returns a searched move. Reckless does the same.
+        panic   = std::numeric_limits<std::int64_t>::max();
         return;
     }
 
@@ -73,7 +78,7 @@ void TimeManager::init(int timeLeft, int inc, int movestogo, int movetimeMs,
     }
 
     // No formula above may put a bound past the flag.
-    const std::int64_t panic = std::max<std::int64_t>(1, timeLeft - move_overhead);
+    panic = std::max<std::int64_t>(1, timeLeft - move_overhead);
     hard = std::clamp<std::int64_t>(static_cast<std::int64_t>(hardMs), 1, panic);
     soft = std::clamp<std::int64_t>(static_cast<std::int64_t>(softMs), 1, hard);
 
@@ -83,6 +88,8 @@ void TimeManager::init(int timeLeft, int inc, int movestogo, int movetimeMs,
         hard = std::min<std::int64_t>(hard, TM_SINGLE_MOVE_MS);
         soft = std::min(soft, hard);
     }
+
+    panic = std::max(panic, hard);
 }
 
 std::int64_t TimeManager::elapsed() const
@@ -93,6 +100,11 @@ std::int64_t TimeManager::elapsed() const
 bool TimeManager::hard_expired() const
 {
     return timeset && elapsed() >= hard;
+}
+
+bool TimeManager::panic_expired() const
+{
+    return timeset && elapsed() >= panic;
 }
 
 bool TimeManager::soft_expired(double scale) const

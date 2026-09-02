@@ -10,6 +10,9 @@ struct TimeManager {
     std::int64_t start = 0;
     std::int64_t soft  = 0;
     std::int64_t hard  = 0;
+    // Bounds the depth-1 exemption in communicate(), the only thing that may
+    // run past `hard`.
+    std::int64_t panic = 0;
 
     // A clock is in play. False for `go depth` / `go infinite`.
     bool timeset = false;
@@ -26,6 +29,7 @@ struct TimeManager {
 
     std::int64_t elapsed() const;
     bool hard_expired() const;
+    bool panic_expired() const;
     bool soft_expired(double scale) const;
 };
 

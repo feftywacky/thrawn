@@ -377,9 +377,10 @@ void read_input() {
 // a bridge function to interact between search and GUI input
 void communicate() {
     // The hard bound. Depth 1 is exempt, so we return a searched move rather
-    // than a fallback one.
+    // than a fallback one; `panic` bounds that exemption at the flag.
     if (timeMan.hard_expired() &&
-        main_completed_depth.load(std::memory_order_relaxed) > 0) {
+        (main_completed_depth.load(std::memory_order_relaxed) > 0 ||
+         timeMan.panic_expired())) {
         stopped.store(1, std::memory_order_relaxed);
     }
 
