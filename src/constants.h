@@ -147,8 +147,9 @@ constexpr int SEARCH_SMP_VOTE_SCORE_OFFSET = 14;
 // aborts the search wherever it is. Values are Berserk's (src/uci.c,
 // src/search.c). See notes/time-management-2026-09.md.
 
-// UCI "Move Overhead" option bounds, in ms.
-constexpr int TM_MOVE_OVERHEAD_DEFAULT = 20;
+// UCI "Move Overhead" option bounds, in ms. 50 is what keeps a reserve behind
+// each move once the clock settles into its low-time equilibrium.
+constexpr int TM_MOVE_OVERHEAD_DEFAULT = 50;
 constexpr int TM_MOVE_OVERHEAD_MIN     = 0;
 constexpr int TM_MOVE_OVERHEAD_MAX     = 5000;
 
