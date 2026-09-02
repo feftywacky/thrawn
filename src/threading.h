@@ -4,9 +4,21 @@
 #include <atomic>
 #include <array>
 #include <mutex>
+#include <utility>
 #include <vector>
 #include "position.h"
 #include "constants.h"
+
+// Highest iterative deepening depth the main thread has fully completed in the
+// current search, or 0 if none. communicate() reads it to refuse a hard-bound
+// abort before there is a searched move to return.
+extern std::atomic<int> main_completed_depth;
+
+// Final root score of the previous search, i.e. of our previous move, or
+// TM_SCORE_UNKNOWN at the start of a game. Feeds the time manager's score-trend
+// term; reset on "ucinewgame".
+extern int previous_root_score;
+constexpr int TM_SCORE_UNKNOWN = SEARCH_INFINITY;
 
 struct RootMove {
     int move;
@@ -65,6 +77,13 @@ public:
     std::vector<RootMove> root_moves;
     std::vector<RootMove> iteration_root_moves;
 
+    // (move, nodes) for each root move, accumulated over the whole search rather
+    // than per iteration - the time manager wants the share of the total tree a
+    // root move has cost, which is what both Berserk and Reckless divide by.
+    // Kept separate from iteration_root_moves, which is cleared on every
+    // aspiration re-search. Linear scan: a root has at most a few dozen moves.
+    std::vector<std::pair<int, long long>> root_move_nodes;
+
     // Constructor initializes all arrays to zero and flags to false (or true where needed).
     ThreadData();
 
@@ -72,6 +91,9 @@ public:
     void resetThreadData();
 
     void recordRootMove(int move, int score, int depth, int bound);
+
+    void addRootNodes(int move, long long nodes);
+    long long rootNodes(int move) const;
 };
 
 void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth);

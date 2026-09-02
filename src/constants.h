@@ -140,6 +140,62 @@ constexpr int SEARCH_BAD_CAPTURE_SEE_FLOOR = -2000;
 
 constexpr int SEARCH_SMP_VOTE_SCORE_OFFSET = 14;
 
+// ----------------------------------------
+// Time management
+// ----------------------------------------
+// `soft` gates whether another iterative deepening iteration is started; `hard`
+// aborts the search wherever it is. Values are Berserk's (src/uci.c,
+// src/search.c). See notes/time-management-2026-09.md.
+
+// UCI "Move Overhead" option bounds, in ms.
+constexpr int TM_MOVE_OVERHEAD_DEFAULT = 20;
+constexpr int TM_MOVE_OVERHEAD_MIN     = 0;
+constexpr int TM_MOVE_OVERHEAD_MAX     = 5000;
+
+constexpr int TM_SAFETY_MS      = 10;
+constexpr int TM_SINGLE_MOVE_MS = 250;
+
+// Sudden death / Fischer. The horizon assumes the game runs this many more
+// moves, so their increment counts as time we can already spend against.
+constexpr int    TM_FISCHER_HORIZON = 50;
+constexpr double TM_SD_SOFT_CAP     = 0.4193;
+constexpr double TM_SD_SOFT_SCALE   = 0.0575;
+constexpr double TM_SD_HARD_CAP     = 0.9221;
+constexpr double TM_SD_HARD_MULT    = 5.928;
+
+// Cyclic. The horizon divisor front-loads the allocation, since every later
+// move re-derives its own share from what is left.
+constexpr double TM_CYC_SOFT_CAP    = 0.9;
+constexpr double TM_CYC_SOFT_SCALE  = 0.9;
+constexpr double TM_CYC_HORIZON_DIV = 2.5;
+constexpr double TM_CYC_HARD_CAP    = 0.8;
+constexpr double TM_CYC_HARD_MULT   = 5.5;
+
+constexpr int TM_MIN_DEPTH         = 5;
+constexpr int TM_SCORE_TREND_PLIES = 3;
+
+// Soft-bound scaler (a): best-move stability.
+constexpr double TM_STABILITY_BASE = 1.3110;
+constexpr double TM_STABILITY_STEP = 0.0533;
+constexpr int    TM_STABILITY_MAX  = 10;
+
+// (b) Score trend. Coefficients are Berserk's 0.0262 / 0.0261 divided by 1.85,
+// Thrawn's cp inflation versus the WDL-normalised scale the references print -
+// see the eval-scale calibration in notes/search-rewrite-2026-08.md.
+constexpr double TM_SCORE_BASE        = 0.1127;
+constexpr double TM_SCORE_RECENT_COEF = 0.0142;
+constexpr double TM_SCORE_PREV_COEF   = 0.0141;
+constexpr double TM_SCORE_MIN         = 0.5028;
+constexpr double TM_SCORE_MAX         = 1.6561;
+
+// (c) Node effort: the share of the tree spent on the best root move.
+constexpr double TM_NODE_BASE     = 0.4499;
+constexpr double TM_NODE_COEF     = 2.2669;
+constexpr double TM_NODE_MIN      = 0.5630;
+constexpr double TM_NODE_DECISIVE = 0.5;
+
+constexpr int TM_MATE_STABILITY = 3;
+
 enum{
     white,
     black,

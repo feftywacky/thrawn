@@ -5,6 +5,7 @@
 #include "move_helpers.h"
 #include "transposition_table.h"
 #include "globals.h"
+#include "timeman.h"
 #include <thread>
 #include <iostream>
 #include <atomic>
@@ -16,7 +17,8 @@
 #include <pthread.h>
 #endif
 
-static std::int64_t globalSearchStartTime = 0;
+std::atomic<int> main_completed_depth{0};
+int previous_root_score = TM_SCORE_UNKNOWN;
 
 namespace {
 
@@ -117,6 +119,7 @@ ThreadData::ThreadData() {
     final_bound = BOUND_NONE;
     root_moves.clear();
     iteration_root_moves.clear();
+    root_move_nodes.clear();
 }
 
 /*
@@ -150,6 +153,7 @@ void ThreadData::resetThreadData() {
     final_bound = BOUND_NONE;
     root_moves.clear();
     iteration_root_moves.clear();
+    root_move_nodes.clear();
 }
 
 void ThreadData::recordRootMove(int move, int score, int depth, int bound) {
@@ -187,6 +191,26 @@ void ThreadData::recordRootMove(int move, int score, int depth, int bound) {
     entry->pv_length = length;
 }
 
+void ThreadData::addRootNodes(int move, long long nodes) {
+    for (std::pair<int, long long>& entry : root_move_nodes) {
+        if (entry.first == move) {
+            entry.second += nodes;
+            return;
+        }
+    }
+
+    root_move_nodes.emplace_back(move, nodes);
+}
+
+long long ThreadData::rootNodes(int move) const {
+    for (const std::pair<int, long long>& entry : root_move_nodes) {
+        if (entry.first == move)
+            return entry.second;
+    }
+
+    return 0;
+}
+
 static int legal_fallback_move(thrawn::Position* rootPos) {
     MoveList moves;
     generate_moves(rootPos, all_moves, moves);
@@ -207,7 +231,7 @@ static void print_result_info(const SearchResult& result) {
     if (!result.has_move)
         return;
 
-    const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
+    const std::int64_t currentTime = timeMan.elapsed();
     const std::uint64_t nodes = total_nodes.load(std::memory_order_relaxed);
     std::cout << "info depth " << result.depth
               << " nodes " << nodes
@@ -251,7 +275,7 @@ static void print_result_info(const SearchResult& result) {
 // re-search short that PV is what `bestmove` comes from.
 static void print_iteration_info(ThreadData* td, int depth, int score, int bound)
 {
-    const std::int64_t currentTime = get_time_ms() - globalSearchStartTime;
+    const std::int64_t currentTime = timeMan.elapsed();
     const std::uint64_t reportedNodes =
         total_nodes.load(std::memory_order_relaxed) +
         static_cast<std::uint64_t>(td->nodes & (NODE_COUNTER_BATCH - 1));
@@ -300,6 +324,13 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
     int alpha = -SEARCH_INFINITY;
     int beta  =  SEARCH_INFINITY;
     int score = 0;
+
+    // Time management state. Main thread only: it is the only one that polls the
+    // clock, so it is the only one that decides when to stop.
+    std::array<int, MAX_DEPTH + 1> iteration_scores{};
+    int best_move_stability = 0;
+    int mate_stability = 0;
+    int previous_best_move = 0;
 
     // Perform iterative deepening from depth 1 to maxDepth
     for (int curr_depth = 1; curr_depth <= maxDepth; curr_depth++)
@@ -412,6 +443,48 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         // print an info line from the master thread (thread 0)
         if (threadID == 0)
             print_iteration_info(td, curr_depth, score, BOUND_EXACT);
+
+        if (threadID != 0)
+            continue;
+
+        // Releases the hard-bound abort: there is now a searched move to hand
+        // back. Relaxed is enough, communicate() runs on this same thread.
+        main_completed_depth.store(curr_depth, std::memory_order_relaxed);
+
+        const int bestMove = td->pv_length[0] > 0 ? td->pv_table[0][0] : 0;
+        best_move_stability = (bestMove != 0 && bestMove == previous_best_move)
+                                  ? std::min(TM_STABILITY_MAX, best_move_stability + 1)
+                                  : 0;
+        previous_best_move = bestMove;
+        iteration_scores[curr_depth] = score;
+
+        // Everything below stops the search early, so it needs a budget to
+        // save: `go depth` / `movetime` / `infinite` run to their stated limit.
+        if (!timeMan.useSoft)
+            continue;
+
+        // A mate that survives a few iterations will not improve. Only our own:
+        // when being mated, searching on can still find a longer defence.
+        const bool winningMate = score >= mateScore;
+        mate_stability = winningMate ? mate_stability + 1 : 0;
+        if (mate_stability >= TM_MATE_STABILITY)
+            break;
+
+        // Below TM_MIN_DEPTH the trend terms have nothing to read.
+        if (curr_depth < TM_MIN_DEPTH)
+            continue;
+
+        const int trendDepth = curr_depth - TM_SCORE_TREND_PLIES;
+        const int recentDiff = trendDepth >= 1 ? iteration_scores[trendDepth] - score : 0;
+        const bool prevKnown = previous_root_score != TM_SCORE_UNKNOWN;
+        const int prevDiff = prevKnown ? previous_root_score - score : 0;
+
+        const double scale = tm_soft_scale(best_move_stability, recentDiff, prevDiff,
+                                           prevKnown, td->rootNodes(bestMove),
+                                           td->nodes, winningMate);
+
+        if (timeMan.soft_expired(scale))
+            break;
     }
 
     // Lazy SMP: only the master thread is gated on the requested search depth
@@ -431,7 +504,12 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
     // Reset stop flags and counters.
     total_nodes.store(0, std::memory_order_relaxed);
     stopped.store(0, std::memory_order_relaxed);
-    globalSearchStartTime = get_time_ms();
+    main_completed_depth.store(0, std::memory_order_relaxed);
+
+    // With a clock, `start` was stamped when `go` was parsed and stays there.
+    // Without one, anchor it now for the elapsed/nps fields.
+    if (!timeMan.timeset)
+        timeMan.start = get_time_ms();
 
     tt->incrementAge();
 
@@ -502,6 +580,12 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
     int bestMove = result.move;
     if (!result.has_move)
         bestMove = legal_fallback_move(rootPos);
+
+    // Baseline for the next search's score trend. From the selected result, not
+    // thread 0, so it describes the move actually played. Guarded so a bench or
+    // fixed-depth run cannot overwrite a real game's trend.
+    if (timeMan.useSoft && result.has_move)
+        previous_root_score = result.score;
     if (result.has_move && result.thread_id != 0) {
         std::cout << "info string thread " << result.thread_id
                   << " selected by Lazy SMP vote\n";

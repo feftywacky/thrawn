@@ -747,3 +747,27 @@ int make_root_move(thrawn::Position* pos, int move, int move_type)
     nnue_debug_check(pos);
     return 1;
 }
+
+// Number of legal moves in `pos`. Uses the perft make/unmake pair, so it does
+// no NNUE work and leaves the position as it found it.
+int count_legal_moves(thrawn::Position* pos)
+{
+    MoveList moves;
+    generate_moves(pos, all_moves, moves);
+
+    int legal = 0;
+    for (int move : moves)
+    {
+        pos->ply++;
+        // make_move_impl unwinds a rejected move itself, so only the accepted
+        // branch unmakes - same shape as perft_nodes().
+        if (make_move_for_perft(pos, move, pos->ply))
+        {
+            legal++;
+            unmake_move(pos, pos->ply);
+        }
+        pos->ply--;
+    }
+
+    return legal;
+}
