@@ -15,6 +15,8 @@
 #include "globals.h"
 #include "constants.h"
 #include "nnue.h"
+#include "timeman.h"
+#include "threading.h"
 #include <stdlib.h>
 #include <vector>
 #include <cstring>
@@ -42,26 +44,7 @@ UCI PROTOCOL CODE REFERENCES TO VICE CHESS ENGINE BY RICHARD ALBERT
 // exit from engine flag
 std::atomic<int> quit{0};
 
-// UCI "movestogo" command moves counter
-int movestogo = 30;
-
-// UCI "movetime" command time counter
-int movetime = -1;
-
-// UCI "time" command holder (ms)
-int uci_time = -1;
-
-// UCI "inc" command's time increment holder
-int inc = 0;
-
-// UCI "starttime" command time holder
-std::int64_t starttime = 0;
-
-// UCI "stoptime" command time holder
-std::int64_t stoptime = 0;
-
-// variable to flag time control availability
-int timeset = 0;
+// The clock lives in `timeMan` (timeman.h), derived once per `go`.
 
 // variable to flag when the time is up
 std::atomic<int> stopped{0};
@@ -393,12 +376,14 @@ void read_input() {
 
 // a bridge function to interact between search and GUI input
 void communicate() {
-	// if time is up break here
-    if(timeset == 1 && get_time_ms() > stoptime) {
-         // cout<<"communicate set stopped = 1"<<"\n";
-			stopped.store(1, std::memory_order_relaxed);
-	}
-	
+    // The hard bound. Depth 1 is exempt, so we return a searched move rather
+    // than a fallback one; `panic` bounds that exemption at the flag.
+    if (timeMan.hard_expired() &&
+        (main_completed_depth.load(std::memory_order_relaxed) > 0 ||
+         timeMan.panic_expired())) {
+        stopped.store(1, std::memory_order_relaxed);
+    }
+
     // read GUI input
 	if (!bench_running)
 		read_input();
@@ -506,7 +491,12 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
 {
     ensure_tt_allocated();
     reset_time_control();
+
     int depth = -1;
+    int uci_time = -1;   // wtime/btime for the side to move
+    int inc = 0;         // winc/binc for the side to move
+    int movestogo = 0;   // 0 means sudden death / Fischer
+    int movetime = -1;
 
     // Infinite search
     if (strstr(command, "infinite") != nullptr) {}
@@ -553,51 +543,19 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
         depth = atoi(strstr(command, "depth") + 6);
     }
 
-    // If move time is available, set time and moves to go
-    if (movetime != -1) {
-        uci_time = movetime;
-        movestogo = 1;
-    }
+    // Only the one-legal-move case reads this. Stamps the clock's start point.
+    const int rootMoveCount = count_legal_moves(pos);
+    timeMan.init(uci_time, inc, movestogo, movetime, rootMoveCount);
 
-    // Initialize start time
-    starttime = get_time_ms();
-
-    // If time control is available
-    if (uci_time != -1) {
-        // Set the timeset flag
-        timeset = 1;
-
-        const int remainingTime = std::max(0, uci_time);
-        const int moveOverheadMs = std::clamp(remainingTime / 20, 1, 100);
-        constexpr int incrementPercent = 75;
-
-        const int movesToGo = std::max(1, movestogo);
-        int allocatedTime = 0;
-
-        if (movetime != -1) {
-            allocatedTime = std::max(1, movetime - moveOverheadMs);
-        } else {
-            allocatedTime = remainingTime / movesToGo;
-            allocatedTime += inc * incrementPercent / 100;
-            allocatedTime -= moveOverheadMs;
-
-            const int maxSafeTime = std::max(1, remainingTime - moveOverheadMs);
-            allocatedTime = std::clamp(allocatedTime, 1, maxSafeTime);
-        }
-
-        uci_time = allocatedTime;
-        stoptime = starttime + allocatedTime;
-    }
-
-    // If depth is not available, set depth to 64 plies
-    if (depth == -1) {
-        depth = 64;
-    }
+    // Clamped either way: the search stacks are MAX_DEPTH deep, so `go depth
+    // 100` would index past them.
+    depth = depth == -1 ? MAX_DEPTH : std::clamp(depth, 1, MAX_DEPTH);
 
     // Print debug info
-    std::cout << "info string time " << uci_time << " start " << starttime
-              << " stop " << stoptime << " depth " << depth
-              << " timeset " << timeset << std::endl;
+    std::cout << "info string time " << uci_time << " start " << timeMan.start
+              << " soft " << timeMan.soft << " hard " << timeMan.hard
+              << " depth " << depth
+              << " timeset " << (timeMan.timeset ? 1 : 0) << std::endl;
 
     std::cout << "info depth 0 nodes 0 time 0 score cp 0 pv none"<<endl;
     search_position_threaded(pos, depth, numThreads);  
@@ -646,7 +604,7 @@ static void uci_bench(thrawn::Position* pos, int depth, int threads, int hashMb)
         parse_fen(pos, BENCH_FENS[i]);
         nnue_refresh_root(pos);
         stopped.store(0, std::memory_order_relaxed);
-        starttime = get_time_ms();
+        // No clock: search_position_threaded() restarts it for the info lines.
 
         std::cout << "info string bench position " << (i + 1) << "/" << count << "\n";
         search_position_threaded(pos, depth, numThreads);
@@ -719,6 +677,8 @@ void uci_loop(thrawn::Position* pos)
         {
             ensure_tt_allocated();
             tt->reset();
+            // No previous move to draw a score trend from.
+            previous_root_score = TM_SCORE_UNKNOWN;
             uci_parse_position(pos, "position startpos");
         }
         // parse UCI "go" command
@@ -756,6 +716,9 @@ void uci_loop(thrawn::Position* pos)
                  << " min " << TT_MIN_MB << " max " << TT_MAX_MB << "\n";
             cout << "option name Threads type spin default 1 min 1 max "
                  << MAX_THREADS << "\n";
+            cout << "option name Move Overhead type spin default "
+                 << TM_MOVE_OVERHEAD_DEFAULT << " min " << TM_MOVE_OVERHEAD_MIN
+                 << " max " << TM_MOVE_OVERHEAD_MAX << "\n";
             cout << "option name EvalFile type string default thrawn-nn-2.nnue" << "\n";
             cout << "uciok\n";
         }
@@ -780,6 +743,14 @@ void uci_loop(thrawn::Position* pos)
                 int t = optionValue.empty() ? numThreads : std::atoi(optionValue.c_str());
                 numThreads = std::clamp(t, 1, MAX_THREADS);
                 std::cout << "info string Set threads = " << numThreads << std::endl;
+            }
+            else if (option_name_equals(optionName, "Move Overhead")) {
+                move_overhead = std::clamp(
+                    optionValue.empty() ? move_overhead : std::atoi(optionValue.c_str()),
+                    TM_MOVE_OVERHEAD_MIN, TM_MOVE_OVERHEAD_MAX);
+
+                std::cout << "info string Set move overhead to " << move_overhead
+                          << "ms\n";
             }
             else if (option_name_equals(optionName, "EvalFile")) {
                 std::string path = optionValue;
@@ -819,12 +790,6 @@ void uci_loop(thrawn::Position* pos)
 void reset_time_control()
 {
     quit.store(0, std::memory_order_relaxed);
-    movestogo = 30;
-    movetime = -1;
-    uci_time = -1;
-    inc = 0;
-    starttime = 0;
-    stoptime = 0;
-    timeset = 0;
+    timeMan.clear();
     stopped.store(0, std::memory_order_relaxed);
 }

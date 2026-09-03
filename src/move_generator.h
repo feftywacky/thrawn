@@ -50,6 +50,7 @@ int make_move(thrawn::Position* pos, int move, int move_type, int ply);
 int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply);
 int make_move_for_perft(thrawn::Position* pos, int move, int ply);
 int make_root_move(thrawn::Position* pos, int move, int move_type);
+int count_legal_moves(thrawn::Position* pos);
 void unmake_move(thrawn::Position* pos, int ply);
 void make_null_move(thrawn::Position* pos, int ply);
 void unmake_null_move(thrawn::Position* pos, int ply);

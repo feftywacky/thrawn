@@ -7,13 +7,6 @@
 #include "position.h"
 
 extern std::atomic<int> quit;
-extern int movestogo;
-extern int movetime;
-extern int uci_time;
-extern int inc;
-extern std::int64_t starttime;
-extern std::int64_t stoptime;
-extern int timeset;
 extern std::atomic<int> stopped;
 extern int numThreads;
 

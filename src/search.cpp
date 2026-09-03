@@ -1841,6 +1841,10 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         td->ply_moves[parentPly] = move;
         const int childDepth = depth - 1 + extension;
 
+        // Root only: this move's subtree cost, for the time manager's node
+        // effort term.
+        const long long rootNodesBefore = parentPly == 0 ? td->nodes : 0;
+
         auto search_child = [&](int searchDepth, int childAlpha, int childBeta, bool childCut) {
             const bool savedFollowPv = td->follow_pv_flag;
             td->follow_pv_flag = nodeFollowPv && td->pv_table[0][parentPly] == move;
@@ -1904,6 +1908,10 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         pos->ply--;
         pos->repetition_index--;
         moves_searched++;
+
+        // Before the abort check: a move cut short still cost what it cost.
+        if (parentPly == 0)
+            td->addRootNodes(move, td->nodes - rootNodesBefore);
 
         if (stopped.load(std::memory_order_relaxed) == 1)
             return alpha;
