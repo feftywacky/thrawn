@@ -12,8 +12,8 @@ using MoveConsumer = void (*)(int move, void* context);
 
 struct MoveList {
     // Intentionally left uninitialized: only [0, count) is ever read (via
-    // begin()/end()/operator[]), so zero-initializing all 256 slots on every
-    // construction is pure wasted memset on the per-node hot path.
+    // begin()/end()), so zero-initializing all 256 slots on every construction
+    // is pure wasted memset on the per-node hot path.
     std::array<int, MAX_GENERATED_MOVES> moves;
     int count = 0;
     MoveConsumer consumer = nullptr;
@@ -35,13 +35,10 @@ struct MoveList {
             moves[count++] = move;
     }
     int size() const { return count; }
-    bool empty() const { return count == 0; }
     int* begin() { return moves.data(); }
     int* end() { return moves.data() + count; }
     const int* begin() const { return moves.data(); }
     const int* end() const { return moves.data() + count; }
-    int& operator[](int index) { return moves[index]; }
-    const int& operator[](int index) const { return moves[index]; }
 };
 
 void generate_moves(thrawn::Position* pos, int move_type, MoveList& moves);

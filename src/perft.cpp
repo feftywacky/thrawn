@@ -57,11 +57,6 @@ std::uint64_t perft_nodes(thrawn::Position* pos, int depth)
 
 } // namespace
 
-std::uint64_t perft_search(thrawn::Position* pos, int depth)
-{
-    return perft_nodes(pos, depth);
-}
-
 std::uint64_t perft_test(thrawn::Position* pos, int depth) {
     std::uint64_t leaf_nodes = 0;
 
@@ -137,8 +132,7 @@ void perft_run_unit_tests() {
         std::uint64_t expected_nodes;
     };
 
-    // Define your test cases (make sure these FEN strings and expected values are correct)
-    Test tests[] = {
+        Test tests[] = {
         { start_position, 6, 119060324 },
         { position_2,     5, 193690690 },
         { position_3,     7, 178633661 },

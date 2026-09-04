@@ -9,20 +9,9 @@
 #include "uci.h" // for 'stopped' and 'communicate()'
 #include "globals.h"
 #include "constants.h"
-#include <iostream>
-#include <vector>
 #include <algorithm>
-#include <numeric>
 #include <atomic>
 #include <cmath>
-
-/*
-some notes for negamax
-3 types
-- fail high: causes beta cut-off
-- fail low: don't increase alpha
-- pv nodes: increase alpha
-*/
 
 std::atomic<uint64_t> total_nodes(0);
 
@@ -851,9 +840,7 @@ int quiet_move_score(ThreadData* td, int side, int ply, int move) {
 int tactical_move_score(thrawn::Position* pos, ThreadData* td, int move) {
     const int promotedPiece = get_promoted_piece(move);
     if (get_is_capture_move(move)) {
-        int target = captured_piece(pos, move);
-        if (target == -1)
-            target = pos->colour_to_move == white ? p : P;
+        const int target = capture_history_victim(pos, move);
 
         int score = SEARCH_TACTICAL_CAPTURE_BASE_SCORE +
                     SEARCH_TACTICAL_VICTIM_MULTIPLIER * piece_value(target) -
@@ -875,9 +862,7 @@ int tactical_move_score(thrawn::Position* pos, ThreadData* td, int move) {
 }
 
 int bad_capture_score(thrawn::Position* pos, ThreadData* td, int move, int seeScore) {
-    int target = captured_piece(pos, move);
-    if (target == -1)
-        target = pos->colour_to_move == white ? p : P;
+    const int target = capture_history_victim(pos, move);
 
     return SEARCH_BAD_CAPTURE_BASE_SCORE +
            piece_value(target) / SEARCH_BAD_CAPTURE_VICTIM_DIVISOR +
@@ -1478,7 +1463,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     int ttScore = 0;
     int ttStaticEval = no_hashmap_entry;
     bool ttWasPv = false;
-    const int ttHit = tt->probe(pos, ttDepth, ttMove, ttScore, ttFlag, ttStaticEval, ttWasPv);
+    const bool ttHit = tt->probe(pos, ttDepth, ttMove, ttScore, ttFlag, ttStaticEval, ttWasPv);
     // Sticky PV marking: a node that has ever been on a PV keeps a wider
     // margin and a smaller reduction for the rest of the search.
     const bool ttPv = isPvNode || (ttHit && ttWasPv);
@@ -1494,7 +1479,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
     if (!inCheck)
     {
-        raw_static_eval = evaluate_static(pos, ttStaticEval, ttHit != 0);
+        raw_static_eval = evaluate_static(pos, ttStaticEval, ttHit);
         static_eval = corrected_static_eval(raw_static_eval, correction_value(td, pos));
     }
     else
@@ -1920,7 +1905,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         {
             const int rootBound = score > alpha ? (score >= beta ? BOUND_LOWER : BOUND_EXACT)
                                                 : BOUND_UPPER;
-            td->recordRootMove(move, score, depth, rootBound);
+            td->recordRootMove(move, rootBound);
         }
 
         if (score > bestScore)

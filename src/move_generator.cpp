@@ -414,7 +414,7 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
     const int enemy_side = moving_side ^ 1;
     const uint64_t source_bb = square_bb(source);
     const uint64_t target_bb = square_bb(target);
-    const int nnue_ply = (stack_ply >= 0) ? stack_ply : pos->ply;
+    const int nnue_ply = stack_ply;  // guaranteed >= 0 by the check above
     const bool use_nnue = update_nnue && nnue_loaded();
     NnuePieceUpdate nnue_updates[8];
     int nnue_update_count = 0;

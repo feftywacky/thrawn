@@ -1,14 +1,6 @@
 #include "zobrist_hashing.h"
 #include "bitboard.h"
 #include "bitboard_helpers.h"
-#include <iostream>
-
-//uint64_t piece_hashkey[12][64]; // [piece][square]
-//uint64_t enpassant_hashkey[64]; // [enpassant square]
-//uint64_t castling_hashkey[16]; // [castle rights]
-//uint64_t colour_to_move_hashkey;
-//
-//uint64_t zobristKey;
 
 void init_hashkeys(thrawn::Position* pos)
 {

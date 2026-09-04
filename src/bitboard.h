@@ -3,13 +3,9 @@
 
 #include <cstdint>
 #include <iostream>
-#include <map>
-#include <set>
-#include <vector>
 #include "bitboard_helpers.h"
 #include "constants.h"
 #include "position.h"
-#include <array>
 
 using namespace std;
 

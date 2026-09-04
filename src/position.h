@@ -10,10 +10,9 @@
 
 namespace thrawn {
 
-// Latest trainer export: HalfKAv2_hm, version 8.
+// Latest trainer export: HalfKAv2_hm (see kCurrentVersion in nnue.cpp).
 constexpr int NNUE_INPUT_FEATURES = 22528;
 constexpr int NNUE_PS_NB = 11 * 64;
-constexpr int NNUE_MAX_ACTIVE_FEATURES = 32;
 constexpr int NNUE_ACCUMULATOR_SIZE = 1024;
 constexpr int NNUE_FT_SIZE = NNUE_ACCUMULATOR_SIZE;
 constexpr int NNUE_HIDDEN_SIZE = 31;

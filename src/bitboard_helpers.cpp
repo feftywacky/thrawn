@@ -2,27 +2,12 @@
 
 #include "bitboard.h"
 
-#include <bitset>
 #include <iostream>
-#include <vector>
 
 using namespace std;
 
 // GLOBAL VARIABLES
 unsigned int random_state = 1804289383;
-
-vector<int> get_squares_from_bb(uint16_t bitboard)
-{
-    vector<int> squares;
-    bitset<64> bits(bitboard);
-
-    for (int i=0;i<64;i++)
-    {
-        if (bits[i]==1)
-            squares.push_back(i);
-    }
-    return squares;
-}
 
 // RANDOM NUMBER GEN
 
@@ -60,36 +45,6 @@ uint64_t get_random_U64()
 uint64_t gen_magic_num()
 {
     return get_random_U64() & get_random_U64() & get_random_U64();
-}
-
-void print_bitboard(uint64_t bitboard) 
-{
-    std::cout << std::endl;
-
-    // Loop over board ranks
-    for (int rank = 0; rank < 8; rank++) {
-        // Loop over board files
-        for (int file = 0; file < 8; file++) {
-            // Convert file & rank into square index
-            int square = rank * 8 + file;
-
-            // Print ranks
-            if (!file)
-                std::cout << "  " << 8 - rank << " ";
-
-            // Print bit state (either 1 or 0)
-            std::cout << " " << (bitboard & (1ULL << square) ? 1 : 0);
-        }
-
-        // Print a new line every rank
-        std::cout << std::endl;
-    }
-
-    // Print board files
-    std::cout << "\n     a b c d e f g h\n\n";
-
-    // Print bitboard as an unsigned decimal number
-    std::cout << "     Bitboard as unsigned decimal: " << bitboard << std::endl;
 }
 
 void print_board(thrawn::Position* pos, int side) 
@@ -141,17 +96,3 @@ void print_board(thrawn::Position* pos, int side)
     std::cout<<std::dec;
 }
 
-void print_bits(uint64_t num)
-{
-    int num_bits = 64;
-
-    for (int i = 0; i < num_bits; i++) {
-        uint64_t bit = (num >> i) & 1;
-        std::cout << bit;
-
-        if (i % 8 == 7 && i != num_bits - 1) {
-            std::cout << ' ';
-        }
-    }
-    std::cout << std::endl;
-}

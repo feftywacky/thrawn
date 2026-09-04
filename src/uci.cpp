@@ -18,7 +18,6 @@
 #include "timeman.h"
 #include "threading.h"
 #include <stdlib.h>
-#include <vector>
 #include <cstring>
 #include <cctype>
 #include <string>
@@ -327,20 +326,14 @@ int input_waiting() {
 }
 
 void read_input() {
-    // Bytes to read holder
     int bytes;
-
-    // GUI/user input
     char input[256] = "", *endc;
 
-    // "Listen" to STDIN
     if (input_waiting()) {
-        // Loop to read bytes from STDIN
+        // Retry on EINTR; read() can be interrupted by a signal.
         do {
             bytes = read(fileno(stdin), input, sizeof(input) - 1);
         }
-
-        // Until bytes are available
         while (bytes < 0);
 
         if (bytes <= 0) {
@@ -349,10 +342,8 @@ void read_input() {
 
         input[bytes] = '\0';
 
-        // Searches for the first occurrence of '\n'
+        // Terminate at the first newline so strcmp below sees a bare token.
         endc = strchr(input, '\n');
-
-        // If a newline character is found, set its value at the pointer to 0
         if (endc)
             *endc = 0;
 
@@ -425,22 +416,18 @@ int uci_parse_move(thrawn::Position* pos, const char *move_str)
 }
 
 void uci_parse_position(thrawn::Position* pos, const char *command) {
-    // Create a non-const pointer for manipulation
-    const char *non_const_command = command;
-
-    non_const_command += 9; // shift index to skip 'position' in command
-
-    const char *curr_ch = non_const_command;
+    // skip past 'position ' in the command
+    const char *args = command + 9;
+    const char *curr_ch;
 
     // parse 'startpos' command
-    
-    if (strncmp(non_const_command, "startpos", 8) == 0)
+    if (strncmp(args, "startpos", 8) == 0)
         parse_fen(pos, start_position);
 
     // parse 'fen' command
     else 
     {
-        curr_ch = strstr(non_const_command, "fen");
+        curr_ch = strstr(args, "fen");
 
         // no 'fen' command found
         if (curr_ch == nullptr)
@@ -454,7 +441,7 @@ void uci_parse_position(thrawn::Position* pos, const char *command) {
     }
 
     // parse moves after position is set up
-    curr_ch = strstr(non_const_command, "moves");
+    curr_ch = strstr(args, "moves");
     
     // if moves are found
     if (curr_ch != nullptr) {
@@ -482,9 +469,6 @@ void uci_parse_position(thrawn::Position* pos, const char *command) {
 
     }
 
-    // for debug
-    // print_board(colour_to_move);
-
 }
 
 void uci_parse_go(thrawn::Position* pos, const char* command)
@@ -498,48 +482,34 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
     int movestogo = 0;   // 0 means sudden death / Fischer
     int movetime = -1;
 
-    // Infinite search
-    if (strstr(command, "infinite") != nullptr) {}
-
-    // Match UCI "binc" command
+    // Each offset below is strlen(token) + 1, to step past the token and the
+    // space separating it from its value. Only the clock fields for the side to
+    // move are read; the opponent's are ignored.
     if (strstr(command, "binc") != nullptr && pos->colour_to_move == 1) {
-        // Parse black time increment
         inc = atoi(strstr(command, "binc") + 5);
     }
 
-    // Match UCI "winc" command
     if (strstr(command, "winc") != nullptr && pos->colour_to_move == 0) {
-        // Parse white time increment
         inc = atoi(strstr(command, "winc") + 5);
     }
 
-    // Match UCI "wtime" command
     if (strstr(command, "wtime") != nullptr && pos->colour_to_move == 0) {
-        // Parse white time limit
         uci_time = atoi(strstr(command, "wtime") + 6);
     }
 
-    // Match UCI "btime" command
     if (strstr(command, "btime") != nullptr && pos->colour_to_move == 1) {
-        // Parse black time limit
         uci_time = atoi(strstr(command, "btime") + 6);
     }
 
-    // Match UCI "movestogo" command
     if (strstr(command, "movestogo") != nullptr) {
-        // Parse number of moves to go
         movestogo = atoi(strstr(command, "movestogo") + 10);
     }
 
-    // Match UCI "movetime" command
     if (strstr(command, "movetime") != nullptr) {
-        // Parse amount of time allowed to spend to make a move
         movetime = atoi(strstr(command, "movetime") + 9);
     }
 
-    // Match UCI "depth" command
     if (strstr(command, "depth") != nullptr) {
-        // Parse search depth
         depth = atoi(strstr(command, "depth") + 6);
     }
 

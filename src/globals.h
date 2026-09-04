@@ -2,7 +2,7 @@
 #define GLOBALS_H
 
 #include "transposition_table.h"
-#include  "threading.h"
+#include "threading.h"
 #include "position.h"
 #include "constants.h"
 

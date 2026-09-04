@@ -446,12 +446,14 @@ void TranspositionTable::storeStaticEval(const thrawn::Position* pos, int static
     }
 }
 
-// bit allocations:
-// best_move: 24 bits (mask: 0xFFFFFF)
-// depth:      16 bits (mask: 0xFFFF)
-// score:      17 bits (mask: 0x1FFFF) after adding an offset of 50000
-// hash_flag:   2 bits (mask: 0x3)
-// age:         5 bits (stored by store() in bits 59-63)
+// bit allocations (LSB first):
+// best_move: bits  0-23 (24 bits, mask 0xFFFFFF)
+// depth:     bits 24-31 ( 8 bits, mask 0xFF, clamped to 0..255)
+// wasPv:     bit  32
+//            bits 33-39 unused
+// score:     bits 40-56 (17 bits, mask 0x1FFFF) after adding an offset of 50000
+// hash_flag: bits 57-58 ( 2 bits, mask 0x3)
+// age:       bits 59-63 ( 5 bits, written by store(), not by encodeTTData)
 //
 // Note: Score is encoded as score + SEARCH_INFINITY so that the range
 // -50000...+50000 becomes 0...100000.

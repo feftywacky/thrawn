@@ -4,10 +4,6 @@
 #include "position.h"
 #include <string>
 
-namespace thrawn {
-class Position;
-}
-
 void nnue_init(const char* evalFile);
 bool nnue_loaded();
 
@@ -28,8 +24,6 @@ void nnue_apply_piece_updates(thrawn::Position* pos,
                               int ply,
                               const NnuePieceUpdate* updates,
                               int update_count);
-void nnue_add_piece(thrawn::Position* pos, int ply, int piece, int square);
-void nnue_remove_piece(thrawn::Position* pos, int ply, int piece, int square);
 
 bool nnue_verify_position(const thrawn::Position* pos, std::string* error);
 bool nnue_measure_evaluation_parity(const thrawn::Position* pos, float* abs_error_cp, std::string* error);

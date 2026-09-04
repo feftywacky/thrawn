@@ -3,7 +3,6 @@
 
 #include <atomic>
 #include <array>
-#include <mutex>
 #include <utility>
 #include <vector>
 #include "position.h"
@@ -22,12 +21,8 @@ constexpr int TM_SCORE_UNKNOWN = SEARCH_INFINITY;
 
 struct RootMove {
     int move;
-    int score;
-    int depth;
     int bound;
-    int pv_length;
     bool completed;
-    std::array<int, MAX_DEPTH> pv;
 
     RootMove();
 };
@@ -84,13 +79,13 @@ public:
     // aspiration re-search. Linear scan: a root has at most a few dozen moves.
     std::vector<std::pair<int, long long>> root_move_nodes;
 
-    // Constructor initializes all arrays to zero and flags to false (or true where needed).
+    // Constructor initializes all arrays to zero and flags to false.
     ThreadData();
 
     // Reset the thread data between searches.
     void resetThreadData();
 
-    void recordRootMove(int move, int score, int depth, int bound);
+    void recordRootMove(int move, int bound);
 
     void addRootNodes(int move, long long nodes);
     long long rootNodes(int move) const;

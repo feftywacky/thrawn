@@ -4,25 +4,18 @@
 #include "constants.h"
 #include "nnue.h"
 #include "zobrist_hashing.h"
-#include "search.h"
 #include "position.h"
 #include <algorithm>
 #include <cstdlib>
-#include <string>
 
 using namespace std;
-
-class Bitboard;
 
 void parse_fen(thrawn::Position* pos, const char* fen)
 {
 
     // reset piece bitboards and occupancies
-    for (int i = 0; i < pos->piece_bitboards.size(); i++)
-        pos->piece_bitboards[i] = 0ULL;
-
-    for (int i = 0; i < pos->occupancies.size(); i++)
-        pos->occupancies[i] = 0ULL;
+    pos->piece_bitboards.fill(0ULL);
+    pos->occupancies.fill(0ULL);
     
     // reset gameState variables
     pos->colour_to_move = white;
@@ -46,7 +39,7 @@ void parse_fen(thrawn::Position* pos, const char* fen)
             {
                 int piece = char_pieces.at(*fen);
                 set_bit(pos->piece_bitboards[piece], square);
-                *fen++;
+                fen++;
             }
 
             // check for numbers in fen which represents # of empty squares
@@ -79,7 +72,7 @@ void parse_fen(thrawn::Position* pos, const char* fen)
     fen++;
 
     // parsing colour_to_move
-    *fen == 'w' ? (pos->colour_to_move = white) : (pos->colour_to_move = black);
+    pos->colour_to_move = (*fen == 'w') ? white : black;
 
     // go to parse castling rights value in fen string
     fen += 2;
@@ -111,7 +104,7 @@ void parse_fen(thrawn::Position* pos, const char* fen)
     {
         int col = *fen - 'a';
         // to get to row
-        *fen++;
+        fen++;
         int row = 8- (*fen -'0');
 
         pos->enpassant = row*8+col;

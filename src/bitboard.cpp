@@ -1,7 +1,5 @@
 #include "bitboard.h"
-#include "evaluation.h"
 #include <iostream>
-#include <vector>
 
 using namespace std;
 
@@ -101,19 +99,19 @@ uint64_t get_bishop_mask(const int& square)
 
     // bottom right diagonal 
     for (row = curr_row+1, col = curr_col+1; row<=6 && col<=6; row++,col++)
-        attacks |= (1ULL << row*8 + col);
+        attacks |= (1ULL << (row*8 + col));
     
     // bottom left diagonal 
     for (row = curr_row+1, col = curr_col-1; row<=6 && col>=1; row++, col--)
-        attacks |= (1ULL << row*8 + col);
+        attacks |= (1ULL << (row*8 + col));
 
     // top right diagonal
     for (row = curr_row-1, col = curr_col+1; row>=1 && col<=6; row--, col++)
-        attacks |= (1ULL << row*8 + col);
+        attacks |= (1ULL << (row*8 + col));
     
     // top left diagonal
     for (row = curr_row-1, col = curr_col-1; row>=1 && col>=1; row--, col--)
-        attacks |= (1ULL << row*8 + col);
+        attacks |= (1ULL << (row*8 + col));
 
     return attacks;    
 }
@@ -132,32 +130,32 @@ uint64_t bishop_attack_runtime_gen(int square, const uint64_t& blockers)
     // bottom right diagonal 
     for (row = curr_row+1, col = curr_col+1; row<=7 && col<=7; row++,col++)
     {
-        attacks |= (1ULL << row*8 + col);
-        if ( (1ULL << row*8 + col) & blockers )
+        attacks |= (1ULL << (row*8 + col));
+        if ( (1ULL << (row*8 + col)) & blockers )
             break;
     }
     
     // bottom left diagonal 
     for (row = curr_row+1, col = curr_col-1; row<=7 && col>=0; row++, col--)
     {
-        attacks |= (1ULL << row*8 + col);
-         if ( (1ULL << row*8 + col) & blockers )
+        attacks |= (1ULL << (row*8 + col));
+         if ( (1ULL << (row*8 + col)) & blockers )
             break;
     }
 
     // top right diagonal
     for (row = curr_row-1, col = curr_col+1; row>=0 && col<=7; row--, col++)
     {
-        attacks |= (1ULL << row*8 + col);
-         if ( (1ULL << row*8 + col) & blockers )
+        attacks |= (1ULL << (row*8 + col));
+         if ( (1ULL << (row*8 + col)) & blockers )
             break;
     }
 
     // top left diagonal
     for (row = curr_row-1, col = curr_col-1; row>=0 && col>=0; row--, col--)
     {
-        attacks |= (1ULL << row*8 + col);
-         if ( (1ULL << row*8 + col) & blockers )
+        attacks |= (1ULL << (row*8 + col));
+         if ( (1ULL << (row*8 + col)) & blockers )
             break;
     }
 
@@ -174,19 +172,19 @@ uint64_t get_rook_mask(const int& square)
 
     // up
     for (row = curr_row-1; row>=1; row--)
-        attacks |= (1ULL << row*8 + curr_col);
+        attacks |= (1ULL << (row*8 + curr_col));
 
     // down
     for (row = curr_row+1; row<=6; row++)
-        attacks |= (1ULL << row*8 + curr_col);
+        attacks |= (1ULL << (row*8 + curr_col));
 
     // left
     for (col = curr_col-1; col >=1; col--)
-        attacks |= (1ULL << curr_row*8 + col);
+        attacks |= (1ULL << (curr_row*8 + col));
 
     // right
     for (col = curr_col+1; col<=6; col++)
-        attacks |= (1ULL << curr_row*8 + col);
+        attacks |= (1ULL << (curr_row*8 + col));
 
     return attacks;
 }
@@ -203,32 +201,32 @@ uint64_t rook_attack_runtime_gen(int square, uint64_t& blockers)
     // up
     for (row = curr_row-1; row>=0; row--)
     {
-        attacks |= (1ULL << row*8 + curr_col);
-        if ( (1ULL << row*8 + curr_col) & blockers )
+        attacks |= (1ULL << (row*8 + curr_col));
+        if ( (1ULL << (row*8 + curr_col)) & blockers )
             break;
     }
 
     // down
     for (row = curr_row+1; row<=7; row++)
     {
-        attacks |= (1ULL << row*8 + curr_col);
-        if ( (1ULL << row*8 + curr_col) & blockers )
+        attacks |= (1ULL << (row*8 + curr_col));
+        if ( (1ULL << (row*8 + curr_col)) & blockers )
             break;
     }
 
     // left
     for (col = curr_col-1; col >=0; col--)
     {
-        attacks |= (1ULL << curr_row*8 + col);
-        if ( (1ULL << curr_row*8 + col) & blockers)
+        attacks |= (1ULL << (curr_row*8 + col));
+        if ( (1ULL << (curr_row*8 + col)) & blockers)
             break;
     }
 
     // right
     for (col = curr_col+1; col<=7; col++)
     {
-        attacks |= (1ULL << curr_row*8 + col);
-        if ( (1ULL << curr_row*8 + col) & blockers)
+        attacks |= (1ULL << (curr_row*8 + col));
+        if ( (1ULL << (curr_row*8 + col)) & blockers)
             break;
     }
 

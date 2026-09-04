@@ -11,11 +11,12 @@ CPPFLAGS :=
 LDFLAGS  :=
 
 ###############################################################################
-# Host detection (the machine running make) -> RM / MKDIR / default TARGET
+# Host detection (the machine running make) -> RM / RMDIR / MKDIR / default TARGET
 ###############################################################################
 ifeq ($(OS),Windows_NT)
     HOST_OS := windows
     RM      := del /Q
+    RMDIR   := rmdir /S /Q
     MKDIR   := mkdir
 else
     UNAME_S := $(shell uname -s)
@@ -25,6 +26,7 @@ else
         HOST_OS := macos
     endif
     RM      := rm -f
+    RMDIR   := rm -rf
     MKDIR   := mkdir -p
 endif
 
@@ -63,7 +65,8 @@ else ifeq ($(TARGET),linux)
 else
     OS_NAME    := macOS
     EXE_SUFFIX :=
-    STACK_FLAG := # No stack flag for macOS
+    # macOS needs no explicit stack flag.
+    STACK_FLAG :=
 endif
 
 ###############################################################################
@@ -201,7 +204,7 @@ else ifeq ($(BUILD),release)
     CPPFLAGS += -DRELEASE_BUILD -DNDEBUG
     CXXFLAGS += $(OPT_FLAGS) $(ARCH_FLAGS)
     # LTO requires the optimization flag at link time as well
-    LDFLAGS  += $(OPT_FLAGS) 
+    LDFLAGS  += $(OPT_FLAGS)
 endif
 
 ###############################################################################
@@ -220,7 +223,6 @@ OUTPUT      := $(BUILD_DIR)/$(OUTPUT_NAME)
 ###############################################################################
 .PHONY: all clean distclean release
 
-# Removed the forced "clean" on every make call so incremental builds work
 all: $(OUTPUT)
 
 $(OUTPUT): $(OBJECTS) | $(BUILD_DIR)
@@ -245,7 +247,7 @@ clean:
 	$(RM) $(OBJECTS) $(DEPS)
 
 distclean: clean
-	$(RM) -r "$(BUILD_DIR)"
+	$(RMDIR) "$(BUILD_DIR)"
 
 # Build all five distributable binaries into $(BUILD_DIR). Intended to run on an
 # Apple Silicon macOS host with mingw-w64 and the x86_64-unknown-linux-gnu cross

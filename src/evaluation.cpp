@@ -2,7 +2,6 @@
 #include "bitboard.h"
 #include "bitboard_helpers.h"
 #include "nnue.h"
-#include "search.h"
 
 // [game phase][piece]
 const int material_score[2][12] = 
@@ -282,7 +281,7 @@ void init_eval_masks()
 
 int get_gamePhase_score(thrawn::Position* pos)
 {
-   // gamePhase scoe determined by adding up all the material scores for each piece
+   // gamePhase score determined by adding up all the material scores for each piece
     int white = 0;
     int black = 0;
     for (int piece = N;piece<=Q;piece++)
@@ -297,7 +296,7 @@ int evaluate_HCE(thrawn::Position* pos)
     int game_phase_score = get_gamePhase_score(pos);
     int game_phase = -1;
 
-    // deterine game phase
+    // determine game phase
     if (game_phase_score > opening_phase_score) 
         game_phase = opening;
     else if (game_phase_score < endgame_phase_score) 
@@ -346,7 +345,6 @@ int evaluate_HCE(thrawn::Position* pos)
                     // pass pawn bonus
                     if ((wPassedPawn_masks[square] & pos->piece_bitboards[p]) == 0)
                     {
-                        // give passed pawn bonus
                         opening_score += passed_pawn_bonus[get_rank_from_sq[square]];
                         endgame_score += passed_pawn_bonus[get_rank_from_sq[square]];
                     }

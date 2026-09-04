@@ -75,9 +75,8 @@ static std::uint64_t exact_node_total(int numThreads) {
 }
 
 RootMove::RootMove()
-    : move(0), score(-SEARCH_INFINITY), depth(0), bound(BOUND_NONE), pv_length(0), completed(false)
+    : move(0), bound(BOUND_NONE), completed(false)
 {
-    pv.fill(0);
 }
 
 SearchResult::SearchResult()
@@ -87,44 +86,10 @@ SearchResult::SearchResult()
     pv.fill(0);
 }
 
-/*
- * ThreadData constructor:
- * Initializes all fixed‑size arrays to zero and sets flags.
- */
 ThreadData::ThreadData() {
-    pv_length.fill(0);
-    for (auto &row : pv_table)
-        row.fill(0);
-    for (auto &row : killer_moves)
-        row.fill(0);
-    quiet_history = {};
-    continuation_history = {};
-    capture_history = {};
-    correction_history = {};
-    for (auto &row : counter_moves)
-        row.fill(0);
-    ply_moves.fill(0);
-    static_eval_stack.fill(no_hashmap_entry);
-
-    follow_pv_flag = false;
-    nmpMinPly = 0;
-
-    nodes = 0;
-    check_counter = NODE_COUNTER_BATCH;
-
-    thread_id = 0;
-    root_depth = 0;
-    final_depth = 0;
-    final_score = 0;
-    final_bound = BOUND_NONE;
-    root_moves.clear();
-    iteration_root_moves.clear();
-    root_move_nodes.clear();
+    resetThreadData();
 }
 
-/*
- * Reset the thread data between searches.
- */
 void ThreadData::resetThreadData() {
     pv_length.fill(0);
     for (auto &row : pv_table)
@@ -156,7 +121,7 @@ void ThreadData::resetThreadData() {
     root_move_nodes.clear();
 }
 
-void ThreadData::recordRootMove(int move, int score, int depth, int bound) {
+void ThreadData::recordRootMove(int move, int bound) {
     RootMove* entry = nullptr;
     for (RootMove& rootMove : iteration_root_moves) {
         if (rootMove.move == move) {
@@ -171,24 +136,8 @@ void ThreadData::recordRootMove(int move, int score, int depth, int bound) {
         entry->move = move;
     }
 
-    entry->score = score;
-    entry->depth = depth;
     entry->bound = bound;
     entry->completed = true;
-    entry->pv.fill(0);
-    entry->pv[0] = move;
-
-    int length = pv_length[1];
-    if (length < 1)
-        length = 1;
-    if (length > MAX_DEPTH)
-        length = MAX_DEPTH;
-
-    for (int nextPly = 1; nextPly < length; nextPly++) {
-        entry->pv[nextPly] = pv_table[1][nextPly];
-    }
-
-    entry->pv_length = length;
 }
 
 void ThreadData::addRootNodes(int move, long long nodes) {
@@ -262,11 +211,6 @@ static void print_result_info(const SearchResult& result) {
     std::cout.flush();
 }
 
-/**
- * smp_worker_thread_func
- * Each worker thread performw iterative deepening
- * Use the local copy of the position and the thread's search data
- */
 // One "info depth ..." line for the main thread. `bound` is BOUND_EXACT for a
 // completed iteration, or BOUND_LOWER/BOUND_UPPER for an aspiration fail, which
 // UCI reports as lowerbound/upperbound. Printing the failing iterations too is
@@ -440,7 +384,6 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
                 td->final_bound = BOUND_EXACT;
         }
         
-        // print an info line from the master thread (thread 0)
         if (threadID == 0)
             print_iteration_info(td, curr_depth, score, BOUND_EXACT);
 
@@ -496,9 +439,6 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         stopped.store(1, std::memory_order_relaxed);
 }
 
-/**
- * entry point to search
- */
 void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numThreads)
 {
     // Reset stop flags and counters.
@@ -513,7 +453,6 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
 
     tt->incrementAge();
 
-    // Limit the number of threads to MAX_THREADS.
     if (numThreads < 1)
         numThreads = 1;
     if (numThreads > MAX_THREADS)
@@ -524,7 +463,6 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
         threadDatas[i].resetThreadData();
     }
 
-    // Create position copies for each thread (on the heap)
     std::vector<thrawn::Position*> positionCopies;
     positionCopies.reserve(numThreads);
     for (int i = 0; i < numThreads; i++) {
@@ -536,14 +474,12 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
     }
     else {
 #if defined(_WIN32)
-    // Create worker threads
     std::vector<std::thread> workerPool;
     workerPool.reserve(numThreads);
     for (int i = 0; i < numThreads; i++) {
         workerPool.emplace_back(smp_worker_thread_func, positionCopies[i], i, maxDepth);
     }
 
-    // Wait for all worker threads to complete.
     for (int i = 0; i < numThreads; i++)
     {
         workerPool[i].join();
@@ -568,7 +504,6 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
 #endif
     }
     
-    // Delete allocated memory for position copies
     for (int i = 0; i < numThreads; i++) {
         delete positionCopies[i];
     }
@@ -592,8 +527,6 @@ void search_position_threaded(thrawn::Position* rootPos, int maxDepth, int numTh
         print_result_info(result);
     }
     
-    // Print the total nodes and best move.
-    //std::cout << "total nodes across all threads " << total_nodes << std::endl;
     std::cout << "bestmove ";
     if (bestMove != 0)
         print_move(bestMove);

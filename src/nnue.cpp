@@ -74,10 +74,6 @@ constexpr int kKingPlaneOffset = 10 * 64;
 constexpr double kCpPerStockfishScore = 100.0 / 208.0;
 constexpr int8_t kLocalAccumulatorSource = -1;
 
-// Thrawn's search margins and mate bounds are cp-based, so the NNUE score_stm
-// is converted once at the engine boundary. UCI raw helpers still expose score_stm.
-constexpr bool kSearchUsesCentipawns = true;
-
 static_assert(kExpectedFc0OutputSize == kExpectedHiddenSize + kExpectedForwardSize,
               "HalfKAv2_hm fc0 shape mismatch");
 static_assert(kExpectedFc1InputSize == kExpectedHiddenSize * 2,
@@ -863,7 +859,7 @@ void ft_pairwise_screlu_avx512(const int16_t* acc, uint8_t* out, int half, int f
 #endif
 
 #if defined(USE_NEON)
-// The accumulator is 1024 int16 (16 KB) and these run on every make-move, so the
+// The accumulator is 1024 int16 (2 KB) and these run on every make-move, so the
 // loops are unrolled 4x (four independent 128-bit chains) to expose ILP across
 // Apple/ARM's multiple NEON units instead of a single load->op->store dependency
 // per iteration. All ops are wrapping (non-saturating) so the reordering/fusion
@@ -898,7 +894,7 @@ static inline void acc_add_sub_row_neon(int16_t* acc, const int16_t* add, const 
 // Fused copy+patch variants: write dst = src (+adds) (-subs) in a single pass,
 // reading from a separate source accumulator. Used when a child ply still shares
 // an ancestor's accumulator: instead of memcpy(dst,src) followed by an in-place
-// patch (2 reads + 2 writes of the 16 KB accumulator), this does 1 read of src +
+// patch (2 reads + 2 writes of the 2 KB accumulator), this does 1 read of src +
 // 1 write of dst, halving accumulator memory traffic on the make-move hot path.
 static inline void acc_add_sub_row_from_neon(int16_t* dst, const int16_t* src,
                                              const int16_t* add, const int16_t* sub) {
@@ -1001,7 +997,7 @@ bool update_accumulator_rows(std::array<int16_t, kExpectedFtSize>& accumulator,
 // Compute dst = src (+ add rows) (- sub rows) in a single pass. When src and dst
 // alias (already-local accumulator) this is an in-place patch; when they differ
 // (child ply still sharing an ancestor's accumulator) it fuses the materialize
-// copy into the patch, so the 16 KB accumulator is read once and written once
+// copy into the patch, so the 2 KB accumulator is read once and written once
 // instead of copied and then re-read/re-written. Bit-identical to a plain copy
 // followed by update_accumulator_rows since every op is wrapping arithmetic.
 bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
@@ -1129,9 +1125,9 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
 #endif
 }
 
-// In-place patch: accumulator += add rows, -= sub rows. Retained as the fallback
-// kernel for the non-NEON path of update_accumulator_rows_from (hence
-// maybe_unused on NEON, where the fused kernel is always used instead).
+// In-place patch: accumulator += add rows, -= sub rows. Retained as the scalar
+// fallback kernel for update_accumulator_rows_from; every SIMD target (NEON,
+// AVX2, AVX-512) uses the fused kernel instead, hence maybe_unused there.
 [[maybe_unused]] bool update_accumulator_rows(std::array<int16_t, kExpectedFtSize>& accumulator,
                              const AlignedFtWeights& weights,
                              const AccumulatorFeatureUpdate* updates,
@@ -1262,11 +1258,6 @@ bool add_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
     return update_accumulator_row(accumulator, weights, feature, AccumulatorUpdateOp::Add);
 }
 
-bool subtract_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
-                              const AlignedFtWeights& weights,
-                              int feature) {
-    return update_accumulator_row(accumulator, weights, feature, AccumulatorUpdateOp::Subtract);
-}
 
 bool track_piece(thrawn::NnueState& state, int piece, int square) {
     if (piece < P || piece > k ||
@@ -1357,55 +1348,6 @@ bool refresh_perspective_accumulator(thrawn::NnueState& state,
     return true;
 }
 
-bool patch_piece_for_available_perspectives(thrawn::Position* pos,
-                                            int ply,
-                                            thrawn::NnueState& state,
-                                            const LoadedNetwork& network,
-                                            int piece,
-                                            int square,
-                                            AccumulatorUpdateOp op) {
-    bool patched_any = false;
-
-    if (state.white_king_sq >= 0 &&
-        state.white_king_sq < BOARD_SIZE &&
-        should_patch_piece_for_perspective(piece, true)) {
-        if (!materialize_accumulator(pos, ply, true)) {
-            return false;
-        }
-        const int feature = halfkav2_hm_index(piece, square, state.white_king_sq, true);
-        if (feature < 0) {
-            return false;
-        }
-        const bool ok = (op == AccumulatorUpdateOp::Add)
-            ? add_accumulator_row(state.white_acc, network.ft_weight, feature)
-            : subtract_accumulator_row(state.white_acc, network.ft_weight, feature);
-        if (!ok) {
-            return false;
-        }
-        patched_any = true;
-    }
-
-    if (state.black_king_sq >= 0 &&
-        state.black_king_sq < BOARD_SIZE &&
-        should_patch_piece_for_perspective(piece, false)) {
-        if (!materialize_accumulator(pos, ply, false)) {
-            return false;
-        }
-        const int feature = halfkav2_hm_index(piece, square, state.black_king_sq, false);
-        if (feature < 0) {
-            return false;
-        }
-        const bool ok = (op == AccumulatorUpdateOp::Add)
-            ? add_accumulator_row(state.black_acc, network.ft_weight, feature)
-            : subtract_accumulator_row(state.black_acc, network.ft_weight, feature);
-        if (!ok) {
-            return false;
-        }
-        patched_any = true;
-    }
-
-    return patched_any || is_king_piece(piece);
-}
 
 bool refresh_perspective_accumulator_from_board(const thrawn::Position* pos,
                                                 thrawn::NnueState& state,
@@ -1446,31 +1388,7 @@ bool refresh_perspective_accumulator_from_board(const thrawn::Position* pos,
     return true;
 }
 
-bool add_piece_to_state(thrawn::Position* pos,
-                        int ply,
-                        thrawn::NnueState& state,
-                        const LoadedNetwork& network,
-                        int piece,
-                        int square) {
-    if (!patch_piece_for_available_perspectives(pos, ply, state, network, piece, square, AccumulatorUpdateOp::Add)) {
-        return false;
-    }
 
-    return track_piece(state, piece, square);
-}
-
-bool remove_piece_from_state(thrawn::Position* pos,
-                             int ply,
-                             thrawn::NnueState& state,
-                             const LoadedNetwork& network,
-                             int piece,
-                             int square) {
-    if (!patch_piece_for_available_perspectives(pos, ply, state, network, piece, square, AccumulatorUpdateOp::Subtract)) {
-        return false;
-    }
-
-    return untrack_piece(state, piece, square);
-}
 
 bool collect_feature_update_for_perspective(const thrawn::NnueState& state,
                                             const NnuePieceUpdate& update,
@@ -2189,15 +2107,6 @@ double raw_output_from_quantized(const IntEvaluationResult& result,
            static_cast<double>(result.forward) * network.inv_fc0_scale;
 }
 
-int32_t evaluate_accumulators_int_score_stm(const AccumulatorView& accumulators,
-                                            const LoadedNetwork& network,
-                                            int colour_to_move) {
-    const IntEvaluationResult result =
-        evaluate_accumulators_int_quantized(accumulators, network, colour_to_move);
-    return round_to_int32(raw_output_from_quantized(result, network) *
-                          static_cast<double>(network.score_scale));
-}
-
 int32_t evaluate_accumulators_int_cp(const AccumulatorView& accumulators,
                                      const LoadedNetwork& network,
                                      int colour_to_move) {
@@ -2208,14 +2117,13 @@ int32_t evaluate_accumulators_int_cp(const AccumulatorView& accumulators,
                           kCpPerStockfishScore);
 }
 
+// Thrawn's search margins and mate bounds are cp-based, so the NNUE score_stm
+// is converted to centipawns once here, at the engine boundary. The UCI raw
+// helpers still report the unconverted score_stm.
 int32_t evaluate_accumulators_int_engine_score(const AccumulatorView& accumulators,
                                                const LoadedNetwork& network,
                                                int colour_to_move) {
-    if constexpr (kSearchUsesCentipawns) {
-        return evaluate_accumulators_int_cp(accumulators, network, colour_to_move);
-    } else {
-        return evaluate_accumulators_int_score_stm(accumulators, network, colour_to_move);
-    }
+    return evaluate_accumulators_int_cp(accumulators, network, colour_to_move);
 }
 
 double crelu(double value) {
@@ -2846,48 +2754,7 @@ void nnue_apply_piece_updates(thrawn::Position* pos,
     }
 }
 
-void nnue_add_piece(thrawn::Position* pos, int ply, int piece, int square) {
-    const LoadedNetwork* network = current_network();
-    if (network == nullptr || ply < 0 || ply > MAX_DEPTH) {
-        return;
-    }
 
-    thrawn::NnueState& state = pos->nnue_stack[ply];
-    if (!state.valid) {
-        return;
-    }
-
-    if (!add_piece_to_state(pos, ply, state, *network, piece, square)) {
-        state.valid = false;
-        return;
-    }
-
-    if (piece == K) {
-        if (!refresh_perspective_accumulator_from_board(pos, state, *network, true)) {
-            state.valid = false;
-        }
-    } else if (piece == k) {
-        if (!refresh_perspective_accumulator_from_board(pos, state, *network, false)) {
-            state.valid = false;
-        }
-    }
-}
-
-void nnue_remove_piece(thrawn::Position* pos, int ply, int piece, int square) {
-    const LoadedNetwork* network = current_network();
-    if (network == nullptr || ply < 0 || ply > MAX_DEPTH) {
-        return;
-    }
-
-    thrawn::NnueState& state = pos->nnue_stack[ply];
-    if (!state.valid) {
-        return;
-    }
-
-    if (!remove_piece_from_state(pos, ply, state, *network, piece, square)) {
-        state.valid = false;
-    }
-}
 
 bool nnue_verify_position(const thrawn::Position* pos, std::string* error) {
     const LoadedNetwork* network = current_network();

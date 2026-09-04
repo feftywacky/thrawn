@@ -232,7 +232,6 @@ constexpr int BOARD_SIZE = 64;
 
 // ASCII pieces
 extern const array<char, 12>ascii_pieces;
-extern const array<string, 12> unicode_pieces;
 
 extern const unordered_map<char, int> char_pieces;
 
@@ -254,12 +253,7 @@ extern const std::array<int, 64> update_castling_right_values;
 extern std::array<uint64_t, 64> rook_magic_nums;
 extern std::array<uint64_t, 64> bishop_magic_nums;
 
-// move ordering
-// [attacker][victim]
-extern const std::array<std::array<int, 12>, 12> mvv_lva;
-
 // FEN position test cases
-extern const char* empty_board;
 extern const char* start_position;
 extern const char* position_2;
 extern const char* position_3;

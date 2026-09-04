@@ -11,14 +11,8 @@ const std::string version = " v3.1";
 
 void init_all()
 {
-    // init_magic_nums(); // used to help generate magic bitboards
-    
-    // init_leaping_attacks(pos);
-    // init_sliding_attacks(pos, bishop);
-    // init_sliding_attacks(pos, rook);
-
-    // init hashkeys
-    // init_hashkeys();
+    // init_magic_nums(); // kept: regenerates the magic bitboards in constants.cpp
+    // Attack tables and Zobrist keys are initialised lazily by Position.
 
     // The transposition table is deliberately NOT allocated here. A GUI or
     // tournament manager sends `setoption name Hash` right after `uci`, so an

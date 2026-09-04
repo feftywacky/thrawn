@@ -18,17 +18,10 @@ some notes for negamax
 // global node counter
 extern std::atomic<uint64_t> total_nodes;
 
-/*
- * Negamax & Quiescence:
- * Now they accept a reference to ThreadData (td),
- * which holds PV arrays, killer moves, history, etc.
-*/
+// td carries the per-thread PV arrays, killer moves and history tables.
 int negamax(thrawn::Position* pos, ThreadData* td, int depth, int alpha, int beta);
 int quiescence(thrawn::Position* pos, ThreadData* td, int alpha, int beta);
 
-/*
- * Repetition check
- */
 int isRepetition(thrawn::Position* pos);
 
 #endif // SEARCH_H
