@@ -62,7 +62,9 @@ constexpr uint32_t kExpectedFc1InputSize = thrawn::NNUE_FC1_INPUT_SIZE;
 constexpr uint32_t kExpectedFc1OutputSize = thrawn::NNUE_FC1_OUTPUT_SIZE;
 constexpr uint32_t kExpectedOutputPerspective = 1;
 constexpr const char* kExpectedFeatureSet = "HalfKAv2_hm";
-constexpr const char* kDefaultEvalFile = "thrawn-nn-2.nnue";
+// Sentinel EvalFile value meaning "use the network embedded in the binary".
+// Advertised as the UCI default, so a GUI echoing it back costs no disk probe.
+constexpr const char* kEmbeddedEvalFile = "<embedded>";
 
 // The FT output is activated (pairwise SqrCReLU) before fc0, so fc0 is a
 // u8 x i8 layer whose input width equals the accumulator width, not twice it.
@@ -329,11 +331,7 @@ bool looks_like_absolute_path(const std::string& path) {
 }
 
 std::vector<std::string> candidate_paths(const std::string& requested_path) {
-    std::string path = trim_copy(requested_path);
-    if (path.empty()) {
-        path = kDefaultEvalFile;
-    }
-
+    const std::string path = trim_copy(requested_path);
     std::vector<std::string> candidates{path};
     if (!looks_like_absolute_path(path) && path.rfind("./", 0) != 0 && path.rfind("../", 0) != 0) {
         candidates.push_back("src/" + path);
@@ -2570,11 +2568,18 @@ void activate_network(LoadedNetwork&& loaded) {
 }
 
 void nnue_init(const char* evalFile) {
-    const std::string requested = evalFile == nullptr ? "" : std::string(evalFile);
+    std::string requested = evalFile == nullptr ? "" : trim_copy(std::string(evalFile));
+    if (requested == kEmbeddedEvalFile) {
+        requested.clear();
+    }
     std::string last_error;
-    auto candidates = candidate_paths(requested);
 
-    for (const std::string& candidate : candidates) {
+    // The default network ships inside the binary (nnue_embedded_data.S), so
+    // startup requests nothing and goes straight to it - no .nnue is shipped
+    // alongside the executable any more. Only an explicit `setoption name
+    // EvalFile` probes the disk, and it still falls back to the embedded net.
+    for (const std::string& candidate :
+         requested.empty() ? std::vector<std::string>{} : candidate_paths(requested)) {
         LoadedNetwork loaded;
         std::string error;
         if (!load_network_from_file(candidate, loaded, error)) {
@@ -2589,9 +2594,6 @@ void nnue_init(const char* evalFile) {
         return;
     }
 
-    // No usable file on disk (the common case now: no .nnue shipped alongside
-    // the executable). Fall back to the network embedded in the binary itself
-    // rather than leaving the engine without an evaluator.
     {
         LoadedNetwork loaded;
         std::string embedded_error;
@@ -2599,10 +2601,9 @@ void nnue_init(const char* evalFile) {
             const std::string embedded_name = loaded.loaded_path;
             activate_network(std::move(loaded));
             std::cout << "info string Loaded embedded default NNUE (" << embedded_name << ")";
-            // Only call out the failure if the caller asked for something other
-            // than the (now optional) default filename; that's the normal,
-            // expected path when no .nnue ships next to the executable.
-            if (!requested.empty() && requested != kDefaultEvalFile && !last_error.empty()) {
+            // Startup requests nothing, so this is silent in the normal case;
+            // only an explicit EvalFile that failed gets called out.
+            if (!requested.empty() && !last_error.empty()) {
                 std::cout << " (EvalFile " << requested << " failed: " << last_error << ")";
             }
             std::cout << "\n";

@@ -689,7 +689,7 @@ void uci_loop(thrawn::Position* pos)
             cout << "option name Move Overhead type spin default "
                  << TM_MOVE_OVERHEAD_DEFAULT << " min " << TM_MOVE_OVERHEAD_MIN
                  << " max " << TM_MOVE_OVERHEAD_MAX << "\n";
-            cout << "option name EvalFile type string default thrawn-nn-2.nnue" << "\n";
+            cout << "option name EvalFile type string default <embedded>" << "\n";
             cout << "uciok\n";
         }
         
@@ -723,11 +723,8 @@ void uci_loop(thrawn::Position* pos)
                           << "ms\n";
             }
             else if (option_name_equals(optionName, "EvalFile")) {
-                std::string path = optionValue;
-                if (path.empty()) {
-                    path = "thrawn-nn-2.nnue";
-                }
-                nnue_init(path.c_str());
+                // An empty value resets to the embedded default network.
+                nnue_init(optionValue.c_str());
                 nnue_refresh_root(pos);
             }
             else {
