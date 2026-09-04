@@ -211,9 +211,9 @@ endif
 # Distribution output
 #   All binaries land in a build/ directory at the repo root, named:
 #     build/thrawn-v<VERSION>-<os>-<simd>[.exe]
-#   e.g. build/thrawn-v3.1-macos-arm-neon, build/thrawn-v3.1-windows-x64-avx2.exe
+#   e.g. build/thrawn-v3.2-macos-arm-neon, build/thrawn-v3.2-windows-x64-avx2.exe
 ###############################################################################
-VERSION     ?= 3.1
+VERSION     ?= 3.2
 BUILD_DIR   ?= $(abspath $(CURDIR)/build)
 OUTPUT_NAME ?= thrawn-v$(VERSION)-$(TARGET)-$(DIST_TAG)$(EXE_SUFFIX)
 OUTPUT      := $(BUILD_DIR)/$(OUTPUT_NAME)

@@ -39,7 +39,7 @@ The selected CPU target must also match the machine that will run the binary:
 git clone https://github.com/feftywacky/Thrawn.git
 cd Thrawn
 make                    # native build for the current machine
-build/thrawn-v3.1-*     # run the produced binary
+build/thrawn-v3.2-*     # run the produced binary
 ```
 
 All binaries are written to a `build/` directory at the repo root and named
