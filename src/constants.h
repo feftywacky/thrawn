@@ -126,6 +126,20 @@ constexpr int SEARCH_IIR_MIN_DEPTH = 4;
 constexpr int SEARCH_IIR_REDUCTION = 1;
 
 constexpr int SEARCH_QSEARCH_DELTA_MARGIN = 156;
+
+// Move-loop futility for captures (not checks): eval plus the victim still
+// cannot reach alpha.
+constexpr int SEARCH_CAPTURE_FUTILITY_MAX_DEPTH = 6;
+constexpr int SEARCH_CAPTURE_FUTILITY_BASE = 230;
+constexpr int SEARCH_CAPTURE_FUTILITY_DEPTH_FACTOR = 150;
+
+// Static eval shrinks toward a draw as the 50-move counter runs:
+// eval * (DIVISOR - fifty_move) / DIVISOR.
+constexpr int SEARCH_FIFTY_MOVE_DAMPING_DIVISOR = 220;
+
+// Aspiration: after a fail-high, the re-search runs up to this many plies
+// shallower than the iteration's depth.
+constexpr int SEARCH_ASPIRATION_MAX_FAIL_HIGH_REDUCTION = 3;
 constexpr int SEARCH_QSEARCH_SEE_MARGIN = -32;
 
 constexpr int SEARCH_SEE_PRUNE_MAX_DEPTH = 10;

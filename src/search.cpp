@@ -217,9 +217,20 @@ int correction_value(ThreadData* td, thrawn::Position* pos) {
     return weighted / 512;
 }
 
-int corrected_static_eval(int rawStaticEval, int correction) {
-    return std::clamp(rawStaticEval + correction, -mateScore + MAX_DEPTH,
+// The raw eval is what the TT holds; the 50-move counter is not part of the
+// key, so damping is applied here, after the table.
+int corrected_static_eval(const thrawn::Position* pos, int rawStaticEval, int correction) {
+    const int damped = rawStaticEval * (SEARCH_FIFTY_MOVE_DAMPING_DIVISOR - pos->fifty_move) /
+                       SEARCH_FIFTY_MOVE_DAMPING_DIVISOR;
+    return std::clamp(damped + correction, -mateScore + MAX_DEPTH,
                       mateScore - MAX_DEPTH);
+}
+
+// A repetition scores a hair either side of zero, keyed off the node count, so
+// the search does not see every drawing line as exactly equal and walk into
+// one blindly (Stockfish).
+int draw_score(const ThreadData* td) {
+    return 1 - static_cast<int>(td->nodes & 2);
 }
 
 NodeContext make_node_context(ThreadData* td, int ply, int staticEval, bool cutNode) {
@@ -1558,7 +1569,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     }
 
     if (pos->ply && isRepetition(pos))
-        return 0;
+        return draw_score(td);
     if (pos->fifty_move >= 100)
         return fifty_move_score(pos);
 
@@ -1616,7 +1627,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     if (!inCheck)
     {
         raw_static_eval = evaluate_static(pos, ttStaticEval, ttHit);
-        static_eval = corrected_static_eval(raw_static_eval, correction_value(td, pos));
+        static_eval = corrected_static_eval(pos, raw_static_eval, correction_value(td, pos));
     }
     else
     {
@@ -1865,6 +1876,13 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             // is exactly the kind of move the quiet margins would throw away.
             if (!quietMove || gives_check())
             {
+                if (captureMove && !get_promoted_piece(move) && !gives_check() &&
+                    lmrDepth <= SEARCH_CAPTURE_FUTILITY_MAX_DEPTH &&
+                    eval + SEARCH_CAPTURE_FUTILITY_BASE +
+                        SEARCH_CAPTURE_FUTILITY_DEPTH_FACTOR * lmrDepth +
+                        piece_value(capture_history_victim(pos, move)) <= alpha)
+                    continue;
+
                 if (depth <= SEARCH_SEE_PRUNE_MAX_DEPTH)
                 {
                     const int seeScore = picked.seeKnown
@@ -2211,7 +2229,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     if (!inCheck)
     {
         raw_static_eval = evaluate_static(pos, ttStaticEval, ttHit);
-        static_eval = corrected_static_eval(raw_static_eval, correction_value(td, pos));
+        static_eval = corrected_static_eval(pos, raw_static_eval, correction_value(td, pos));
         bestScore = static_eval;
         td->static_eval_stack[pos->ply] = static_eval;
         td->in_check_stack[pos->ply] = false;
@@ -2227,6 +2245,10 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
 
         if (bestScore >= beta)
         {
+            // Stand pat is only an estimate; meeting beta halfway keeps the
+            // fail-soft bound from overshooting on a noisy eval.
+            if (!is_mate_score(bestScore))
+                bestScore = (bestScore + beta) / 2;
             tt->store(pos, 0, bestScore, BOUND_LOWER, 0, raw_static_eval, ttPv);
             return bestScore;
         }
