@@ -65,6 +65,11 @@ constexpr int SEARCH_CONT_CORRECTION_WEIGHT = 16;
 
 constexpr int SEARCH_QUEEN_PROMOTION_SCORE = 10499;
 
+// Quiet ordering, per unit of the moving piece's value: moving a piece out of
+// an attack by a cheaper piece, or into one.
+constexpr int SEARCH_THREAT_ESCAPE_BONUS = 50;
+constexpr int SEARCH_THREAT_ENTER_PENALTY = 45;
+
 // Reverse futility: margin scales with depth, one depth step cheaper when the
 // eval trend is with us. No lower depth bound beyond the floor.
 constexpr int SEARCH_REVERSE_FUTILITY_MAX_DEPTH = 11;

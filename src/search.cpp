@@ -547,9 +547,43 @@ int continuation_history_score(ThreadData* td, int ply, int move) {
     return score;
 }
 
+ThreatInfo compute_threats(thrawn::Position* pos, int them) {
+    ThreatInfo t{0, 0, 0, 0};
+    const uint64_t occupancy = pos->occupancies[both];
+    const int offset = them == white ? 0 : 6;
+
+    for (uint64_t bb = pos->piece_bitboards[P + offset]; bb; bb &= bb - 1)
+        t.byPawn |= pos->pawn_attacks[them][get_lsb_index(bb)];
+    for (uint64_t bb = pos->piece_bitboards[N + offset]; bb; bb &= bb - 1)
+        t.byMinor |= pos->knight_attacks[get_lsb_index(bb)];
+    for (uint64_t bb = pos->piece_bitboards[B + offset]; bb; bb &= bb - 1)
+        t.byMinor |= get_bishop_attacks(pos, get_lsb_index(bb), occupancy);
+    for (uint64_t bb = pos->piece_bitboards[R + offset]; bb; bb &= bb - 1)
+        t.byRook |= get_rook_attacks(pos, get_lsb_index(bb), occupancy);
+
+    uint64_t rest = 0;
+    for (uint64_t bb = pos->piece_bitboards[Q + offset]; bb; bb &= bb - 1)
+        rest |= get_queen_attacks(pos, get_lsb_index(bb), occupancy);
+    for (uint64_t bb = pos->piece_bitboards[K + offset]; bb; bb &= bb - 1)
+        rest |= pos->king_attacks[get_lsb_index(bb)];
+
+    t.all = t.byPawn | t.byMinor | t.byRook | rest;
+    return t;
+}
+
+void set_threats(ThreadData* td, thrawn::Position* pos) {
+    td->threats[pos->ply] = compute_threats(pos, pos->colour_to_move ^ 1);
+}
+
+int& quiet_history_entry(ThreadData* td, int side, int ply, int move) {
+    const uint64_t attacked = td->threats[ply].all;
+    const int from = get_move_source(move);
+    const int to = get_move_target(move);
+    return td->quiet_history[side][(attacked >> from) & 1][(attacked >> to) & 1][from][to];
+}
+
 int quiet_history_score(ThreadData* td, int side, int ply, int move) {
-    const int fromTo = td->quiet_history[side][get_move_source(move)]
-                                        [get_move_target(move)];
+    const int fromTo = quiet_history_entry(td, side, ply, move);
     return 2 * fromTo + continuation_history_score(td, ply, move);
 }
 
@@ -574,8 +608,7 @@ void update_continuation_history(ThreadData* td, int ply, int move, int bonus) {
 }
 
 void update_quiet_history(ThreadData* td, int side, int ply, int move, int bonus) {
-    update_history_entry(td->quiet_history[side][get_move_source(move)]
-                                           [get_move_target(move)], bonus);
+    update_history_entry(quiet_history_entry(td, side, ply, move), bonus);
     update_continuation_history(td, ply, move,
                                 bonus * SEARCH_CONTINUATION_HISTORY_NUMERATOR /
                                     SEARCH_CONTINUATION_HISTORY_DENOMINATOR);
@@ -913,7 +946,23 @@ bool move_is_pseudo_legal(thrawn::Position* pos, int move, int moveType) {
 // buffer, so anything scored here is an ordinary quiet: history alone orders it,
 // unclamped, or every well established quiet would tie at the clamp.
 int quiet_move_score(ThreadData* td, int side, int ply, int move) {
-    return quiet_history_score(td, side, ply, move);
+    int score = quiet_history_score(td, side, ply, move);
+
+    const int piece = get_move_piece(move);
+    const int type = piece % 6;
+    if (type == PAWN || type == KING)
+        return score;
+
+    const ThreatInfo& t = td->threats[ply];
+    const uint64_t byLesser = type == QUEEN ? (t.byPawn | t.byMinor | t.byRook)
+                            : type == ROOK  ? (t.byPawn | t.byMinor)
+                                            : t.byPawn;
+    const int value = piece_value(piece);
+    if (byLesser & square_bb(get_move_target(move)))
+        score -= SEARCH_THREAT_ENTER_PENALTY * value;
+    else if (byLesser & square_bb(get_move_source(move)))
+        score += SEARCH_THREAT_ESCAPE_BONUS * value;
+    return score;
 }
 
 int tactical_move_score(thrawn::Position* pos, ThreadData* td, int move) {
@@ -1578,6 +1627,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     }
     eval = static_eval;
     td->static_eval_stack[pos->ply] = static_eval;
+    td->in_check_stack[pos->ply] = inCheck;
+    set_threats(td, pos);
 
     nodeContext = make_node_context(td, pos->ply, static_eval, cutNode);
 
@@ -2163,6 +2214,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         static_eval = corrected_static_eval(raw_static_eval, correction_value(td, pos));
         bestScore = static_eval;
         td->static_eval_stack[pos->ply] = static_eval;
+        td->in_check_stack[pos->ply] = false;
 
         // A TT score whose bound points the right way is a better stand pat.
         if (ttHit && ttFlag != BOUND_NONE && !is_mate_score(ttScore) &&
@@ -2186,9 +2238,13 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     {
         td->static_eval_stack[pos->ply] =
             pos->ply >= 2 ? td->static_eval_stack[pos->ply - 2] : no_hashmap_entry;
+        td->in_check_stack[pos->ply] = true;
     }
 
     const int move_type = inCheck ? all_moves : only_captures;
+    // Evasions include quiets, and their ordering reads this ply's threats.
+    if (inCheck)
+        set_threats(td, pos);
     MovePicker movePicker(pos, td, ttMove, false, move_type, inCheck);
 
     int valid_moves = 0;

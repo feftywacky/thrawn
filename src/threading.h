@@ -19,6 +19,15 @@ extern std::atomic<int> main_completed_depth;
 extern int previous_root_score;
 constexpr int TM_SCORE_UNKNOWN = SEARCH_INFINITY;
 
+// Squares the side not to move attacks, split by attacker class so move
+// ordering can tell a piece attacked by something cheaper than itself.
+struct ThreatInfo {
+    uint64_t all;
+    uint64_t byPawn;
+    uint64_t byMinor;
+    uint64_t byRook;
+};
+
 struct RootMove {
     int move;
     int bound;
@@ -35,7 +44,13 @@ public:
 
     // Killer, history, and counter-move ordering tables.
     std::array<std::array<int, MAX_DEPTH>, KILLER_MOVES> killer_moves;
-    std::array<std::array<std::array<int, BOARD_SIZE>, BOARD_SIZE>, 2> quiet_history;
+    // [side][from attacked][to attacked][from][to]: the same move is a
+    // different proposition when it steps out of, or into, an attack.
+    std::array<
+        std::array<
+            std::array<std::array<std::array<int, BOARD_SIZE>, BOARD_SIZE>, 2>,
+            2>,
+        2> quiet_history;
     // [plies back - 1][previous piece][previous to][piece][to]. int16_t so the
     // two tables together cost what the single int table did.
     std::array<
@@ -61,6 +76,8 @@ public:
     std::array<std::array<int, BOARD_SIZE>, HISTORY_SIZE> counter_moves;
     std::array<int, MAX_DEPTH> ply_moves;
     std::array<int, MAX_DEPTH> static_eval_stack;
+    std::array<bool, MAX_DEPTH> in_check_stack;
+    std::array<ThreatInfo, MAX_DEPTH> threats;
 
     // Flags used for move ordering and search heuristics.
     bool follow_pv_flag;

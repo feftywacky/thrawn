@@ -111,6 +111,8 @@ void ThreadData::resetThreadData() {
         row.fill(0);
     ply_moves.fill(0);
     static_eval_stack.fill(no_hashmap_entry);
+    in_check_stack.fill(false);
+    threats.fill(ThreatInfo{0, 0, 0, 0});
 
     follow_pv_flag = false;
     nmpMinPly = 0;
