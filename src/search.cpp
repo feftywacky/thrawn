@@ -228,7 +228,7 @@ int corrected_static_eval(const thrawn::Position* pos, int rawStaticEval, int co
 
 // A repetition scores a hair either side of zero, keyed off the node count, so
 // the search does not see every drawing line as exactly equal and walk into
-// one blindly (Stockfish).
+// one blindly.
 int draw_score(const ThreadData* td) {
     return 1 - static_cast<int>(td->nodes & 2);
 }

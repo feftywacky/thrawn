@@ -168,8 +168,7 @@ constexpr int SEARCH_SMP_VOTE_SCORE_OFFSET = 14;
 // Time management
 // ----------------------------------------
 // `soft` gates whether another iterative deepening iteration is started; `hard`
-// aborts the search wherever it is. Values are Berserk's (src/uci.c,
-// src/search.c). See notes/time-management-2026-09.md.
+// aborts the search wherever it is. See notes/time-management-2026-09.md.
 
 // UCI "Move Overhead" option bounds, in ms. 50 is what keeps a reserve behind
 // each move once the clock settles into its low-time equilibrium.
@@ -204,8 +203,8 @@ constexpr double TM_STABILITY_BASE = 1.3110;
 constexpr double TM_STABILITY_STEP = 0.0533;
 constexpr int    TM_STABILITY_MAX  = 10;
 
-// (b) Score trend. Coefficients are Berserk's 0.0262 / 0.0261 divided by 1.85,
-// Thrawn's cp inflation versus the WDL-normalised scale the references print -
+// (b) Score trend. Coefficients 0.0262 / 0.0261 divided by 1.85, Thrawn's cp
+// inflation versus the WDL-normalised scale -
 // see the eval-scale calibration in notes/search-rewrite-2026-08.md.
 constexpr double TM_SCORE_BASE        = 0.1127;
 constexpr double TM_SCORE_RECENT_COEF = 0.0142;

@@ -102,7 +102,7 @@ public:
 
     // (move, nodes) for each root move, accumulated over the whole search rather
     // than per iteration - the time manager wants the share of the total tree a
-    // root move has cost, which is what both Berserk and Reckless divide by.
+    // root move has cost.
     // Kept separate from iteration_root_moves, which is cleared on every
     // aspiration re-search. Linear scan: a root has at most a few dozen moves.
     std::vector<std::pair<int, long long>> root_move_nodes;

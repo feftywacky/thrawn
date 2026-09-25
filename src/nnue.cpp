@@ -73,7 +73,7 @@ constexpr int kFtActivationHalf = static_cast<int>(kExpectedFtSize) / 2;
 constexpr int kFc1InputPaddedSize = 64;
 constexpr int kFc2OutputSize = 1;
 constexpr int kKingPlaneOffset = 10 * 64;
-constexpr double kCpPerStockfishScore = 100.0 / 208.0;
+constexpr double kCpPerNetworkScore = 100.0 / 208.0;
 constexpr int8_t kUncomputedAccumulator = -1;
 
 static_assert(kExpectedFc0OutputSize == kExpectedHiddenSize + kExpectedForwardSize,
@@ -2100,7 +2100,7 @@ int32_t evaluate_accumulators_int_cp(const AccumulatorView& accumulators,
         evaluate_accumulators_int_quantized(accumulators, network, colour_to_move);
     return round_to_int32(raw_output_from_quantized(result, network) *
                           static_cast<double>(network.score_scale) *
-                          kCpPerStockfishScore);
+                          kCpPerNetworkScore);
 }
 
 // Thrawn's search margins and mate bounds are cp-based, so the NNUE score_stm
@@ -2178,7 +2178,7 @@ double evaluate_accumulators_float_cp(const AccumulatorView& accumulators,
                                       const LoadedNetwork& network,
                                       int colour_to_move) {
     return evaluate_accumulators_float_score_stm(accumulators, network, colour_to_move) *
-           kCpPerStockfishScore;
+           kCpPerNetworkScore;
 }
 
 bool verify_state_against_board(const thrawn::Position* pos,

@@ -34,7 +34,7 @@ void TimeManager::init(int timeLeft, int inc, int movestogo, int movetimeMs,
         hard    = std::max<std::int64_t>(1, movetimeMs - move_overhead);
         soft    = hard;
         // No clock to flag, so the depth-1 exemption stays open and a tiny
-        // movetime still returns a searched move. Reckless does the same.
+        // movetime still returns a searched move.
         panic   = std::numeric_limits<std::int64_t>::max();
         return;
     }
@@ -54,7 +54,7 @@ void TimeManager::init(int timeLeft, int inc, int movestogo, int movetimeMs,
 
     if (movestogo <= 0)
     {
-        // Berserk lets the horizon term go negative, which collapses the
+        // Left unfloored, the horizon term goes negative and collapses the
         // allocation once remaining time drops below horizon * overhead.
         // Flooring it at zero leaves a low clock spending a fixed share of what
         // is left, and changes nothing while the increment covers the overhead.

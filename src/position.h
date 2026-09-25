@@ -52,7 +52,7 @@ struct alignas(NNUE_SIMD_ALIGNMENT) NnueState {
     bool valid = false;
 };
 
-// Accumulator refresh cache ("Finny table"). One entry per perspective per king
+// Accumulator refresh cache. One entry per perspective per king
 // square: HalfKAv2_hm features depend only on (perspective, king bucket, king
 // file half), and every king square maps to a distinct (bucket, half) pair, so
 // the king square is an exact key. Each entry holds an accumulator together with

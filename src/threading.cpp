@@ -312,7 +312,7 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
         // Aspiration loop: adjust the window until search returns a score in (alpha, beta)
         bool completed_iteration = false;
         // A fail-high is usually confirmed without the full depth, so each one
-        // shaves a ply off the re-search (Stockfish/Obsidian). A fail-low
+        // shaves a ply off the re-search. A fail-low
         // restores it: that result has to be trusted at full depth.
         int searchDepth = curr_depth;
         while (true)
@@ -447,8 +447,7 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             break;
     }
 
-    // Lazy SMP: only the master thread is gated on the requested search depth
-    // (mirrors Stockfish's `limits.depth && mainThread` loop condition). Once
+    // Lazy SMP: only the master thread is gated on the requested search depth. Once
     // the master has completed maxDepth, signal all helper threads to stop so
     // they abort their in-progress iteration instead of independently grinding
     // to maxDepth and gating the join on the slowest straggler.
