@@ -72,8 +72,8 @@ void NnueStack::copy_up_to(const NnueStack& other, int ply) {
     }
     for (int i = limit + 1; i <= MAX_DEPTH; ++i) {
         (*states)[i].valid = false;
-        (*states)[i].white_acc_source_ply = -1;
-        (*states)[i].black_acc_source_ply = -1;
+        (*states)[i].white_acc_ply = -1;
+        (*states)[i].black_acc_ply = -1;
     }
 }
 

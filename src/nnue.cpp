@@ -74,7 +74,7 @@ constexpr int kFc1InputPaddedSize = 64;
 constexpr int kFc2OutputSize = 1;
 constexpr int kKingPlaneOffset = 10 * 64;
 constexpr double kCpPerStockfishScore = 100.0 / 208.0;
-constexpr int8_t kLocalAccumulatorSource = -1;
+constexpr int8_t kUncomputedAccumulator = -1;
 
 static_assert(kExpectedFc0OutputSize == kExpectedHiddenSize + kExpectedForwardSize,
               "HalfKAv2_hm fc0 shape mismatch");
@@ -548,8 +548,9 @@ const LoadedNetwork* current_network() {
 void clear_state(thrawn::NnueState& state) {
     state.white_acc.fill(0);
     state.black_acc.fill(0);
-    state.white_acc_source_ply = kLocalAccumulatorSource;
-    state.black_acc_source_ply = kLocalAccumulatorSource;
+    state.white_acc_ply = kUncomputedAccumulator;
+    state.black_acc_ply = kUncomputedAccumulator;
+    state.dirty_count = 0;
     state.valid = false;
 }
 
@@ -557,100 +558,12 @@ AccumulatorView local_accumulator_view(const thrawn::NnueState& state) {
     return {&state.white_acc, &state.black_acc};
 }
 
-int accumulator_source_for_child(const thrawn::NnueState& parent,
-                                 bool white_perspective,
-                                 int parent_ply) {
-    const int parent_source = white_perspective
-        ? parent.white_acc_source_ply
-        : parent.black_acc_source_ply;
-    return parent_source == kLocalAccumulatorSource ? parent_ply : parent_source;
+int8_t& accumulator_ply(thrawn::NnueState& state, bool white_perspective) {
+    return white_perspective ? state.white_acc_ply : state.black_acc_ply;
 }
 
-bool resolve_accumulator(const thrawn::Position* pos,
-                         int ply,
-                         bool white_perspective,
-                         const std::array<int16_t, kExpectedFtSize>*& accumulator) {
-    if (pos == nullptr || ply < 0 || ply > MAX_DEPTH) {
-        return false;
-    }
-
-    int source_ply = ply;
-    for (int hops = 0; hops <= MAX_DEPTH; ++hops) {
-        const thrawn::NnueState& state = pos->nnue_stack[static_cast<std::size_t>(source_ply)];
-        if (!state.valid) {
-            return false;
-        }
-
-        const int next_source = white_perspective
-            ? state.white_acc_source_ply
-            : state.black_acc_source_ply;
-        if (next_source == kLocalAccumulatorSource) {
-            accumulator = white_perspective ? &state.white_acc : &state.black_acc;
-            return true;
-        }
-        if (next_source < 0 || next_source > MAX_DEPTH || next_source == source_ply) {
-            return false;
-        }
-        source_ply = next_source;
-    }
-
-    return false;
-}
-
-bool accumulator_view_for_ply(const thrawn::Position* pos,
-                              int ply,
-                              AccumulatorView& view) {
-    return resolve_accumulator(pos, ply, true, view.white) &&
-           resolve_accumulator(pos, ply, false, view.black);
-}
-
-bool materialize_accumulator(thrawn::Position* pos, int ply, bool white_perspective) {
-    if (pos == nullptr || ply < 0 || ply > MAX_DEPTH) {
-        return false;
-    }
-
-    thrawn::NnueState& state = pos->nnue_stack[static_cast<std::size_t>(ply)];
-    int8_t& source = white_perspective ? state.white_acc_source_ply : state.black_acc_source_ply;
-    if (source == kLocalAccumulatorSource) {
-        return state.valid;
-    }
-
-    const std::array<int16_t, kExpectedFtSize>* source_acc = nullptr;
-    if (!resolve_accumulator(pos, ply, white_perspective, source_acc) || source_acc == nullptr) {
-        return false;
-    }
-
-    auto& target = white_perspective ? state.white_acc : state.black_acc;
-    if (source_acc != &target) {
-        target = *source_acc;
-    }
-    source = kLocalAccumulatorSource;
-    return true;
-}
-
-bool materialize_state_accumulators(thrawn::Position* pos, int ply) {
-    return materialize_accumulator(pos, ply, true) &&
-           materialize_accumulator(pos, ply, false);
-}
-
-void mark_accumulator_local(thrawn::NnueState& state, bool white_perspective) {
-    if (white_perspective) {
-        state.white_acc_source_ply = kLocalAccumulatorSource;
-    } else {
-        state.black_acc_source_ply = kLocalAccumulatorSource;
-    }
-}
-
-void copy_state_metadata_without_accumulators(thrawn::NnueState& child,
-                                              const thrawn::NnueState& parent,
-                                              int child_ply) {
-    child.valid = parent.valid;
-
-    const int parent_ply = child_ply - 1;
-    child.white_acc_source_ply = static_cast<int8_t>(
-        accumulator_source_for_child(parent, true, parent_ply));
-    child.black_acc_source_ply = static_cast<int8_t>(
-        accumulator_source_for_child(parent, false, parent_ply));
+std::array<int16_t, kExpectedFtSize>& accumulator_of(thrawn::NnueState& state, bool white_perspective) {
+    return white_perspective ? state.white_acc : state.black_acc;
 }
 
 enum class AccumulatorUpdateOp { Add, Subtract };
@@ -1433,8 +1346,6 @@ bool refresh_perspective_accumulator_cached(thrawn::Position* pos,
     for (int piece = P; piece <= k; ++piece) {
         entry.bitboards[piece] = pos->piece_bitboards[piece];
     }
-
-    mark_accumulator_local(state, white_perspective);
     return true;
 }
 
@@ -1469,12 +1380,11 @@ bool refresh_perspective_accumulator_full(const thrawn::Position* pos,
     auto& acc = white_perspective ? state.white_acc : state.black_acc;
     apply_feature_rows_tiled(network.ft_bias.data(), acc.data(), nullptr,
                              adds, add_count, nullptr, 0);
-    mark_accumulator_local(state, white_perspective);
     return true;
 }
 
 bool collect_feature_update_for_perspective(int our_king_square,
-                                            const NnuePieceUpdate& update,
+                                            const thrawn::NnueDirtyPiece& update,
                                             bool white_perspective,
                                             AccumulatorFeatureUpdate* feature_updates,
                                             int& feature_update_count) {
@@ -1500,103 +1410,97 @@ bool collect_feature_update_for_perspective(int our_king_square,
     return true;
 }
 
-// Resolve the source accumulator for this perspective (the nearest materialized
-// ancestor, or the local one) and write state's accumulator = source ± feature
-// rows in a single fused pass, then mark it local. This replaces the previous
-// two-step materialize (2 KB copy) + in-place patch with one read/write pass.
-bool materialize_and_apply_rows(thrawn::Position* pos,
-                                int ply,
-                                thrawn::NnueState& state,
-                                bool white_perspective,
-                                const AlignedFtWeights& weights,
-                                const AccumulatorFeatureUpdate* updates,
-                                int update_count) {
-    auto& dst = white_perspective ? state.white_acc : state.black_acc;
-    int8_t& source = white_perspective ? state.white_acc_source_ply
-                                       : state.black_acc_source_ply;
+// Materialize (if needed) and return this perspective's accumulator for `ply`,
+// which must be the ply the board is currently at (a refresh reads the live
+// board). Walk back to the nearest ply whose accumulator is computed, then
+// replay each later ply's dirty pieces forward in fused src->dst passes, so
+// every intermediate ply becomes computed too (later siblings reuse them).
+// If the walk crosses a move of this perspective's own king, the chain cannot
+// be replayed incrementally; the accumulator is instead refreshed at `ply`
+// straight from the board via the refresh cache. Returns nullptr if the state
+// is invalid or an update cannot be applied.
+const std::array<int16_t, kExpectedFtSize>* ensure_accumulator(thrawn::Position* pos,
+                                                               int ply,
+                                                               bool white_perspective,
+                                                               const LoadedNetwork& network) {
+    thrawn::NnueStack& stack = pos->nnue_stack;
+    thrawn::NnueState& state = stack[static_cast<std::size_t>(ply)];
+    if (!state.valid) {
+        return nullptr;
+    }
 
-    const std::array<int16_t, kExpectedFtSize>* src_acc = &dst;
-    if (source != kLocalAccumulatorSource) {
-        if (!resolve_accumulator(pos, ply, white_perspective, src_acc) ||
-            src_acc == nullptr) {
-            return false;
+    int8_t& state_acc_ply = accumulator_ply(state, white_perspective);
+    if (state_acc_ply != kUncomputedAccumulator) {
+        return &accumulator_of(stack[static_cast<std::size_t>(state_acc_ply)], white_perspective);
+    }
+
+    const int own_king = white_perspective ? K : k;
+    int base = ply;
+    for (;;) {
+        thrawn::NnueState& walk = stack[static_cast<std::size_t>(base)];
+        if (accumulator_ply(walk, white_perspective) != kUncomputedAccumulator) {
+            break;
         }
+        for (int i = 0; i < walk.dirty_count; ++i) {
+            if (walk.dirty[i].piece == own_king) {
+                if (!refresh_perspective_accumulator_cached(pos, state, network, white_perspective)) {
+                    return nullptr;
+                }
+                state_acc_ply = static_cast<int8_t>(ply);
+                return &accumulator_of(state, white_perspective);
+            }
+        }
+        if (base == 0) {
+            return nullptr;
+        }
+        --base;
     }
 
-    if (!update_accumulator_rows_from(dst, *src_acc, weights, updates, update_count)) {
-        return false;
+    // No own-king move in (base, ply], so the king square is the live one.
+    const int our_king_square = get_lsb_index(pos->piece_bitboards[own_king]);
+    if (our_king_square < 0) {
+        return nullptr;
     }
 
-    source = kLocalAccumulatorSource;
-    return true;
+    for (int j = base + 1; j <= ply; ++j) {
+        thrawn::NnueState& prev = stack[static_cast<std::size_t>(j - 1)];
+        thrawn::NnueState& cur = stack[static_cast<std::size_t>(j)];
+        const int source_ply = accumulator_ply(prev, white_perspective);
+
+        AccumulatorFeatureUpdate updates[kMaxBatchedPieceUpdates];
+        int update_count = 0;
+        for (int i = 0; i < cur.dirty_count; ++i) {
+            if (!collect_feature_update_for_perspective(our_king_square, cur.dirty[i], white_perspective,
+                                                        updates, update_count)) {
+                return nullptr;
+            }
+        }
+
+        if (update_count == 0) {
+            // Nothing changed for this perspective (null move): share the source.
+            accumulator_ply(cur, white_perspective) = static_cast<int8_t>(source_ply);
+            continue;
+        }
+
+        if (!update_accumulator_rows_from(accumulator_of(cur, white_perspective),
+                                          accumulator_of(stack[static_cast<std::size_t>(source_ply)],
+                                                         white_perspective),
+                                          network.ft_weight, updates, update_count)) {
+            return nullptr;
+        }
+        accumulator_ply(cur, white_perspective) = static_cast<int8_t>(j);
+    }
+
+    return &accumulator_of(stack[static_cast<std::size_t>(state_acc_ply)], white_perspective);
 }
 
-bool apply_piece_updates_to_state(thrawn::Position* pos,
-                                  int ply,
-                                  thrawn::NnueState& state,
-                                  const LoadedNetwork& network,
-                                  const NnuePieceUpdate* updates,
-                                  int update_count) {
-    if (updates == nullptr || update_count < 0 || update_count > kMaxBatchedPieceUpdates) {
-        return false;
-    }
-
-    bool refresh_white = false;
-    bool refresh_black = false;
-    for (int i = 0; i < update_count; ++i) {
-        if (updates[i].piece == K) {
-            refresh_white = true;
-        } else if (updates[i].piece == k) {
-            refresh_black = true;
-        }
-    }
-
-    // The board is already in the post-move state, so its king squares are the
-    // ones the incremental (non-refreshed) perspectives are indexed by.
-    const int white_king_square = get_lsb_index(pos->piece_bitboards[K]);
-    const int black_king_square = get_lsb_index(pos->piece_bitboards[k]);
-    if (white_king_square < 0 || black_king_square < 0) {
-        return false;
-    }
-
-    AccumulatorFeatureUpdate white_updates[kMaxBatchedPieceUpdates];
-    AccumulatorFeatureUpdate black_updates[kMaxBatchedPieceUpdates];
-    int white_update_count = 0;
-    int black_update_count = 0;
-    for (int i = 0; i < update_count; ++i) {
-        if (!refresh_white &&
-            !collect_feature_update_for_perspective(white_king_square, updates[i], true,
-                                                    white_updates, white_update_count)) {
-            return false;
-        }
-        if (!refresh_black &&
-            !collect_feature_update_for_perspective(black_king_square, updates[i], false,
-                                                    black_updates, black_update_count)) {
-            return false;
-        }
-    }
-
-    if (white_update_count > 0) {
-        if (!materialize_and_apply_rows(pos, ply, state, true, network.ft_weight,
-                                        white_updates, white_update_count)) {
-            return false;
-        }
-    }
-    if (black_update_count > 0) {
-        if (!materialize_and_apply_rows(pos, ply, state, false, network.ft_weight,
-                                        black_updates, black_update_count)) {
-            return false;
-        }
-    }
-
-    if (refresh_white && !refresh_perspective_accumulator_cached(pos, state, network, true)) {
-        return false;
-    }
-    if (refresh_black && !refresh_perspective_accumulator_cached(pos, state, network, false)) {
-        return false;
-    }
-
-    return true;
+bool ensure_accumulators(thrawn::Position* pos,
+                         int ply,
+                         const LoadedNetwork& network,
+                         AccumulatorView& view) {
+    view.white = ensure_accumulator(pos, ply, true, network);
+    view.black = ensure_accumulator(pos, ply, false, network);
+    return view.valid();
 }
 
 bool build_state_from_board(const thrawn::Position* pos,
@@ -1628,6 +1532,10 @@ bool build_state_from_board(const thrawn::Position* pos,
         return false;
     }
 
+    // Built states are the root (ply 0) or standalone temporaries read through
+    // local_accumulator_view, so the accumulators live in their own buffers.
+    out_state.white_acc_ply = 0;
+    out_state.black_acc_ply = 0;
     out_state.valid = true;
     return true;
 }
@@ -1636,12 +1544,13 @@ EvaluationState state_for_evaluation(const thrawn::Position* pos,
                                      const LoadedNetwork& network,
                                      thrawn::NnueState& refreshed_state) {
     if (pos->ply >= 0 && pos->ply <= MAX_DEPTH) {
+        // Materializing lazy accumulators only fills in values already fixed by
+        // the board and move history, so it is logically const.
+        thrawn::Position* mutable_pos = const_cast<thrawn::Position*>(pos);
         const thrawn::NnueState& live_state = pos->nnue_stack[pos->ply];
-        if (live_state.valid) {
-            EvaluationState evaluation{&live_state, {}};
-            if (accumulator_view_for_ply(pos, pos->ply, evaluation.accumulators)) {
-                return evaluation;
-            }
+        EvaluationState evaluation{&live_state, {}};
+        if (live_state.valid && ensure_accumulators(mutable_pos, pos->ply, network, evaluation.accumulators)) {
+            return evaluation;
         }
     }
 
@@ -2296,8 +2205,10 @@ bool verify_state_against_board(const thrawn::Position* pos,
         return fail("incremental state invalid");
     }
 
+    // Materializing lazy accumulators is logically const (see state_for_evaluation).
     AccumulatorView incremental_accumulators{};
-    if (!accumulator_view_for_ply(pos, pos->ply, incremental_accumulators)) {
+    if (!ensure_accumulators(const_cast<thrawn::Position*>(pos), pos->ply, network,
+                             incremental_accumulators)) {
         return fail("incremental accumulator source invalid");
     }
 
@@ -2712,9 +2623,8 @@ int nnue_evaluate(thrawn::Position* pos) {
     }
 
     if (pos->ply >= 0 && pos->ply <= MAX_DEPTH) {
-        const thrawn::NnueState& live_state = pos->nnue_stack[pos->ply];
         AccumulatorView accumulators{};
-        if (live_state.valid && accumulator_view_for_ply(pos, pos->ply, accumulators)) {
+        if (ensure_accumulators(pos, pos->ply, *network, accumulators)) {
             return evaluate_accumulators_int_engine_score(accumulators, *network, pos->colour_to_move);
         }
     }
@@ -2770,14 +2680,19 @@ void nnue_copy_parent_to_child(thrawn::Position* pos, int child_ply) {
 
     thrawn::NnueState& child = pos->nnue_stack[child_ply];
     const thrawn::NnueState& parent = pos->nnue_stack[child_ply - 1];
+    child.dirty_count = 0;
     if (current_network() == nullptr || !parent.valid) {
         child.valid = false;
-        child.white_acc_source_ply = kLocalAccumulatorSource;
-        child.black_acc_source_ply = kLocalAccumulatorSource;
+        child.white_acc_ply = kUncomputedAccumulator;
+        child.black_acc_ply = kUncomputedAccumulator;
         return;
     }
 
-    copy_state_metadata_without_accumulators(child, parent, child_ply);
+    // With no piece changes (a null move) the child's accumulators are the
+    // parent's; a real move resets them in nnue_apply_piece_updates.
+    child.valid = true;
+    child.white_acc_ply = parent.white_acc_ply;
+    child.black_acc_ply = parent.black_acc_ply;
 }
 
 void nnue_promote_to_root(thrawn::Position* pos, int ply) {
@@ -2786,32 +2701,35 @@ void nnue_promote_to_root(thrawn::Position* pos, int ply) {
     }
 
     thrawn::NnueState& root = pos->nnue_stack[0];
-    if (current_network() == nullptr) {
+    const LoadedNetwork* network = current_network();
+    AccumulatorView accumulators{};
+    if (network == nullptr || ply != pos->ply ||
+        !ensure_accumulators(pos, ply, *network, accumulators)) {
         root.valid = false;
-        root.white_acc_source_ply = kLocalAccumulatorSource;
-        root.black_acc_source_ply = kLocalAccumulatorSource;
+        root.white_acc_ply = kUncomputedAccumulator;
+        root.black_acc_ply = kUncomputedAccumulator;
+        root.dirty_count = 0;
         return;
     }
 
-    if (!pos->nnue_stack[ply].valid || !materialize_state_accumulators(pos, ply)) {
-        root.valid = false;
-        root.white_acc_source_ply = kLocalAccumulatorSource;
-        root.black_acc_source_ply = kLocalAccumulatorSource;
-        return;
+    if (accumulators.white != &root.white_acc) {
+        root.white_acc = *accumulators.white;
     }
-
-    root = pos->nnue_stack[ply];
-    root.white_acc_source_ply = kLocalAccumulatorSource;
-    root.black_acc_source_ply = kLocalAccumulatorSource;
+    if (accumulators.black != &root.black_acc) {
+        root.black_acc = *accumulators.black;
+    }
+    root.white_acc_ply = 0;
+    root.black_acc_ply = 0;
+    root.dirty_count = 0;
+    root.valid = true;
 }
 
+// Record the move's piece changes for lazy replay; no accumulator work here.
 void nnue_apply_piece_updates(thrawn::Position* pos,
                               int ply,
                               const NnuePieceUpdate* updates,
                               int update_count) {
-    const LoadedNetwork* network = current_network();
-    if (network == nullptr ||
-        pos == nullptr ||
+    if (pos == nullptr ||
         updates == nullptr ||
         update_count < 0 ||
         ply < 0 ||
@@ -2820,13 +2738,22 @@ void nnue_apply_piece_updates(thrawn::Position* pos,
     }
 
     thrawn::NnueState& state = pos->nnue_stack[ply];
-    if (!state.valid) {
+    if (!state.valid || update_count == 0) {
+        return;
+    }
+    if (update_count > thrawn::NNUE_MAX_DIRTY_PIECES) {
+        state.valid = false;
         return;
     }
 
-    if (!apply_piece_updates_to_state(pos, ply, state, *network, updates, update_count)) {
-        state.valid = false;
+    for (int i = 0; i < update_count; ++i) {
+        state.dirty[i] = {static_cast<int8_t>(updates[i].piece),
+                          static_cast<int8_t>(updates[i].square),
+                          updates[i].add};
     }
+    state.dirty_count = static_cast<uint8_t>(update_count);
+    state.white_acc_ply = kUncomputedAccumulator;
+    state.black_acc_ply = kUncomputedAccumulator;
 }
 
 
