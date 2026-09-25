@@ -199,6 +199,54 @@ struct IntEvaluationResult {
     }
 };
 
+// Exact replacement for div_round_by_scale(value, scale) with a fixed scale in
+// [1, 255], used on the per-eval output path so it costs a multiply and a shift
+// instead of a 64-bit hardware division. The rounded magnitude n = |value| +
+// scale/2 is divided by a multiply with m = ceil(2^(N+l) / scale), l =
+// ceil(log2(scale)), N = kMagicBits. Granlund & Montgomery (1994, Thm 4.2):
+// since m*scale - 2^(N+l) <= scale - 1 < 2^l, floor(n*m / 2^(N+l)) equals
+// floor(n / scale) for every 0 <= n < 2^N. With scale > 2^(l-1), m <= 2^(N+1),
+// so n*m < 2^(2N+1) = 2^63 cannot overflow. Magnitudes >= 2^N (unreachable for
+// this network's int32 dot products of at most ~2^25, but handled anyway) fall
+// back to the real division, so the result equals div_round_by_scale for every
+// int64 input: same rounding (half away from zero), same sign handling.
+struct RoundingDivider {
+    static constexpr uint32_t kMagicBits = 31;
+
+    uint64_t magic = 0;
+    uint32_t shift = 0;
+    uint32_t half = 0;
+    uint32_t divisor = 1;
+
+    bool init(int32_t scale) {
+        if (scale <= 0 || scale > 255) {
+            return false;
+        }
+        const uint32_t d = static_cast<uint32_t>(scale);
+        uint32_t l = 0;
+        while ((1U << l) < d) {
+            ++l;
+        }
+        shift = kMagicBits + l;
+        magic = ((uint64_t{1} << shift) + d - 1) / d;
+        half = d / 2U;
+        divisor = d;
+        return true;
+    }
+
+    int64_t div_round(int64_t value) const {
+        const uint64_t magnitude = value >= 0
+            ? static_cast<uint64_t>(value)
+            : static_cast<uint64_t>(-value);
+        const uint64_t n = magnitude + half;
+        const uint64_t quotient = (n < (uint64_t{1} << kMagicBits))
+            ? (n * magic) >> shift
+            : n / divisor;
+        const int64_t signed_quotient = static_cast<int64_t>(quotient);
+        return value >= 0 ? signed_quotient : -signed_quotient;
+    }
+};
+
 struct LoadedNetwork {
     uint32_t version = 0;
     uint32_t output_perspective = 0;
@@ -225,6 +273,14 @@ struct LoadedNetwork {
     float inv_fc0_scale = 0.0f;
     float inv_fc1_scale = 0.0f;
     float inv_fc2_scale = 0.0f;
+
+    // Precomputed output-path "rounding glue": exact multiply-shift dividers for
+    // the per-eval div_round_by_scale calls, and the SqrCReLU renormalization
+    // screlu_lut[c] == div_round_by_scale(c * c, qfc0) for every uint8 c.
+    RoundingDivider div_act_one;
+    RoundingDivider div_qfc0;
+    RoundingDivider div_qfc1;
+    std::array<uint8_t, 256> screlu_lut{};
 
     std::array<int16_t, kExpectedFtSize> ft_bias{};
     AlignedFtWeights ft_weight;
@@ -2168,10 +2224,6 @@ uint8_t crelu_to_u8(int64_t value, int32_t scale) {
     return static_cast<uint8_t>(value);
 }
 
-uint8_t screlu_to_u8(uint8_t crelu, int32_t scale) {
-    return static_cast<uint8_t>(div_round_by_scale(static_cast<int64_t>(crelu) * crelu, scale));
-}
-
 IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& accumulators,
                                                         const LoadedNetwork& network,
                                                         int colour_to_move) {
@@ -2204,18 +2256,18 @@ IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& a
                      d0, d1, d2, d3);
 
         fc0[j] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j]) +
-                                      div_round_by_scale(d0, network.act_one));
+                                      network.div_act_one.div_round(d0));
         fc0[j + 1] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j + 1]) +
-                                          div_round_by_scale(d1, network.act_one));
+                                          network.div_act_one.div_round(d1));
         fc0[j + 2] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j + 2]) +
-                                          div_round_by_scale(d2, network.act_one));
+                                          network.div_act_one.div_round(d2));
         fc0[j + 3] = static_cast<int32_t>(static_cast<int64_t>(network.fc0_bias[j + 3]) +
-                                          div_round_by_scale(d3, network.act_one));
+                                          network.div_act_one.div_round(d3));
     }
 
     for (int i = 0; i < static_cast<int>(kExpectedHiddenSize); ++i) {
         const uint8_t crelu = crelu_to_u8(fc0[i], network.qfc0);
-        a0[i] = screlu_to_u8(crelu, network.qfc0);
+        a0[i] = network.screlu_lut[crelu];
         a0[static_cast<int>(kExpectedHiddenSize) + i] = crelu;
     }
     if constexpr (kFc1InputPaddedSize > static_cast<int>(kExpectedFc1InputSize)) {
@@ -2236,19 +2288,19 @@ IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& a
                      d0, d1, d2, d3);
 
         a1[j] = crelu_to_u8(static_cast<int64_t>(network.fc1_bias[j]) +
-                            div_round_by_scale(d0, network.qfc0), network.qfc1);
+                            network.div_qfc0.div_round(d0), network.qfc1);
         a1[j + 1] = crelu_to_u8(static_cast<int64_t>(network.fc1_bias[j + 1]) +
-                                div_round_by_scale(d1, network.qfc0), network.qfc1);
+                                network.div_qfc0.div_round(d1), network.qfc1);
         a1[j + 2] = crelu_to_u8(static_cast<int64_t>(network.fc1_bias[j + 2]) +
-                                div_round_by_scale(d2, network.qfc0), network.qfc1);
+                                network.div_qfc0.div_round(d2), network.qfc1);
         a1[j + 3] = crelu_to_u8(static_cast<int64_t>(network.fc1_bias[j + 3]) +
-                                div_round_by_scale(d3, network.qfc0), network.qfc1);
+                                network.div_qfc0.div_round(d3), network.qfc1);
     }
 
     const int32_t fc2_dot = dot_u8_i8(a1.data(), network.fc2_weight.data(), kExpectedFc1OutputSize);
     return {
         static_cast<int32_t>(static_cast<int64_t>(network.fc2_bias) +
-                             div_round_by_scale(fc2_dot, network.qfc1)),
+                             network.div_qfc1.div_round(fc2_dot)),
         fc0[static_cast<int>(kExpectedHiddenSize)]
     };
 }
@@ -2650,6 +2702,17 @@ bool load_network_from_stream(std::istream& stream,
     network.inv_fc0_scale = 1.0f / fc0_scale;
     network.inv_fc1_scale = 1.0f / fc1_scale;
     network.inv_fc2_scale = 1.0f / fc2_scale;
+
+    if (!network.div_act_one.init(act_one) ||
+        !network.div_qfc0.init(qfc0) ||
+        !network.div_qfc1.init(qfc1)) {
+        error = "output scales out of range";
+        return false;
+    }
+    for (int c = 0; c < 256; ++c) {
+        network.screlu_lut[static_cast<std::size_t>(c)] = static_cast<uint8_t>(
+            div_round_by_scale(static_cast<int64_t>(c) * c, qfc0));
+    }
 
     std::copy(ft_bias_q.begin(), ft_bias_q.end(), network.ft_bias.begin());
     network.ft_weight = std::move(ft_weight_q);
