@@ -42,7 +42,8 @@ uint64_t Position::castling_hashkey[16]{};
 uint64_t Position::colour_to_move_hashkey = 0ULL;
 
 NnueStack::NnueStack()
-    : states(std::make_unique<std::array<NnueState, MAX_DEPTH + 1>>()) {}
+    : states(std::make_unique<std::array<NnueState, MAX_DEPTH + 1>>()),
+      cache(std::make_unique<NnueRefreshCache>()) {}
 
 NnueStack::NnueStack(const NnueStack& other)
     : NnueStack() {

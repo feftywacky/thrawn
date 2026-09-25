@@ -245,6 +245,10 @@ struct LoadedNetwork {
 std::mutex g_network_mutex;
 std::shared_ptr<const LoadedNetwork> g_network_owner;
 std::atomic<const LoadedNetwork*> g_network_raw{nullptr};
+// Bumped on every network (re)load or unload. Refresh-cache entries record the
+// generation they were built for, so a stale entry is rebuilt on first use.
+// Starts at 1 so zero-initialized cache entries are always stale.
+std::atomic<uint32_t> g_network_generation{1};
 
 bool host_is_little_endian() {
     const uint16_t endian_probe = 0x0102;
@@ -1347,46 +1351,196 @@ bool refresh_perspective_accumulator(thrawn::NnueState& state,
 }
 
 
-bool refresh_perspective_accumulator_from_board(const thrawn::Position* pos,
-                                                thrawn::NnueState& state,
-                                                const LoadedNetwork& network,
-                                                bool white_perspective) {
-    if (pos == nullptr) {
+// dst = src + sum(add rows) - sum(sub rows), with an optional second copy of
+// the result written to dst2. The accumulator is processed in register tiles
+// (all rows folded into a tile before it is stored), so src/dst are read and
+// written exactly once however many rows are applied. Every op is wrapping
+// int16 arithmetic, so the result is bit-identical to applying the rows one
+// at a time in any order.
+void apply_feature_rows_tiled(const int16_t* src,
+                              int16_t* dst,
+                              int16_t* dst2,
+                              const int16_t* const* adds,
+                              int add_count,
+                              const int16_t* const* subs,
+                              int sub_count) {
+#if defined(USE_AVX512)
+    constexpr int kLanes = 32;
+    constexpr int kRegs = 8;
+    static_assert(kExpectedFtSize % (kLanes * kRegs) == 0, "FT size must fit AVX-512 refresh tiles");
+    for (int base = 0; base < static_cast<int>(kExpectedFtSize); base += kLanes * kRegs) {
+        __m512i r[kRegs];
+        for (int j = 0; j < kRegs; ++j) {
+            r[j] = _mm512_load_si512(reinterpret_cast<const void*>(src + base + j * kLanes));
+        }
+        for (int a = 0; a < add_count; ++a) {
+            const int16_t* row = adds[a] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = _mm512_add_epi16(r[j], _mm512_load_si512(reinterpret_cast<const void*>(row + j * kLanes)));
+            }
+        }
+        for (int s = 0; s < sub_count; ++s) {
+            const int16_t* row = subs[s] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = _mm512_sub_epi16(r[j], _mm512_load_si512(reinterpret_cast<const void*>(row + j * kLanes)));
+            }
+        }
+        for (int j = 0; j < kRegs; ++j) {
+            _mm512_store_si512(reinterpret_cast<void*>(dst + base + j * kLanes), r[j]);
+        }
+        if (dst2 != nullptr) {
+            for (int j = 0; j < kRegs; ++j) {
+                _mm512_store_si512(reinterpret_cast<void*>(dst2 + base + j * kLanes), r[j]);
+            }
+        }
+    }
+#elif defined(USE_AVX2)
+    constexpr int kLanes = 16;
+    constexpr int kRegs = 8;
+    static_assert(kExpectedFtSize % (kLanes * kRegs) == 0, "FT size must fit AVX2 refresh tiles");
+    for (int base = 0; base < static_cast<int>(kExpectedFtSize); base += kLanes * kRegs) {
+        __m256i r[kRegs];
+        for (int j = 0; j < kRegs; ++j) {
+            r[j] = _mm256_load_si256(reinterpret_cast<const __m256i*>(src + base + j * kLanes));
+        }
+        for (int a = 0; a < add_count; ++a) {
+            const int16_t* row = adds[a] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = _mm256_add_epi16(r[j], _mm256_load_si256(reinterpret_cast<const __m256i*>(row + j * kLanes)));
+            }
+        }
+        for (int s = 0; s < sub_count; ++s) {
+            const int16_t* row = subs[s] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = _mm256_sub_epi16(r[j], _mm256_load_si256(reinterpret_cast<const __m256i*>(row + j * kLanes)));
+            }
+        }
+        for (int j = 0; j < kRegs; ++j) {
+            _mm256_store_si256(reinterpret_cast<__m256i*>(dst + base + j * kLanes), r[j]);
+        }
+        if (dst2 != nullptr) {
+            for (int j = 0; j < kRegs; ++j) {
+                _mm256_store_si256(reinterpret_cast<__m256i*>(dst2 + base + j * kLanes), r[j]);
+            }
+        }
+    }
+#elif defined(USE_NEON)
+    constexpr int kLanes = 8;
+    constexpr int kRegs = 16;
+    static_assert(kExpectedFtSize % (kLanes * kRegs) == 0, "FT size must fit NEON refresh tiles");
+    for (int base = 0; base < static_cast<int>(kExpectedFtSize); base += kLanes * kRegs) {
+        int16x8_t r[kRegs];
+        for (int j = 0; j < kRegs; ++j) {
+            r[j] = vld1q_s16(src + base + j * kLanes);
+        }
+        for (int a = 0; a < add_count; ++a) {
+            const int16_t* row = adds[a] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = vaddq_s16(r[j], vld1q_s16(row + j * kLanes));
+            }
+        }
+        for (int s = 0; s < sub_count; ++s) {
+            const int16_t* row = subs[s] + base;
+            for (int j = 0; j < kRegs; ++j) {
+                r[j] = vsubq_s16(r[j], vld1q_s16(row + j * kLanes));
+            }
+        }
+        for (int j = 0; j < kRegs; ++j) {
+            vst1q_s16(dst + base + j * kLanes, r[j]);
+        }
+        if (dst2 != nullptr) {
+            for (int j = 0; j < kRegs; ++j) {
+                vst1q_s16(dst2 + base + j * kLanes, r[j]);
+            }
+        }
+    }
+#else
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
+        int32_t value = src[i];
+        for (int a = 0; a < add_count; ++a) {
+            value += adds[a][i];
+        }
+        for (int s = 0; s < sub_count; ++s) {
+            value -= subs[s][i];
+        }
+        dst[i] = static_cast<int16_t>(value);
+        if (dst2 != nullptr) {
+            dst2[i] = static_cast<int16_t>(value);
+        }
+    }
+#endif
+}
+
+// Refresh one perspective through the position's refresh cache: take the cached
+// accumulator for this (perspective, king square), apply only the features that
+// differ between its stored bitboards and the live board, store the result back
+// into the cache and into `state`. Exact (bit-identical to a from-scratch
+// refresh) because the cached accumulator is always ft_bias plus exactly the
+// rows of the pieces in its stored bitboards.
+bool refresh_perspective_accumulator_cached(thrawn::Position* pos,
+                                            thrawn::NnueState& state,
+                                            const LoadedNetwork& network,
+                                            bool white_perspective) {
+    const uint64_t king_bb = pos->piece_bitboards[white_perspective ? K : k];
+    if (king_bb == 0) {
         return false;
+    }
+    const int our_king_square = get_lsb_index(king_bb);
+
+    thrawn::NnueRefreshEntry& entry =
+        pos->nnue_stack.refresh_cache().entries[white_perspective ? 1 : 0][our_king_square];
+    const uint32_t generation = g_network_generation.load(std::memory_order_relaxed);
+    if (entry.generation != generation) {
+        entry.acc = network.ft_bias;
+        entry.bitboards.fill(0ULL);
+        entry.generation = generation;
+    }
+
+    // Pieces sit on distinct squares, so each side of the diff has at most 64 bits.
+    const int16_t* adds[BOARD_SIZE];
+    const int16_t* subs[BOARD_SIZE];
+    int add_count = 0;
+    int sub_count = 0;
+    const int16_t* weights = network.ft_weight.data();
+
+    for (int piece = P; piece <= k; ++piece) {
+        const uint64_t current = pos->piece_bitboards[piece];
+        const uint64_t cached = entry.bitboards[piece];
+        uint64_t added = current & ~cached;
+        uint64_t removed = cached & ~current;
+        while (added) {
+            const int square = pop_lsb(added);
+            const int feature = halfkav2_hm_index(piece, square, our_king_square, white_perspective);
+            if (feature < 0) {
+                return false;
+            }
+            adds[add_count++] = weights + static_cast<std::size_t>(feature) * kExpectedFtSize;
+        }
+        while (removed) {
+            const int square = pop_lsb(removed);
+            const int feature = halfkav2_hm_index(piece, square, our_king_square, white_perspective);
+            if (feature < 0) {
+                return false;
+            }
+            subs[sub_count++] = weights + static_cast<std::size_t>(feature) * kExpectedFtSize;
+        }
     }
 
     auto& acc = white_perspective ? state.white_acc : state.black_acc;
-    mark_accumulator_local(state, white_perspective);
-    acc = network.ft_bias;
-
-    const int our_king_square = white_perspective
-        ? get_lsb_index(pos->piece_bitboards[K])
-        : get_lsb_index(pos->piece_bitboards[k]);
-    if (our_king_square < 0 || our_king_square >= BOARD_SIZE) {
-        return false;
+    apply_feature_rows_tiled(entry.acc.data(), entry.acc.data(), acc.data(),
+                             adds, add_count, subs, sub_count);
+    for (int piece = P; piece <= k; ++piece) {
+        entry.bitboards[piece] = pos->piece_bitboards[piece];
     }
 
+    mark_accumulator_local(state, white_perspective);
     if (white_perspective) {
         state.white_king_sq = static_cast<int8_t>(our_king_square);
     } else {
         state.black_king_sq = static_cast<int8_t>(our_king_square);
     }
-
-    for (int piece = P; piece <= k; ++piece) {
-        uint64_t bitboard = pos->piece_bitboards[piece];
-        while (bitboard) {
-            const int square = pop_lsb(bitboard);
-            const int feature = halfkav2_hm_index(piece, square, our_king_square, white_perspective);
-            if (feature < 0 || !add_accumulator_row(acc, network.ft_weight, feature)) {
-                return false;
-            }
-        }
-    }
-
     return true;
 }
-
-
 
 bool collect_feature_update_for_perspective(const thrawn::NnueState& state,
                                             const NnuePieceUpdate& update,
@@ -1508,10 +1662,10 @@ bool apply_piece_updates_to_state(thrawn::Position* pos,
         }
     }
 
-    if (refresh_white && !refresh_perspective_accumulator_from_board(pos, state, network, true)) {
+    if (refresh_white && !refresh_perspective_accumulator_cached(pos, state, network, true)) {
         return false;
     }
-    if (refresh_black && !refresh_perspective_accumulator_from_board(pos, state, network, false)) {
+    if (refresh_black && !refresh_perspective_accumulator_cached(pos, state, network, false)) {
         return false;
     }
 
@@ -2565,6 +2719,7 @@ void activate_network(LoadedNetwork&& loaded) {
     std::lock_guard<std::mutex> lock(g_network_mutex);
     g_network_owner = network;
     g_network_raw.store(network.get(), std::memory_order_release);
+    g_network_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void nnue_init(const char* evalFile) {
@@ -2618,6 +2773,7 @@ void nnue_init(const char* evalFile) {
         std::lock_guard<std::mutex> lock(g_network_mutex);
         g_network_owner.reset();
         g_network_raw.store(nullptr, std::memory_order_release);
+        g_network_generation.fetch_add(1, std::memory_order_acq_rel);
     }
 
     std::cout << "info string Failed to load NNUE";
