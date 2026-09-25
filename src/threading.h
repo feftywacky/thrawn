@@ -82,8 +82,13 @@ public:
     // Constructor initializes all arrays to zero and flags to false.
     ThreadData();
 
-    // Reset the thread data between searches.
+    // Reset the per-search state. Move-ordering and correction histories are
+    // deliberately kept: what was learned searching the previous move is still
+    // true of this position's subtree.
     void resetThreadData();
+
+    // Wipe the learned tables. Only on a new game (and between bench positions).
+    void clearHistory();
 
     void recordRootMove(int move, int bound);
 

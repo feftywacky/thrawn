@@ -87,7 +87,17 @@ SearchResult::SearchResult()
 }
 
 ThreadData::ThreadData() {
+    clearHistory();
     resetThreadData();
+}
+
+void ThreadData::clearHistory() {
+    quiet_history = {};
+    continuation_history = {};
+    capture_history = {};
+    correction_history = {};
+    for (auto &row : counter_moves)
+        row.fill(0);
 }
 
 void ThreadData::resetThreadData() {
@@ -95,12 +105,6 @@ void ThreadData::resetThreadData() {
     for (auto &row : pv_table)
         row.fill(0);
     for (auto &row : killer_moves)
-        row.fill(0);
-    quiet_history = {};
-    continuation_history = {};
-    capture_history = {};
-    correction_history = {};
-    for (auto &row : counter_moves)
         row.fill(0);
     ply_moves.fill(0);
     static_eval_stack.fill(no_hashmap_entry);
@@ -187,7 +191,7 @@ static void print_result_info(const SearchResult& result) {
               << " nps " << (currentTime > 0
                     ? nodes * 1000 / static_cast<std::uint64_t>(currentTime)
                     : nodes)
-              << " hashfull " << tt->hashfullMb() << "/" << tt->hashSizeMb()
+              << " hashfull " << tt->hashfull()
               << " time " << currentTime
               << " score ";
 
@@ -229,7 +233,7 @@ static void print_iteration_info(ThreadData* td, int depth, int score, int bound
               << " nps " << (currentTime > 0
                     ? reportedNodes * 1000 / static_cast<std::uint64_t>(currentTime)
                     : reportedNodes)
-              << " hashfull " << tt->hashfullMb() << "/" << tt->hashSizeMb()
+              << " hashfull " << tt->hashfull()
               << " time " << currentTime;
 
     // Determine whether to report a mate score or a centipawn score

@@ -107,6 +107,21 @@ int piece_value(int piece) {
     return PIECE_VALUES[piece % 6];
 }
 
+bool side_to_move_in_check(thrawn::Position* pos) {
+    const uint64_t king = pos->piece_bitboards[pos->colour_to_move == white ? K : k];
+    return is_square_under_attack(pos, get_lsb_index(king), pos->colour_to_move ^ 1);
+}
+
+// The 50-move rule draws only if the side to move is not already mated: mate
+// on the hundredth half-move still wins. Reached rarely enough that counting
+// the legal replies is free in practice.
+int fifty_move_score(thrawn::Position* pos) {
+    if (pos->ply < MAX_DEPTH - 1 && side_to_move_in_check(pos) &&
+        count_legal_moves(pos) == 0)
+        return -mateVal + pos->ply;
+    return 0;
+}
+
 void count_node(ThreadData* td) {
     td->nodes++;
     if ((td->nodes & (NODE_COUNTER_BATCH - 1)) == 0) {
@@ -1120,6 +1135,9 @@ public:
         quietsSkipped = true;
     }
 
+    // True while handing out the history-ordered quiets.
+    bool in_quiet_stage() const { return stage == Stage::Quiets; }
+
     bool next(PickedMove& picked) {
         while (stage != Stage::Done) {
             switch (stage) {
@@ -1426,8 +1444,10 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         td->killer_moves[1][pos->ply + 2] = 0;
     }
 
-    if ((pos->ply && isRepetition(pos)) || pos->fifty_move >= 100)
+    if (pos->ply && isRepetition(pos))
         return 0;
+    if (pos->fifty_move >= 100)
+        return fifty_move_score(pos);
 
     // Mate distance pruning
     if (pos->ply)
@@ -1467,7 +1487,10 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     // Sticky PV marking: a node that has ever been on a PV keeps a wider
     // margin and a smaller reduction for the rest of the search.
     const bool ttPv = isPvNode || (ttHit && ttWasPv);
-    if (ttHit && !excludedNode && ttDepth >= depth && !isPvNode)
+    // Close to the 50-move horizon a stored score may belong to a line that is
+    // now a draw, so do not trust it for a cutoff.
+    if (ttHit && !excludedNode && ttDepth >= depth && !isPvNode &&
+        pos->fifty_move < 90)
     {
         if (ttFlag == BOUND_EXACT
             || (ttFlag == BOUND_LOWER && ttScore >= beta)
@@ -1603,7 +1626,10 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                     const int seeScore = probCutPicked.seeKnown
                         ? probCutPicked.seeScore
                         : static_exchange_eval(pos, move);
-                    if (seeScore < SEARCH_PROBCUT_SEE_MARGIN)
+                    // Only a capture that wins enough material to lift the static
+                    // eval over probCutBeta on its own is worth the search.
+                    if (seeScore < std::max(SEARCH_PROBCUT_SEE_MARGIN,
+                                            probCutBeta - static_eval))
                         continue;
                 }
 
@@ -1738,7 +1764,11 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 if (lmrDepth <= SEARCH_FUTILITY_MAX_DEPTH &&
                     eval + futility_margin(lmrDepth) <= alpha)
                 {
-                    movePicker.skip_quiets();
+                    // Quiets after this one in the history-ordered stage score no
+                    // better, so they would be pruned too. A killer or counter
+                    // move says nothing about the quiets still to come.
+                    if (movePicker.in_quiet_stage())
+                        movePicker.skip_quiets();
                     continue;
                 }
 
@@ -1964,8 +1994,13 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             update_quiet_history(td, parentSide, parentPly, bestMove, bonus);
             penalize_quiet_history(td, parentSide, parentPly, failed_quiet_moves, depth);
 
-            td->killer_moves[1][parentPly] = td->killer_moves[0][parentPly];
-            td->killer_moves[0][parentPly] = bestMove;
+            // Shift only a different move down, or both slots end up holding
+            // the same killer and the second one is wasted.
+            if (td->killer_moves[0][parentPly] != bestMove)
+            {
+                td->killer_moves[1][parentPly] = td->killer_moves[0][parentPly];
+                td->killer_moves[0][parentPly] = bestMove;
+            }
             update_counter_move(td, parentPly, bestMove);
         }
         else
@@ -2005,8 +2040,10 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
             return alpha;
     }
 
-    if ((pos->ply && isRepetition(pos)) || pos->fifty_move >= 100)
+    if (pos->ply && isRepetition(pos))
         return 0;
+    if (pos->fifty_move >= 100)
+        return fifty_move_score(pos);
 
     if (pos->ply)
     {
@@ -2042,7 +2079,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     // Qsearch only carries an existing PV marking forward; it never creates one,
     // or every capture sequence off a PV node would be marked.
     const bool ttPv = ttHit && ttWasPv;
-    if (ttHit && !isPvNode &&
+    if (ttHit && !isPvNode && pos->fifty_move < 90 &&
         (ttFlag == BOUND_EXACT ||
          (ttFlag == BOUND_LOWER && ttScore >= beta) ||
          (ttFlag == BOUND_UPPER && ttScore <= alpha)))
