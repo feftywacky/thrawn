@@ -20,7 +20,6 @@ constexpr int NNUE_FORWARD_SIZE = 1;
 constexpr int NNUE_FC0_OUTPUT_SIZE = NNUE_HIDDEN_SIZE + NNUE_FORWARD_SIZE;
 constexpr int NNUE_FC1_INPUT_SIZE = NNUE_HIDDEN_SIZE * 2;
 constexpr int NNUE_FC1_OUTPUT_SIZE = 32;
-constexpr int NNUE_MAX_PIECES = 32;
 constexpr int NNUE_SIMD_ALIGNMENT = 64;
 
 static_assert(NNUE_ACCUMULATOR_SIZE % 8 == 0, "NNUE accumulator must fit NEON lanes");
@@ -30,20 +29,10 @@ static_assert(NNUE_INPUT_FEATURES == 32 * NNUE_PS_NB, "HalfKAv2_hm feature count
 struct alignas(NNUE_SIMD_ALIGNMENT) NnueState {
     alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> white_acc{};
     alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> black_acc{};
-    std::array<uint8_t, NNUE_MAX_PIECES> piece_list{};
-    std::array<uint8_t, NNUE_MAX_PIECES> square_list{};
-    std::array<int8_t, BOARD_SIZE> index_by_square{};
     // -1 means local; otherwise this perspective reads from an ancestor ply until first write.
     int8_t white_acc_source_ply = -1;
     int8_t black_acc_source_ply = -1;
-    uint8_t piece_count = 0;
-    int8_t white_king_sq = -1;
-    int8_t black_king_sq = -1;
     bool valid = false;
-
-    NnueState() {
-        index_by_square.fill(-1);
-    }
 };
 
 // Accumulator refresh cache ("Finny table"). One entry per perspective per king

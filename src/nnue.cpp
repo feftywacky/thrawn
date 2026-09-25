@@ -548,14 +548,8 @@ const LoadedNetwork* current_network() {
 void clear_state(thrawn::NnueState& state) {
     state.white_acc.fill(0);
     state.black_acc.fill(0);
-    state.piece_list.fill(0);
-    state.square_list.fill(0);
-    state.index_by_square.fill(-1);
     state.white_acc_source_ply = kLocalAccumulatorSource;
     state.black_acc_source_ply = kLocalAccumulatorSource;
-    state.piece_count = 0;
-    state.white_king_sq = -1;
-    state.black_king_sq = -1;
     state.valid = false;
 }
 
@@ -650,12 +644,6 @@ void mark_accumulator_local(thrawn::NnueState& state, bool white_perspective) {
 void copy_state_metadata_without_accumulators(thrawn::NnueState& child,
                                               const thrawn::NnueState& parent,
                                               int child_ply) {
-    child.piece_list = parent.piece_list;
-    child.square_list = parent.square_list;
-    child.index_by_square = parent.index_by_square;
-    child.piece_count = parent.piece_count;
-    child.white_king_sq = parent.white_king_sq;
-    child.black_king_sq = parent.black_king_sq;
     child.valid = parent.valid;
 
     const int parent_ply = child_ply - 1;
@@ -1001,52 +989,6 @@ void ft_pairwise_screlu_neon(const int16_t* acc, uint8_t* out, int half, int ft_
 
 #endif
 
-bool update_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
-                            const AlignedFtWeights& weights,
-                            int feature,
-                            AccumulatorUpdateOp op) {
-    if (feature < 0) {
-        return false;
-    }
-
-    const std::size_t offset = static_cast<std::size_t>(feature) * kExpectedFtSize;
-    if (offset + kExpectedFtSize > weights.size()) {
-        return false;
-    }
-
-    const int16_t* row = weights.data() + offset;
-    int16_t* acc = accumulator.data();
-
-#if defined(USE_AVX512)
-    if (op == AccumulatorUpdateOp::Add) {
-        acc_add_row_avx512(acc, row);
-    } else {
-        acc_sub_row_avx512(acc, row);
-    }
-#elif defined(USE_AVX2)
-    if (op == AccumulatorUpdateOp::Add) {
-        acc_add_row_avx2(acc, row);
-    } else {
-        acc_sub_row_avx2(acc, row);
-    }
-#elif defined(USE_NEON)
-    if (op == AccumulatorUpdateOp::Add) {
-        acc_add_row_neon(acc, row);
-    } else {
-        acc_sub_row_neon(acc, row);
-    }
-#else
-    for (int i = 0; i < static_cast<int>(kExpectedFtSize); ++i) {
-        const int32_t value = (op == AccumulatorUpdateOp::Add)
-            ? static_cast<int32_t>(acc[i]) + row[i]
-            : static_cast<int32_t>(acc[i]) - row[i];
-        acc[i] = static_cast<int16_t>(value);
-    }
-#endif
-
-    return true;
-}
-
 bool update_accumulator_rows(std::array<int16_t, kExpectedFtSize>& accumulator,
                              const AlignedFtWeights& weights,
                              const AccumulatorFeatureUpdate* updates,
@@ -1310,103 +1252,6 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
     return true;
 }
 
-bool add_accumulator_row(std::array<int16_t, kExpectedFtSize>& accumulator,
-                         const AlignedFtWeights& weights,
-                         int feature) {
-    return update_accumulator_row(accumulator, weights, feature, AccumulatorUpdateOp::Add);
-}
-
-
-bool track_piece(thrawn::NnueState& state, int piece, int square) {
-    if (piece < P || piece > k ||
-        square < 0 || square >= BOARD_SIZE ||
-        state.piece_count >= thrawn::NNUE_MAX_PIECES) {
-        return false;
-    }
-    if (state.index_by_square[square] != -1) {
-        return false;
-    }
-
-    if (piece == K && state.white_king_sq != -1) {
-        return false;
-    }
-    if (piece == k && state.black_king_sq != -1) {
-        return false;
-    }
-
-    const int index = state.piece_count;
-    state.piece_list[index] = static_cast<uint8_t>(piece);
-    state.square_list[index] = static_cast<uint8_t>(square);
-    state.index_by_square[square] = static_cast<int8_t>(index);
-    state.piece_count = static_cast<uint8_t>(state.piece_count + 1);
-
-    if (piece == K) {
-        state.white_king_sq = static_cast<int8_t>(square);
-    } else if (piece == k) {
-        state.black_king_sq = static_cast<int8_t>(square);
-    }
-
-    return true;
-}
-
-bool untrack_piece(thrawn::NnueState& state, int piece, int square) {
-    if (square < 0 || square >= BOARD_SIZE) {
-        return false;
-    }
-
-    const int index = state.index_by_square[square];
-    if (index < 0 || index >= static_cast<int>(state.piece_count) || state.piece_list[index] != piece) {
-        return false;
-    }
-
-    if (piece == K) {
-        state.white_king_sq = -1;
-    } else if (piece == k) {
-        state.black_king_sq = -1;
-    }
-
-    const int last_index = static_cast<int>(state.piece_count) - 1;
-    state.index_by_square[square] = -1;
-
-    if (index != last_index) {
-        const uint8_t moved_piece = state.piece_list[last_index];
-        const uint8_t moved_square = state.square_list[last_index];
-        state.piece_list[index] = moved_piece;
-        state.square_list[index] = moved_square;
-        state.index_by_square[moved_square] = static_cast<int8_t>(index);
-    }
-
-    state.piece_list[last_index] = 0;
-    state.square_list[last_index] = 0;
-    state.piece_count = static_cast<uint8_t>(state.piece_count - 1);
-    return true;
-}
-
-bool refresh_perspective_accumulator(thrawn::NnueState& state,
-                                     const LoadedNetwork& network,
-                                     bool white_perspective) {
-    const int our_king_square = white_perspective ? state.white_king_sq : state.black_king_sq;
-    if (our_king_square < 0 || our_king_square >= BOARD_SIZE) {
-        return false;
-    }
-
-    auto& acc = white_perspective ? state.white_acc : state.black_acc;
-    mark_accumulator_local(state, white_perspective);
-    acc = network.ft_bias;
-
-    for (int i = 0; i < static_cast<int>(state.piece_count); ++i) {
-        const int piece = state.piece_list[i];
-        const int square = state.square_list[i];
-        const int feature = halfkav2_hm_index(piece, square, our_king_square, white_perspective);
-        if (feature < 0 || !add_accumulator_row(acc, network.ft_weight, feature)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-
 // dst = src + sum(add rows) - sum(sub rows), with an optional second copy of
 // the result written to dst2. The accumulator is processed in register tiles
 // (all rows folded into a tile before it is stored), so src/dst are read and
@@ -1590,26 +1435,51 @@ bool refresh_perspective_accumulator_cached(thrawn::Position* pos,
     }
 
     mark_accumulator_local(state, white_perspective);
-    if (white_perspective) {
-        state.white_king_sq = static_cast<int8_t>(our_king_square);
-    } else {
-        state.black_king_sq = static_cast<int8_t>(our_king_square);
-    }
     return true;
 }
 
-bool collect_feature_update_for_perspective(const thrawn::NnueState& state,
+// Full refresh of one perspective from the board: ft_bias plus the row of every
+// piece, folded in one register-tiled pass. Used where no refresh cache applies
+// (root builds, verification rebuilds).
+bool refresh_perspective_accumulator_full(const thrawn::Position* pos,
+                                          thrawn::NnueState& state,
+                                          const LoadedNetwork& network,
+                                          bool white_perspective) {
+    const uint64_t king_bb = pos->piece_bitboards[white_perspective ? K : k];
+    if (king_bb == 0) {
+        return false;
+    }
+    const int our_king_square = get_lsb_index(king_bb);
+
+    const int16_t* adds[BOARD_SIZE];
+    int add_count = 0;
+    const int16_t* weights = network.ft_weight.data();
+    for (int piece = P; piece <= k; ++piece) {
+        uint64_t bitboard = pos->piece_bitboards[piece];
+        while (bitboard) {
+            const int square = pop_lsb(bitboard);
+            const int feature = halfkav2_hm_index(piece, square, our_king_square, white_perspective);
+            if (feature < 0 || add_count >= BOARD_SIZE) {
+                return false;
+            }
+            adds[add_count++] = weights + static_cast<std::size_t>(feature) * kExpectedFtSize;
+        }
+    }
+
+    auto& acc = white_perspective ? state.white_acc : state.black_acc;
+    apply_feature_rows_tiled(network.ft_bias.data(), acc.data(), nullptr,
+                             adds, add_count, nullptr, 0);
+    mark_accumulator_local(state, white_perspective);
+    return true;
+}
+
+bool collect_feature_update_for_perspective(int our_king_square,
                                             const NnuePieceUpdate& update,
                                             bool white_perspective,
                                             AccumulatorFeatureUpdate* feature_updates,
                                             int& feature_update_count) {
     if (!should_patch_piece_for_perspective(update.piece, white_perspective)) {
         return true;
-    }
-
-    const int our_king_square = white_perspective ? state.white_king_sq : state.black_king_sq;
-    if (our_king_square < 0 || our_king_square >= BOARD_SIZE) {
-        return is_king_piece(update.piece);
     }
 
     const int feature = halfkav2_hm_index(update.piece,
@@ -1681,17 +1551,27 @@ bool apply_piece_updates_to_state(thrawn::Position* pos,
         }
     }
 
+    // The board is already in the post-move state, so its king squares are the
+    // ones the incremental (non-refreshed) perspectives are indexed by.
+    const int white_king_square = get_lsb_index(pos->piece_bitboards[K]);
+    const int black_king_square = get_lsb_index(pos->piece_bitboards[k]);
+    if (white_king_square < 0 || black_king_square < 0) {
+        return false;
+    }
+
     AccumulatorFeatureUpdate white_updates[kMaxBatchedPieceUpdates];
     AccumulatorFeatureUpdate black_updates[kMaxBatchedPieceUpdates];
     int white_update_count = 0;
     int black_update_count = 0;
     for (int i = 0; i < update_count; ++i) {
         if (!refresh_white &&
-            !collect_feature_update_for_perspective(state, updates[i], true, white_updates, white_update_count)) {
+            !collect_feature_update_for_perspective(white_king_square, updates[i], true,
+                                                    white_updates, white_update_count)) {
             return false;
         }
         if (!refresh_black &&
-            !collect_feature_update_for_perspective(state, updates[i], false, black_updates, black_update_count)) {
+            !collect_feature_update_for_perspective(black_king_square, updates[i], false,
+                                                    black_updates, black_update_count)) {
             return false;
         }
     }
@@ -1705,15 +1585,6 @@ bool apply_piece_updates_to_state(thrawn::Position* pos,
     if (black_update_count > 0) {
         if (!materialize_and_apply_rows(pos, ply, state, false, network.ft_weight,
                                         black_updates, black_update_count)) {
-            return false;
-        }
-    }
-
-    for (int i = 0; i < update_count; ++i) {
-        const bool ok = updates[i].add
-            ? track_piece(state, updates[i].piece, updates[i].square)
-            : untrack_piece(state, updates[i].piece, updates[i].square);
-        if (!ok) {
             return false;
         }
     }
@@ -1733,24 +1604,26 @@ bool build_state_from_board(const thrawn::Position* pos,
                             thrawn::NnueState& out_state) {
     clear_state(out_state);
 
+    // Sanity-check the board (at most 32 pieces on distinct squares, exactly one
+    // king per side) before building; an invalid state falls back to eval 0.
+    uint64_t occupied = 0ULL;
+    int piece_total = 0;
     for (int piece = P; piece <= k; ++piece) {
-        uint64_t bitboard = pos->piece_bitboards[piece];
-        while (bitboard) {
-            const int square = pop_lsb(bitboard);
-            if (!track_piece(out_state, piece, square)) {
-                clear_state(out_state);
-                return false;
-            }
+        const uint64_t bitboard = pos->piece_bitboards[piece];
+        if ((occupied & bitboard) != 0ULL) {
+            return false;
         }
+        occupied |= bitboard;
+        piece_total += count_bits(bitboard);
     }
-
-    if (out_state.white_king_sq < 0 || out_state.black_king_sq < 0) {
-        clear_state(out_state);
+    if (piece_total > 32 ||
+        count_bits(pos->piece_bitboards[K]) != 1 ||
+        count_bits(pos->piece_bitboards[k]) != 1) {
         return false;
     }
 
-    if (!refresh_perspective_accumulator(out_state, network, true) ||
-        !refresh_perspective_accumulator(out_state, network, false)) {
+    if (!refresh_perspective_accumulator_full(pos, out_state, network, true) ||
+        !refresh_perspective_accumulator_full(pos, out_state, network, false)) {
         clear_state(out_state);
         return false;
     }
@@ -2428,29 +2301,11 @@ bool verify_state_against_board(const thrawn::Position* pos,
         return fail("incremental accumulator source invalid");
     }
 
-    if (incremental.piece_count != rebuilt.piece_count) {
-        return fail("piece count mismatch");
-    }
-    if (incremental.white_king_sq != rebuilt.white_king_sq ||
-        incremental.black_king_sq != rebuilt.black_king_sq) {
-        return fail("king square mismatch");
-    }
     if (*incremental_accumulators.white != rebuilt.white_acc) {
         return fail("white accumulator mismatch");
     }
     if (*incremental_accumulators.black != rebuilt.black_acc) {
         return fail("black accumulator mismatch");
-    }
-
-    for (int square = 0; square < BOARD_SIZE; ++square) {
-        const int inc_index = incremental.index_by_square[square];
-        const int ref_index = rebuilt.index_by_square[square];
-        if ((inc_index == -1) != (ref_index == -1)) {
-            return fail("piece presence mismatch");
-        }
-        if (inc_index != -1 && incremental.piece_list[inc_index] != rebuilt.piece_list[ref_index]) {
-            return fail("piece identity mismatch");
-        }
     }
 
     const IntEvaluationResult incremental_raw =
