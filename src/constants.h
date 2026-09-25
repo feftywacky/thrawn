@@ -55,10 +55,20 @@ constexpr int SEARCH_CONTINUATION_HISTORY_DECAY_DENOMINATOR = 4;
 // positions that share it. Applied as weight * entry / 512.
 constexpr int SEARCH_CORRECTION_HISTORY_SIZE = 16384;
 constexpr int SEARCH_CORRECTION_HISTORY_MAX = 1024;
-constexpr int SEARCH_CORRECTION_HISTORY_WEIGHT = 64;
+constexpr int SEARCH_CORRECTION_HISTORY_WEIGHT = 24;
 constexpr int SEARCH_CORRECTION_HISTORY_DEPTH_DIVISOR = 8;
+// Further tables share the pawn table's update rule, each keyed on a different
+// slice of the position; their corrections add, weighted the same way.
+constexpr int SEARCH_NONPAWN_CORRECTION_WEIGHT = 24;
+constexpr int SEARCH_MINOR_CORRECTION_WEIGHT = 20;
+constexpr int SEARCH_CONT_CORRECTION_WEIGHT = 16;
 
 constexpr int SEARCH_QUEEN_PROMOTION_SCORE = 10499;
+
+// Quiet ordering, per unit of the moving piece's value: moving a piece out of
+// an attack by a cheaper piece, or into one.
+constexpr int SEARCH_THREAT_ESCAPE_BONUS = 50;
+constexpr int SEARCH_THREAT_ENTER_PENALTY = 45;
 
 // Reverse futility: margin scales with depth, one depth step cheaper when the
 // eval trend is with us. No lower depth bound beyond the floor.
@@ -116,6 +126,20 @@ constexpr int SEARCH_IIR_MIN_DEPTH = 4;
 constexpr int SEARCH_IIR_REDUCTION = 1;
 
 constexpr int SEARCH_QSEARCH_DELTA_MARGIN = 156;
+
+// Move-loop futility for captures (not checks): eval plus the victim still
+// cannot reach alpha.
+constexpr int SEARCH_CAPTURE_FUTILITY_MAX_DEPTH = 6;
+constexpr int SEARCH_CAPTURE_FUTILITY_BASE = 230;
+constexpr int SEARCH_CAPTURE_FUTILITY_DEPTH_FACTOR = 150;
+
+// Static eval shrinks toward a draw as the 50-move counter runs:
+// eval * (DIVISOR - fifty_move) / DIVISOR.
+constexpr int SEARCH_FIFTY_MOVE_DAMPING_DIVISOR = 220;
+
+// Aspiration: after a fail-high, the re-search runs up to this many plies
+// shallower than the iteration's depth.
+constexpr int SEARCH_ASPIRATION_MAX_FAIL_HIGH_REDUCTION = 3;
 constexpr int SEARCH_QSEARCH_SEE_MARGIN = -32;
 
 constexpr int SEARCH_SEE_PRUNE_MAX_DEPTH = 10;
@@ -144,8 +168,7 @@ constexpr int SEARCH_SMP_VOTE_SCORE_OFFSET = 14;
 // Time management
 // ----------------------------------------
 // `soft` gates whether another iterative deepening iteration is started; `hard`
-// aborts the search wherever it is. Values are Berserk's (src/uci.c,
-// src/search.c). See notes/time-management-2026-09.md.
+// aborts the search wherever it is. See notes/time-management-2026-09.md.
 
 // UCI "Move Overhead" option bounds, in ms. 50 is what keeps a reserve behind
 // each move once the clock settles into its low-time equilibrium.
@@ -180,8 +203,8 @@ constexpr double TM_STABILITY_BASE = 1.3110;
 constexpr double TM_STABILITY_STEP = 0.0533;
 constexpr int    TM_STABILITY_MAX  = 10;
 
-// (b) Score trend. Coefficients are Berserk's 0.0262 / 0.0261 divided by 1.85,
-// Thrawn's cp inflation versus the WDL-normalised scale the references print -
+// (b) Score trend. Coefficients 0.0262 / 0.0261 divided by 1.85, Thrawn's cp
+// inflation versus the WDL-normalised scale -
 // see the eval-scale calibration in notes/search-rewrite-2026-08.md.
 constexpr double TM_SCORE_BASE        = 0.1127;
 constexpr double TM_SCORE_RECENT_COEF = 0.0142;

@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <initializer_list>
+#include <type_traits>
 
 std::atomic<uint64_t> total_nodes(0);
 
@@ -107,6 +109,21 @@ int piece_value(int piece) {
     return PIECE_VALUES[piece % 6];
 }
 
+bool side_to_move_in_check(thrawn::Position* pos) {
+    const uint64_t king = pos->piece_bitboards[pos->colour_to_move == white ? K : k];
+    return is_square_under_attack(pos, get_lsb_index(king), pos->colour_to_move ^ 1);
+}
+
+// The 50-move rule draws only if the side to move is not already mated: mate
+// on the hundredth half-move still wins. Reached rarely enough that counting
+// the legal replies is free in practice.
+int fifty_move_score(thrawn::Position* pos) {
+    if (pos->ply < MAX_DEPTH - 1 && side_to_move_in_check(pos) &&
+        count_legal_moves(pos) == 0)
+        return -mateVal + pos->ply;
+    return 0;
+}
+
 void count_node(ThreadData* td) {
     td->nodes++;
     if ((td->nodes & (NODE_COUNTER_BATCH - 1)) == 0) {
@@ -130,24 +147,90 @@ int evaluate_static(thrawn::Position* pos, int cachedStaticEval, bool ttHit) {
 // Keyed on pawn structure, not the full position key: a correction learned in
 // one position then applies to every position sharing that structure, which is
 // the whole point of the table.
-int correction_history_index(const thrawn::Position* pos) {
-    static_assert((SEARCH_CORRECTION_HISTORY_SIZE & (SEARCH_CORRECTION_HISTORY_SIZE - 1)) == 0,
-                  "correction history size must be a power of two");
-    uint64_t key = pos->piece_bitboards[P] * 0x9E3779B97F4A7C15ULL ^
-                   pos->piece_bitboards[p] * 0xC2B2AE3D27D4EB4FULL;
+static_assert((SEARCH_CORRECTION_HISTORY_SIZE & (SEARCH_CORRECTION_HISTORY_SIZE - 1)) == 0,
+              "correction history size must be a power of two");
+
+constexpr std::array<uint64_t, 12> kCorrectionMix = {
+    0x9E3779B97F4A7C15ULL, 0xBF58476D1CE4E5B9ULL, 0x94D049BB133111EBULL,
+    0xD6E8FEB86659FD93ULL, 0xA0761D6478BD642FULL, 0xE7037ED1A0B428DBULL,
+    0xC2B2AE3D27D4EB4FULL, 0x8EBC6AF09C88C6E3ULL, 0x589965CC75374CC3ULL,
+    0x1D8E4E27C47D124FULL, 0xFF51AFD7ED558CCDULL, 0xC4CEB9FE1A85EC53ULL,
+};
+
+int correction_key_index(uint64_t key) {
     key ^= key >> 29;
+    key *= 0xBF58476D1CE4E5B9ULL;
+    key ^= key >> 32;
     return static_cast<int>(key) & (SEARCH_CORRECTION_HISTORY_SIZE - 1);
 }
 
-int correction_value(ThreadData* td, thrawn::Position* pos) {
-    const int entry = td->correction_history[pos->colour_to_move]
-                                            [correction_history_index(pos)];
-    return SEARCH_CORRECTION_HISTORY_WEIGHT * entry / 512;
+uint64_t mix_pieces(const thrawn::Position* pos, std::initializer_list<int> pieces) {
+    uint64_t key = 0;
+    for (int piece : pieces)
+        key ^= pos->piece_bitboards[piece] * kCorrectionMix[piece];
+    return key;
 }
 
-int corrected_static_eval(int rawStaticEval, int correction) {
-    return std::clamp(rawStaticEval + correction, -mateScore + MAX_DEPTH,
+// Keyed on pawn structure, not the full position key: a correction learned in
+// one position then applies to every position sharing that structure, which is
+// the whole point of the table.
+int correction_history_index(const thrawn::Position* pos) {
+    return correction_key_index(mix_pieces(pos, {P, p}));
+}
+
+// One colour's pieces other than pawns, king included.
+int nonpawn_correction_index(const thrawn::Position* pos, int colour) {
+    return colour == white ? correction_key_index(mix_pieces(pos, {N, B, R, Q, K}))
+                           : correction_key_index(mix_pieces(pos, {n, b, r, q, k}));
+}
+
+int minor_correction_index(const thrawn::Position* pos) {
+    return correction_key_index(mix_pieces(pos, {N, B, K, n, b, k}));
+}
+
+int previous_ply_move(ThreadData* td, int ply, int pliesBack = 1);
+
+// The pair of moves that led here, or nullptr at the root / after a null move.
+int16_t* continuation_correction_entry(ThreadData* td, int ply) {
+    const int move1 = previous_ply_move(td, ply, 1);
+    const int move2 = previous_ply_move(td, ply, 2);
+    if (!move1 || !move2)
+        return nullptr;
+    return &td->continuation_correction_history[get_move_piece(move2)]
+                                               [get_move_target(move2)]
+                                               [get_move_piece(move1)]
+                                               [get_move_target(move1)];
+}
+
+int correction_value(ThreadData* td, thrawn::Position* pos) {
+    const int stm = pos->colour_to_move;
+    int weighted =
+        SEARCH_CORRECTION_HISTORY_WEIGHT *
+            td->correction_history[stm][correction_history_index(pos)] +
+        SEARCH_NONPAWN_CORRECTION_WEIGHT *
+            (td->nonpawn_correction_history[stm][white][nonpawn_correction_index(pos, white)] +
+             td->nonpawn_correction_history[stm][black][nonpawn_correction_index(pos, black)]) +
+        SEARCH_MINOR_CORRECTION_WEIGHT *
+            td->minor_correction_history[stm][minor_correction_index(pos)];
+    if (const int16_t* cont = continuation_correction_entry(td, pos->ply))
+        weighted += SEARCH_CONT_CORRECTION_WEIGHT * *cont;
+    return weighted / 512;
+}
+
+// The raw eval is what the TT holds; the 50-move counter is not part of the
+// key, so damping is applied here, after the table.
+int corrected_static_eval(const thrawn::Position* pos, int rawStaticEval, int correction) {
+    const int damped = rawStaticEval * (SEARCH_FIFTY_MOVE_DAMPING_DIVISOR - pos->fifty_move) /
+                       SEARCH_FIFTY_MOVE_DAMPING_DIVISOR;
+    return std::clamp(damped + correction, -mateScore + MAX_DEPTH,
                       mateScore - MAX_DEPTH);
+}
+
+// A repetition scores a hair either side of zero, keyed off the node count, so
+// the search does not see every drawing line as exactly equal and walk into
+// one blindly.
+int draw_score(const ThreadData* td) {
+    return 1 - static_cast<int>(td->nodes & 2);
 }
 
 NodeContext make_node_context(ThreadData* td, int ply, int staticEval, bool cutNode) {
@@ -184,15 +267,24 @@ void update_correction_history(ThreadData* td, thrawn::Position* pos, int static
         return;
     }
 
-    int& entry = td->correction_history[pos->colour_to_move]
-                                       [correction_history_index(pos)];
     const int bonus = std::clamp((score - staticEval) * depth /
                                      SEARCH_CORRECTION_HISTORY_DEPTH_DIVISOR,
                                  -SEARCH_CORRECTION_HISTORY_MAX / 4,
                                  SEARCH_CORRECTION_HISTORY_MAX / 4);
-    entry += bonus - entry * std::abs(bonus) / SEARCH_CORRECTION_HISTORY_MAX;
-    entry = std::clamp(entry, -SEARCH_CORRECTION_HISTORY_MAX,
-                       SEARCH_CORRECTION_HISTORY_MAX);
+    auto update = [bonus](auto& entry) {
+        int value = entry;
+        value += bonus - value * std::abs(bonus) / SEARCH_CORRECTION_HISTORY_MAX;
+        entry = static_cast<std::remove_reference_t<decltype(entry)>>(
+            std::clamp(value, -SEARCH_CORRECTION_HISTORY_MAX, SEARCH_CORRECTION_HISTORY_MAX));
+    };
+
+    const int stm = pos->colour_to_move;
+    update(td->correction_history[stm][correction_history_index(pos)]);
+    update(td->nonpawn_correction_history[stm][white][nonpawn_correction_index(pos, white)]);
+    update(td->nonpawn_correction_history[stm][black][nonpawn_correction_index(pos, black)]);
+    update(td->minor_correction_history[stm][minor_correction_index(pos)]);
+    if (int16_t* cont = continuation_correction_entry(td, pos->ply))
+        update(*cont);
 }
 
 bool is_slider_piece(int piece) {
@@ -440,8 +532,6 @@ int history_malus(int depth) {
                     SEARCH_HISTORY_MALUS_MAX);
 }
 
-int previous_ply_move(ThreadData* td, int ply, int pliesBack = 1);
-
 template <typename Entry>
 void update_history_entry(Entry& entry, int bonus) {
     const int history_max = std::max(1, SEARCH_HISTORY_MAX);
@@ -468,9 +558,43 @@ int continuation_history_score(ThreadData* td, int ply, int move) {
     return score;
 }
 
+ThreatInfo compute_threats(thrawn::Position* pos, int them) {
+    ThreatInfo t{0, 0, 0, 0};
+    const uint64_t occupancy = pos->occupancies[both];
+    const int offset = them == white ? 0 : 6;
+
+    for (uint64_t bb = pos->piece_bitboards[P + offset]; bb; bb &= bb - 1)
+        t.byPawn |= pos->pawn_attacks[them][get_lsb_index(bb)];
+    for (uint64_t bb = pos->piece_bitboards[N + offset]; bb; bb &= bb - 1)
+        t.byMinor |= pos->knight_attacks[get_lsb_index(bb)];
+    for (uint64_t bb = pos->piece_bitboards[B + offset]; bb; bb &= bb - 1)
+        t.byMinor |= get_bishop_attacks(pos, get_lsb_index(bb), occupancy);
+    for (uint64_t bb = pos->piece_bitboards[R + offset]; bb; bb &= bb - 1)
+        t.byRook |= get_rook_attacks(pos, get_lsb_index(bb), occupancy);
+
+    uint64_t rest = 0;
+    for (uint64_t bb = pos->piece_bitboards[Q + offset]; bb; bb &= bb - 1)
+        rest |= get_queen_attacks(pos, get_lsb_index(bb), occupancy);
+    for (uint64_t bb = pos->piece_bitboards[K + offset]; bb; bb &= bb - 1)
+        rest |= pos->king_attacks[get_lsb_index(bb)];
+
+    t.all = t.byPawn | t.byMinor | t.byRook | rest;
+    return t;
+}
+
+void set_threats(ThreadData* td, thrawn::Position* pos) {
+    td->threats[pos->ply] = compute_threats(pos, pos->colour_to_move ^ 1);
+}
+
+int& quiet_history_entry(ThreadData* td, int side, int ply, int move) {
+    const uint64_t attacked = td->threats[ply].all;
+    const int from = get_move_source(move);
+    const int to = get_move_target(move);
+    return td->quiet_history[side][(attacked >> from) & 1][(attacked >> to) & 1][from][to];
+}
+
 int quiet_history_score(ThreadData* td, int side, int ply, int move) {
-    const int fromTo = td->quiet_history[side][get_move_source(move)]
-                                        [get_move_target(move)];
+    const int fromTo = quiet_history_entry(td, side, ply, move);
     return 2 * fromTo + continuation_history_score(td, ply, move);
 }
 
@@ -495,8 +619,7 @@ void update_continuation_history(ThreadData* td, int ply, int move, int bonus) {
 }
 
 void update_quiet_history(ThreadData* td, int side, int ply, int move, int bonus) {
-    update_history_entry(td->quiet_history[side][get_move_source(move)]
-                                           [get_move_target(move)], bonus);
+    update_history_entry(quiet_history_entry(td, side, ply, move), bonus);
     update_continuation_history(td, ply, move,
                                 bonus * SEARCH_CONTINUATION_HISTORY_NUMERATOR /
                                     SEARCH_CONTINUATION_HISTORY_DENOMINATOR);
@@ -834,7 +957,23 @@ bool move_is_pseudo_legal(thrawn::Position* pos, int move, int moveType) {
 // buffer, so anything scored here is an ordinary quiet: history alone orders it,
 // unclamped, or every well established quiet would tie at the clamp.
 int quiet_move_score(ThreadData* td, int side, int ply, int move) {
-    return quiet_history_score(td, side, ply, move);
+    int score = quiet_history_score(td, side, ply, move);
+
+    const int piece = get_move_piece(move);
+    const int type = piece % 6;
+    if (type == PAWN || type == KING)
+        return score;
+
+    const ThreatInfo& t = td->threats[ply];
+    const uint64_t byLesser = type == QUEEN ? (t.byPawn | t.byMinor | t.byRook)
+                            : type == ROOK  ? (t.byPawn | t.byMinor)
+                                            : t.byPawn;
+    const int value = piece_value(piece);
+    if (byLesser & square_bb(get_move_target(move)))
+        score -= SEARCH_THREAT_ENTER_PENALTY * value;
+    else if (byLesser & square_bb(get_move_source(move)))
+        score += SEARCH_THREAT_ESCAPE_BONUS * value;
+    return score;
 }
 
 int tactical_move_score(thrawn::Position* pos, ThreadData* td, int move) {
@@ -1119,6 +1258,9 @@ public:
         }
         quietsSkipped = true;
     }
+
+    // True while handing out the history-ordered quiets.
+    bool in_quiet_stage() const { return stage == Stage::Quiets; }
 
     bool next(PickedMove& picked) {
         while (stage != Stage::Done) {
@@ -1426,8 +1568,10 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         td->killer_moves[1][pos->ply + 2] = 0;
     }
 
-    if ((pos->ply && isRepetition(pos)) || pos->fifty_move >= 100)
-        return 0;
+    if (pos->ply && isRepetition(pos))
+        return draw_score(td);
+    if (pos->fifty_move >= 100)
+        return fifty_move_score(pos);
 
     // Mate distance pruning
     if (pos->ply)
@@ -1467,7 +1611,10 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     // Sticky PV marking: a node that has ever been on a PV keeps a wider
     // margin and a smaller reduction for the rest of the search.
     const bool ttPv = isPvNode || (ttHit && ttWasPv);
-    if (ttHit && !excludedNode && ttDepth >= depth && !isPvNode)
+    // Close to the 50-move horizon a stored score may belong to a line that is
+    // now a draw, so do not trust it for a cutoff.
+    if (ttHit && !excludedNode && ttDepth >= depth && !isPvNode &&
+        pos->fifty_move < 90)
     {
         if (ttFlag == BOUND_EXACT
             || (ttFlag == BOUND_LOWER && ttScore >= beta)
@@ -1480,7 +1627,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     if (!inCheck)
     {
         raw_static_eval = evaluate_static(pos, ttStaticEval, ttHit);
-        static_eval = corrected_static_eval(raw_static_eval, correction_value(td, pos));
+        static_eval = corrected_static_eval(pos, raw_static_eval, correction_value(td, pos));
     }
     else
     {
@@ -1491,6 +1638,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     }
     eval = static_eval;
     td->static_eval_stack[pos->ply] = static_eval;
+    td->in_check_stack[pos->ply] = inCheck;
+    set_threats(td, pos);
 
     nodeContext = make_node_context(td, pos->ply, static_eval, cutNode);
 
@@ -1603,7 +1752,10 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                     const int seeScore = probCutPicked.seeKnown
                         ? probCutPicked.seeScore
                         : static_exchange_eval(pos, move);
-                    if (seeScore < SEARCH_PROBCUT_SEE_MARGIN)
+                    // Only a capture that wins enough material to lift the static
+                    // eval over probCutBeta on its own is worth the search.
+                    if (seeScore < std::max(SEARCH_PROBCUT_SEE_MARGIN,
+                                            probCutBeta - static_eval))
                         continue;
                 }
 
@@ -1724,6 +1876,13 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             // is exactly the kind of move the quiet margins would throw away.
             if (!quietMove || gives_check())
             {
+                if (captureMove && !get_promoted_piece(move) && !gives_check() &&
+                    lmrDepth <= SEARCH_CAPTURE_FUTILITY_MAX_DEPTH &&
+                    eval + SEARCH_CAPTURE_FUTILITY_BASE +
+                        SEARCH_CAPTURE_FUTILITY_DEPTH_FACTOR * lmrDepth +
+                        piece_value(capture_history_victim(pos, move)) <= alpha)
+                    continue;
+
                 if (depth <= SEARCH_SEE_PRUNE_MAX_DEPTH)
                 {
                     const int seeScore = picked.seeKnown
@@ -1738,7 +1897,11 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 if (lmrDepth <= SEARCH_FUTILITY_MAX_DEPTH &&
                     eval + futility_margin(lmrDepth) <= alpha)
                 {
-                    movePicker.skip_quiets();
+                    // Quiets after this one in the history-ordered stage score no
+                    // better, so they would be pruned too. A killer or counter
+                    // move says nothing about the quiets still to come.
+                    if (movePicker.in_quiet_stage())
+                        movePicker.skip_quiets();
                     continue;
                 }
 
@@ -1964,8 +2127,13 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             update_quiet_history(td, parentSide, parentPly, bestMove, bonus);
             penalize_quiet_history(td, parentSide, parentPly, failed_quiet_moves, depth);
 
-            td->killer_moves[1][parentPly] = td->killer_moves[0][parentPly];
-            td->killer_moves[0][parentPly] = bestMove;
+            // Shift only a different move down, or both slots end up holding
+            // the same killer and the second one is wasted.
+            if (td->killer_moves[0][parentPly] != bestMove)
+            {
+                td->killer_moves[1][parentPly] = td->killer_moves[0][parentPly];
+                td->killer_moves[0][parentPly] = bestMove;
+            }
             update_counter_move(td, parentPly, bestMove);
         }
         else
@@ -2005,8 +2173,10 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
             return alpha;
     }
 
-    if ((pos->ply && isRepetition(pos)) || pos->fifty_move >= 100)
+    if (pos->ply && isRepetition(pos))
         return 0;
+    if (pos->fifty_move >= 100)
+        return fifty_move_score(pos);
 
     if (pos->ply)
     {
@@ -2042,7 +2212,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     // Qsearch only carries an existing PV marking forward; it never creates one,
     // or every capture sequence off a PV node would be marked.
     const bool ttPv = ttHit && ttWasPv;
-    if (ttHit && !isPvNode &&
+    if (ttHit && !isPvNode && pos->fifty_move < 90 &&
         (ttFlag == BOUND_EXACT ||
          (ttFlag == BOUND_LOWER && ttScore >= beta) ||
          (ttFlag == BOUND_UPPER && ttScore <= alpha)))
@@ -2059,9 +2229,10 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     if (!inCheck)
     {
         raw_static_eval = evaluate_static(pos, ttStaticEval, ttHit);
-        static_eval = corrected_static_eval(raw_static_eval, correction_value(td, pos));
+        static_eval = corrected_static_eval(pos, raw_static_eval, correction_value(td, pos));
         bestScore = static_eval;
         td->static_eval_stack[pos->ply] = static_eval;
+        td->in_check_stack[pos->ply] = false;
 
         // A TT score whose bound points the right way is a better stand pat.
         if (ttHit && ttFlag != BOUND_NONE && !is_mate_score(ttScore) &&
@@ -2074,6 +2245,10 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
 
         if (bestScore >= beta)
         {
+            // Stand pat is only an estimate; meeting beta halfway keeps the
+            // fail-soft bound from overshooting on a noisy eval.
+            if (!is_mate_score(bestScore))
+                bestScore = (bestScore + beta) / 2;
             tt->store(pos, 0, bestScore, BOUND_LOWER, 0, raw_static_eval, ttPv);
             return bestScore;
         }
@@ -2085,9 +2260,13 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     {
         td->static_eval_stack[pos->ply] =
             pos->ply >= 2 ? td->static_eval_stack[pos->ply - 2] : no_hashmap_entry;
+        td->in_check_stack[pos->ply] = true;
     }
 
     const int move_type = inCheck ? all_moves : only_captures;
+    // Evasions include quiets, and their ordering reads this ply's threats.
+    if (inCheck)
+        set_threats(td, pos);
     MovePicker movePicker(pos, td, ttMove, false, move_type, inCheck);
 
     int valid_moves = 0;

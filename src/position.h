@@ -20,35 +20,61 @@ constexpr int NNUE_FORWARD_SIZE = 1;
 constexpr int NNUE_FC0_OUTPUT_SIZE = NNUE_HIDDEN_SIZE + NNUE_FORWARD_SIZE;
 constexpr int NNUE_FC1_INPUT_SIZE = NNUE_HIDDEN_SIZE * 2;
 constexpr int NNUE_FC1_OUTPUT_SIZE = 32;
-constexpr int NNUE_MAX_PIECES = 32;
 constexpr int NNUE_SIMD_ALIGNMENT = 64;
 
 static_assert(NNUE_ACCUMULATOR_SIZE % 8 == 0, "NNUE accumulator must fit NEON lanes");
 static_assert(NNUE_ACCUMULATOR_SIZE % 16 == 0, "NNUE accumulator must fit AVX2 lanes");
 static_assert(NNUE_INPUT_FEATURES == 32 * NNUE_PS_NB, "HalfKAv2_hm feature count mismatch");
 
+// One piece change made by the move into a ply (piece removed from or added to
+// a square). Castling is the largest move: king and rook each removed + added.
+struct NnueDirtyPiece {
+    int8_t piece = 0;
+    int8_t square = 0;
+    bool add = false;
+};
+constexpr int NNUE_MAX_DIRTY_PIECES = 4;
+
+// Per-ply NNUE state. Accumulators are updated lazily: make_move only records
+// the move's piece changes in `dirty`, and an accumulator is materialized (by
+// replaying dirty pieces forward from the nearest computed ancestor, or by a
+// cached refresh after a king move) only when a node is actually evaluated.
 struct alignas(NNUE_SIMD_ALIGNMENT) NnueState {
     alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> white_acc{};
     alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> black_acc{};
-    std::array<uint8_t, NNUE_MAX_PIECES> piece_list{};
-    std::array<uint8_t, NNUE_MAX_PIECES> square_list{};
-    std::array<int8_t, BOARD_SIZE> index_by_square{};
-    // -1 means local; otherwise this perspective reads from an ancestor ply until first write.
-    int8_t white_acc_source_ply = -1;
-    int8_t black_acc_source_ply = -1;
-    uint8_t piece_count = 0;
-    int8_t white_king_sq = -1;
-    int8_t black_king_sq = -1;
+    // Per perspective: the ply whose buffer holds this ply's accumulator - this
+    // ply itself once computed, an ancestor when nothing changed for that
+    // perspective (null move) - or -1 while it has not been computed yet.
+    int8_t white_acc_ply = -1;
+    int8_t black_acc_ply = -1;
+    uint8_t dirty_count = 0;
+    std::array<NnueDirtyPiece, NNUE_MAX_DIRTY_PIECES> dirty{};
     bool valid = false;
+};
 
-    NnueState() {
-        index_by_square.fill(-1);
-    }
+// Accumulator refresh cache. One entry per perspective per king
+// square: HalfKAv2_hm features depend only on (perspective, king bucket, king
+// file half), and every king square maps to a distinct (bucket, half) pair, so
+// the king square is an exact key. Each entry holds an accumulator together with
+// the piece bitboards it was built from; a refresh diffs those against the live
+// board and applies only the add/sub deltas. `generation` ties the entry to the
+// network it was built with (0 = never built), so a (re)load invalidates it.
+struct alignas(NNUE_SIMD_ALIGNMENT) NnueRefreshEntry {
+    alignas(NNUE_SIMD_ALIGNMENT) std::array<int16_t, NNUE_ACCUMULATOR_SIZE> acc;
+    std::array<uint64_t, 12> bitboards;
+    uint32_t generation;
+};
+
+struct NnueRefreshCache {
+    std::array<std::array<NnueRefreshEntry, BOARD_SIZE>, 2> entries;  // [white_perspective][king_sq]
 };
 
 class NnueStack {
 public:
     NnueStack();
+    // Copies carry the accumulator stack but start with a cold refresh cache:
+    // the cache is a pure speed-up (entries are exact for their bitboards), so a
+    // fresh one is always correct, and each search thread owns its own.
     NnueStack(const NnueStack& other);
     NnueStack& operator=(const NnueStack& other);
     NnueStack(NnueStack&& other) noexcept = default;
@@ -59,8 +85,11 @@ public:
 
     void copy_up_to(const NnueStack& other, int ply);
 
+    NnueRefreshCache& refresh_cache() { return *cache; }
+
 private:
     std::unique_ptr<std::array<NnueState, MAX_DEPTH + 1>> states;
+    std::unique_ptr<NnueRefreshCache> cache;
 };
 
 // Holds the irreversible state and capture delta needed to unmake one move.
