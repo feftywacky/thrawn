@@ -55,8 +55,13 @@ constexpr int SEARCH_CONTINUATION_HISTORY_DECAY_DENOMINATOR = 4;
 // positions that share it. Applied as weight * entry / 512.
 constexpr int SEARCH_CORRECTION_HISTORY_SIZE = 16384;
 constexpr int SEARCH_CORRECTION_HISTORY_MAX = 1024;
-constexpr int SEARCH_CORRECTION_HISTORY_WEIGHT = 64;
+constexpr int SEARCH_CORRECTION_HISTORY_WEIGHT = 24;
 constexpr int SEARCH_CORRECTION_HISTORY_DEPTH_DIVISOR = 8;
+// Further tables share the pawn table's update rule, each keyed on a different
+// slice of the position; their corrections add, weighted the same way.
+constexpr int SEARCH_NONPAWN_CORRECTION_WEIGHT = 24;
+constexpr int SEARCH_MINOR_CORRECTION_WEIGHT = 20;
+constexpr int SEARCH_CONT_CORRECTION_WEIGHT = 16;
 
 constexpr int SEARCH_QUEEN_PROMOTION_SCORE = 10499;
 

@@ -96,6 +96,9 @@ void ThreadData::clearHistory() {
     continuation_history = {};
     capture_history = {};
     correction_history = {};
+    nonpawn_correction_history = {};
+    minor_correction_history = {};
+    continuation_correction_history = {};
     for (auto &row : counter_moves)
         row.fill(0);
 }

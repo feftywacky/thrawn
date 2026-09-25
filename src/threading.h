@@ -47,6 +47,17 @@ public:
         SEARCH_CONTINUATION_HISTORY_PLIES> continuation_history;
     std::array<std::array<std::array<int, HISTORY_SIZE>, BOARD_SIZE>, HISTORY_SIZE> capture_history;
     std::array<std::array<int, SEARCH_CORRECTION_HISTORY_SIZE>, 2> correction_history;
+    // [side to move][colour whose non-pawn pieces form the key][index]
+    std::array<std::array<std::array<int, SEARCH_CORRECTION_HISTORY_SIZE>, 2>, 2>
+        nonpawn_correction_history;
+    // [side to move][index], keyed on knights, bishops and kings.
+    std::array<std::array<int, SEARCH_CORRECTION_HISTORY_SIZE>, 2> minor_correction_history;
+    // [piece 2 plies back][its target][piece 1 ply back][its target]
+    std::array<
+        std::array<
+            std::array<std::array<int16_t, BOARD_SIZE>, HISTORY_SIZE>,
+            BOARD_SIZE>,
+        HISTORY_SIZE> continuation_correction_history;
     std::array<std::array<int, BOARD_SIZE>, HISTORY_SIZE> counter_moves;
     std::array<int, MAX_DEPTH> ply_moves;
     std::array<int, MAX_DEPTH> static_eval_stack;

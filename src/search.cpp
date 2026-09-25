@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <initializer_list>
+#include <type_traits>
 
 std::atomic<uint64_t> total_nodes(0);
 
@@ -145,19 +147,74 @@ int evaluate_static(thrawn::Position* pos, int cachedStaticEval, bool ttHit) {
 // Keyed on pawn structure, not the full position key: a correction learned in
 // one position then applies to every position sharing that structure, which is
 // the whole point of the table.
-int correction_history_index(const thrawn::Position* pos) {
-    static_assert((SEARCH_CORRECTION_HISTORY_SIZE & (SEARCH_CORRECTION_HISTORY_SIZE - 1)) == 0,
-                  "correction history size must be a power of two");
-    uint64_t key = pos->piece_bitboards[P] * 0x9E3779B97F4A7C15ULL ^
-                   pos->piece_bitboards[p] * 0xC2B2AE3D27D4EB4FULL;
+static_assert((SEARCH_CORRECTION_HISTORY_SIZE & (SEARCH_CORRECTION_HISTORY_SIZE - 1)) == 0,
+              "correction history size must be a power of two");
+
+constexpr std::array<uint64_t, 12> kCorrectionMix = {
+    0x9E3779B97F4A7C15ULL, 0xBF58476D1CE4E5B9ULL, 0x94D049BB133111EBULL,
+    0xD6E8FEB86659FD93ULL, 0xA0761D6478BD642FULL, 0xE7037ED1A0B428DBULL,
+    0xC2B2AE3D27D4EB4FULL, 0x8EBC6AF09C88C6E3ULL, 0x589965CC75374CC3ULL,
+    0x1D8E4E27C47D124FULL, 0xFF51AFD7ED558CCDULL, 0xC4CEB9FE1A85EC53ULL,
+};
+
+int correction_key_index(uint64_t key) {
     key ^= key >> 29;
+    key *= 0xBF58476D1CE4E5B9ULL;
+    key ^= key >> 32;
     return static_cast<int>(key) & (SEARCH_CORRECTION_HISTORY_SIZE - 1);
 }
 
+uint64_t mix_pieces(const thrawn::Position* pos, std::initializer_list<int> pieces) {
+    uint64_t key = 0;
+    for (int piece : pieces)
+        key ^= pos->piece_bitboards[piece] * kCorrectionMix[piece];
+    return key;
+}
+
+// Keyed on pawn structure, not the full position key: a correction learned in
+// one position then applies to every position sharing that structure, which is
+// the whole point of the table.
+int correction_history_index(const thrawn::Position* pos) {
+    return correction_key_index(mix_pieces(pos, {P, p}));
+}
+
+// One colour's pieces other than pawns, king included.
+int nonpawn_correction_index(const thrawn::Position* pos, int colour) {
+    return colour == white ? correction_key_index(mix_pieces(pos, {N, B, R, Q, K}))
+                           : correction_key_index(mix_pieces(pos, {n, b, r, q, k}));
+}
+
+int minor_correction_index(const thrawn::Position* pos) {
+    return correction_key_index(mix_pieces(pos, {N, B, K, n, b, k}));
+}
+
+int previous_ply_move(ThreadData* td, int ply, int pliesBack = 1);
+
+// The pair of moves that led here, or nullptr at the root / after a null move.
+int16_t* continuation_correction_entry(ThreadData* td, int ply) {
+    const int move1 = previous_ply_move(td, ply, 1);
+    const int move2 = previous_ply_move(td, ply, 2);
+    if (!move1 || !move2)
+        return nullptr;
+    return &td->continuation_correction_history[get_move_piece(move2)]
+                                               [get_move_target(move2)]
+                                               [get_move_piece(move1)]
+                                               [get_move_target(move1)];
+}
+
 int correction_value(ThreadData* td, thrawn::Position* pos) {
-    const int entry = td->correction_history[pos->colour_to_move]
-                                            [correction_history_index(pos)];
-    return SEARCH_CORRECTION_HISTORY_WEIGHT * entry / 512;
+    const int stm = pos->colour_to_move;
+    int weighted =
+        SEARCH_CORRECTION_HISTORY_WEIGHT *
+            td->correction_history[stm][correction_history_index(pos)] +
+        SEARCH_NONPAWN_CORRECTION_WEIGHT *
+            (td->nonpawn_correction_history[stm][white][nonpawn_correction_index(pos, white)] +
+             td->nonpawn_correction_history[stm][black][nonpawn_correction_index(pos, black)]) +
+        SEARCH_MINOR_CORRECTION_WEIGHT *
+            td->minor_correction_history[stm][minor_correction_index(pos)];
+    if (const int16_t* cont = continuation_correction_entry(td, pos->ply))
+        weighted += SEARCH_CONT_CORRECTION_WEIGHT * *cont;
+    return weighted / 512;
 }
 
 int corrected_static_eval(int rawStaticEval, int correction) {
@@ -199,15 +256,24 @@ void update_correction_history(ThreadData* td, thrawn::Position* pos, int static
         return;
     }
 
-    int& entry = td->correction_history[pos->colour_to_move]
-                                       [correction_history_index(pos)];
     const int bonus = std::clamp((score - staticEval) * depth /
                                      SEARCH_CORRECTION_HISTORY_DEPTH_DIVISOR,
                                  -SEARCH_CORRECTION_HISTORY_MAX / 4,
                                  SEARCH_CORRECTION_HISTORY_MAX / 4);
-    entry += bonus - entry * std::abs(bonus) / SEARCH_CORRECTION_HISTORY_MAX;
-    entry = std::clamp(entry, -SEARCH_CORRECTION_HISTORY_MAX,
-                       SEARCH_CORRECTION_HISTORY_MAX);
+    auto update = [bonus](auto& entry) {
+        int value = entry;
+        value += bonus - value * std::abs(bonus) / SEARCH_CORRECTION_HISTORY_MAX;
+        entry = static_cast<std::remove_reference_t<decltype(entry)>>(
+            std::clamp(value, -SEARCH_CORRECTION_HISTORY_MAX, SEARCH_CORRECTION_HISTORY_MAX));
+    };
+
+    const int stm = pos->colour_to_move;
+    update(td->correction_history[stm][correction_history_index(pos)]);
+    update(td->nonpawn_correction_history[stm][white][nonpawn_correction_index(pos, white)]);
+    update(td->nonpawn_correction_history[stm][black][nonpawn_correction_index(pos, black)]);
+    update(td->minor_correction_history[stm][minor_correction_index(pos)]);
+    if (int16_t* cont = continuation_correction_entry(td, pos->ply))
+        update(*cont);
 }
 
 bool is_slider_piece(int piece) {
@@ -454,8 +520,6 @@ int history_malus(int depth) {
     return std::min(SEARCH_HISTORY_MALUS_DEPTH * depth + SEARCH_HISTORY_MALUS_BIAS,
                     SEARCH_HISTORY_MALUS_MAX);
 }
-
-int previous_ply_move(ThreadData* td, int ply, int pliesBack = 1);
 
 template <typename Entry>
 void update_history_entry(Entry& entry, int bonus) {
