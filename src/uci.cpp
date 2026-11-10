@@ -292,7 +292,7 @@ static void uci_verify_nnue_search(const char* command, thrawn::Position* pos) {
 TIME CONTROL
 */
 std::int64_t get_time_ms() {
-    return chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now().time_since_epoch()).count();
+    return chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 int input_waiting() {
@@ -459,6 +459,13 @@ void uci_parse_position(thrawn::Position* pos, const char *command) {
 
             make_root_move(pos, move, all_moves);
 
+            // Nothing before an irreversible move can repeat, so restart the
+            // table there. Otherwise a long enough game runs off its end.
+            if (pos->fifty_move == 0) {
+                pos->repetition_index = 0;
+                pos->repetition_table[0] = pos->zobristKey;
+            }
+
             // Move index to the end of the current move
             while (*curr_ch && *curr_ch != ' ')
                 curr_ch++;
@@ -512,6 +519,11 @@ void uci_parse_go(thrawn::Position* pos, const char* command)
     if (strstr(command, "depth") != nullptr) {
         depth = atoi(strstr(command, "depth") + 6);
     }
+
+    // A clock that has already run out (some GUIs send a negative value once
+    // the move overhead eats past zero) is still a clock, not "no clock".
+    if (strstr(command, pos->colour_to_move == 0 ? "wtime" : "btime") != nullptr)
+        uci_time = std::max(0, uci_time);
 
     // Only the one-legal-move case reads this. Stamps the clock's start point.
     const int rootMoveCount = count_legal_moves(pos);
@@ -571,6 +583,8 @@ static void uci_bench(thrawn::Position* pos, int depth, int threads, int hashMb)
         // Clear between positions so each node count depends only on the
         // position and the depth, not on what the previous search left behind.
         tt->reset();
+        for (ThreadData& td : threadDatas)
+            td.clearHistory();
         parse_fen(pos, BENCH_FENS[i]);
         nnue_refresh_root(pos);
         stopped.store(0, std::memory_order_relaxed);
@@ -647,6 +661,8 @@ void uci_loop(thrawn::Position* pos)
         {
             ensure_tt_allocated();
             tt->reset();
+            for (ThreadData& td : threadDatas)
+                td.clearHistory();
             // No previous move to draw a score trend from.
             previous_root_score = TM_SCORE_UNKNOWN;
             uci_parse_position(pos, "position startpos");

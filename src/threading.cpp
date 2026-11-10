@@ -87,7 +87,20 @@ SearchResult::SearchResult()
 }
 
 ThreadData::ThreadData() {
+    clearHistory();
     resetThreadData();
+}
+
+void ThreadData::clearHistory() {
+    quiet_history = {};
+    continuation_history = {};
+    capture_history = {};
+    correction_history = {};
+    nonpawn_correction_history = {};
+    minor_correction_history = {};
+    continuation_correction_history = {};
+    for (auto &row : counter_moves)
+        row.fill(0);
 }
 
 void ThreadData::resetThreadData() {
@@ -96,14 +109,10 @@ void ThreadData::resetThreadData() {
         row.fill(0);
     for (auto &row : killer_moves)
         row.fill(0);
-    quiet_history = {};
-    continuation_history = {};
-    capture_history = {};
-    correction_history = {};
-    for (auto &row : counter_moves)
-        row.fill(0);
     ply_moves.fill(0);
     static_eval_stack.fill(no_hashmap_entry);
+    in_check_stack.fill(false);
+    threats.fill(ThreatInfo{0, 0, 0, 0});
 
     follow_pv_flag = false;
     nmpMinPly = 0;
@@ -187,7 +196,7 @@ static void print_result_info(const SearchResult& result) {
               << " nps " << (currentTime > 0
                     ? nodes * 1000 / static_cast<std::uint64_t>(currentTime)
                     : nodes)
-              << " hashfull " << tt->hashfullMb() << "/" << tt->hashSizeMb()
+              << " hashfull " << tt->hashfull()
               << " time " << currentTime
               << " score ";
 
@@ -229,7 +238,7 @@ static void print_iteration_info(ThreadData* td, int depth, int score, int bound
               << " nps " << (currentTime > 0
                     ? reportedNodes * 1000 / static_cast<std::uint64_t>(currentTime)
                     : reportedNodes)
-              << " hashfull " << tt->hashfullMb() << "/" << tt->hashSizeMb()
+              << " hashfull " << tt->hashfull()
               << " time " << currentTime;
 
     // Determine whether to report a mate score or a centipawn score
@@ -302,6 +311,10 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
 
         // Aspiration loop: adjust the window until search returns a score in (alpha, beta)
         bool completed_iteration = false;
+        // A fail-high is usually confirmed without the full depth, so each one
+        // shaves a ply off the re-search. A fail-low
+        // restores it: that result has to be trusted at full depth.
+        int searchDepth = curr_depth;
         while (true)
         {
             if(stopped.load(std::memory_order_relaxed)==1)
@@ -312,7 +325,7 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             int backup_pv_length = td->pv_length[0];
             td->iteration_root_moves.clear();
             
-            score = negamax(pos, td, curr_depth, alpha, beta);
+            score = negamax(pos, td, searchDepth, alpha, beta);
 
             if (stopped.load(std::memory_order_relaxed) == 1)
             {
@@ -330,6 +343,7 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             
             // If the search fails low, shift the window around the returned score.
             if (score <= alpha) {
+                searchDepth = curr_depth;
                 beta = alpha;
                 alpha = std::max(-mateVal, score - delta);
                 // Restore the previous PV since the current iteration did not complete properly
@@ -341,6 +355,9 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             }
             // If the search fails high, keep some overlap and expand upward.
             else if (score >= beta) {
+                if (std::abs(score) < mateScore)
+                    searchDepth = std::max({1, searchDepth - 1,
+                                            curr_depth - SEARCH_ASPIRATION_MAX_FAIL_HIGH_REDUCTION});
                 alpha = std::max(alpha, beta - delta);
                 beta = std::min(mateVal, score + delta);
 
@@ -430,8 +447,7 @@ void smp_worker_thread_func(thrawn::Position* pos, int threadID, int maxDepth)
             break;
     }
 
-    // Lazy SMP: only the master thread is gated on the requested search depth
-    // (mirrors Stockfish's `limits.depth && mainThread` loop condition). Once
+    // Lazy SMP: only the master thread is gated on the requested search depth. Once
     // the master has completed maxDepth, signal all helper threads to stop so
     // they abort their in-progress iteration instead of independently grinding
     // to maxDepth and gating the join on the slowest straggler.

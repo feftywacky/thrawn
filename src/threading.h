@@ -19,6 +19,15 @@ extern std::atomic<int> main_completed_depth;
 extern int previous_root_score;
 constexpr int TM_SCORE_UNKNOWN = SEARCH_INFINITY;
 
+// Squares the side not to move attacks, split by attacker class so move
+// ordering can tell a piece attacked by something cheaper than itself.
+struct ThreatInfo {
+    uint64_t all;
+    uint64_t byPawn;
+    uint64_t byMinor;
+    uint64_t byRook;
+};
+
 struct RootMove {
     int move;
     int bound;
@@ -35,7 +44,13 @@ public:
 
     // Killer, history, and counter-move ordering tables.
     std::array<std::array<int, MAX_DEPTH>, KILLER_MOVES> killer_moves;
-    std::array<std::array<std::array<int, BOARD_SIZE>, BOARD_SIZE>, 2> quiet_history;
+    // [side][from attacked][to attacked][from][to]: the same move is a
+    // different proposition when it steps out of, or into, an attack.
+    std::array<
+        std::array<
+            std::array<std::array<std::array<int, BOARD_SIZE>, BOARD_SIZE>, 2>,
+            2>,
+        2> quiet_history;
     // [plies back - 1][previous piece][previous to][piece][to]. int16_t so the
     // two tables together cost what the single int table did.
     std::array<
@@ -47,9 +62,22 @@ public:
         SEARCH_CONTINUATION_HISTORY_PLIES> continuation_history;
     std::array<std::array<std::array<int, HISTORY_SIZE>, BOARD_SIZE>, HISTORY_SIZE> capture_history;
     std::array<std::array<int, SEARCH_CORRECTION_HISTORY_SIZE>, 2> correction_history;
+    // [side to move][colour whose non-pawn pieces form the key][index]
+    std::array<std::array<std::array<int, SEARCH_CORRECTION_HISTORY_SIZE>, 2>, 2>
+        nonpawn_correction_history;
+    // [side to move][index], keyed on knights, bishops and kings.
+    std::array<std::array<int, SEARCH_CORRECTION_HISTORY_SIZE>, 2> minor_correction_history;
+    // [piece 2 plies back][its target][piece 1 ply back][its target]
+    std::array<
+        std::array<
+            std::array<std::array<int16_t, BOARD_SIZE>, HISTORY_SIZE>,
+            BOARD_SIZE>,
+        HISTORY_SIZE> continuation_correction_history;
     std::array<std::array<int, BOARD_SIZE>, HISTORY_SIZE> counter_moves;
     std::array<int, MAX_DEPTH> ply_moves;
     std::array<int, MAX_DEPTH> static_eval_stack;
+    std::array<bool, MAX_DEPTH> in_check_stack;
+    std::array<ThreatInfo, MAX_DEPTH> threats;
 
     // Flags used for move ordering and search heuristics.
     bool follow_pv_flag;
@@ -74,7 +102,7 @@ public:
 
     // (move, nodes) for each root move, accumulated over the whole search rather
     // than per iteration - the time manager wants the share of the total tree a
-    // root move has cost, which is what both Berserk and Reckless divide by.
+    // root move has cost.
     // Kept separate from iteration_root_moves, which is cleared on every
     // aspiration re-search. Linear scan: a root has at most a few dozen moves.
     std::vector<std::pair<int, long long>> root_move_nodes;
@@ -82,8 +110,13 @@ public:
     // Constructor initializes all arrays to zero and flags to false.
     ThreadData();
 
-    // Reset the thread data between searches.
+    // Reset the per-search state. Move-ordering and correction histories are
+    // deliberately kept: what was learned searching the previous move is still
+    // true of this position's subtree.
     void resetThreadData();
+
+    // Wipe the learned tables. Only on a new game (and between bench positions).
+    void clearHistory();
 
     void recordRootMove(int move, int bound);
 
