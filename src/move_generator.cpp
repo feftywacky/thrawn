@@ -6,6 +6,11 @@
 #include "nnue.h"
 #include "position.h"
 
+#ifdef DEBUG_BUILD
+#include <cstdlib>
+#include <iostream>
+#endif
+
 namespace {
 
 constexpr uint64_t rank_1 = 0xFF00000000000000ULL;
@@ -22,7 +27,8 @@ void parse_queen_moves(const thrawn::Position* pos, uint64_t pieces, int piece, 
 void parse_king_moves(const thrawn::Position* pos, uint64_t pieces, int piece, uint64_t friends, uint64_t enemies, MoveList& moves, int move_type);
 void parse_white_castle_moves(const thrawn::Position* pos, MoveList& moves);
 void parse_black_castle_moves(const thrawn::Position* pos, MoveList& moves);
-int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool update_nnue);
+int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool update_nnue,
+                   bool known_legal = false);
 
 inline void append_moves_from_attacks(int source,
                                       int piece,
@@ -383,12 +389,13 @@ void parse_king_moves(const thrawn::Position* pos, uint64_t pieces, int piece,
     }
 }
 
-int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool update_nnue)
+int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool update_nnue,
+                   bool known_legal)
 {
     if (move_type == only_captures)
     {
         if (get_is_capture_move(move) || get_promoted_piece(move))
-            return make_move_impl(pos, move, all_moves, ply, update_nnue);
+            return make_move_impl(pos, move, all_moves, ply, update_nnue, known_legal);
 
         return 0;
     }
@@ -574,17 +581,33 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
     pos->colour_to_move ^= 1;
     pos->zobristKey ^= pos->colour_to_move_hashkey;
 
-    const int moved_king_square = (piece == K || piece == k)
-        ? target
-        : ((moving_side == white)
-            ? get_lsb_index(pos->piece_bitboards[K])
-            : get_lsb_index(pos->piece_bitboards[k]));
-
-    if (is_square_under_attack(pos, moved_king_square, enemy_side))
+    // En passant can expose the king along a line that no caller's filter
+    // checks, so it always gets the full king-safety test.
+    const bool skip_king_test = known_legal && !enpassant_move;
+#ifndef DEBUG_BUILD
+    if (!skip_king_test)
+#endif
     {
-        if (undo != nullptr)
-            unmake_move(pos, stack_ply);
-        return 0;
+        const int moved_king_square = (piece == K || piece == k)
+            ? target
+            : ((moving_side == white)
+                ? get_lsb_index(pos->piece_bitboards[K])
+                : get_lsb_index(pos->piece_bitboards[k]));
+
+        if (is_square_under_attack(pos, moved_king_square, enemy_side))
+        {
+#ifdef DEBUG_BUILD
+            if (skip_king_test)
+            {
+                std::cerr << "make_move: move declared legal leaves the king in check: "
+                          << move << std::endl;
+                std::abort();
+            }
+#endif
+            if (undo != nullptr)
+                unmake_move(pos, stack_ply);
+            return 0;
+        }
     }
 
     if (use_nnue)
@@ -601,6 +624,11 @@ int make_move_impl(thrawn::Position* pos, int move, int move_type, int ply, bool
 int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply)
 {
     return make_move_impl(pos, move, move_type, ply, true);
+}
+
+int make_move_known_legal(thrawn::Position* pos, int move, int move_type, int ply)
+{
+    return make_move_impl(pos, move, move_type, ply, true, true);
 }
 
 int make_move_for_perft(thrawn::Position* pos, int move, int ply)

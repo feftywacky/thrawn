@@ -45,6 +45,9 @@ void generate_moves(thrawn::Position* pos, int move_type, MoveList& moves);
 
 int make_move(thrawn::Position* pos, int move, int move_type, int ply);
 int make_move_on_board(thrawn::Position* pos, int move, int move_type, int ply);
+// make_move_on_board for a move the search's legality filter has already
+// accepted: skips the king-safety test for every move except en passant.
+int make_move_known_legal(thrawn::Position* pos, int move, int move_type, int ply);
 int make_move_for_perft(thrawn::Position* pos, int move, int ply);
 int make_root_move(thrawn::Position* pos, int move, int move_type);
 int count_legal_moves(thrawn::Position* pos);
