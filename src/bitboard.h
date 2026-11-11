@@ -111,6 +111,8 @@ inline bool hasNonPawnMaterial(const thrawn::Position* pos, int side)
 // init all piece attacks
 void init_leaping_attacks(thrawn::Position* pos);
 void init_sliding_attacks(thrawn::Position* pos, int isBishop);
+// needs the sliding attack tables
+void init_line_tables(thrawn::Position* pos);
         
 
 #endif

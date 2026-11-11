@@ -411,6 +411,40 @@ void init_sliding_attacks(thrawn::Position* pos, int isBishop)
     }
 }
 
+// Two squares are aligned when a slider on one, on an empty board, attacks the
+// other. The line is the intersection of both empty-board rays plus the two
+// endpoints; the between set is the intersection of the rays each square casts
+// when the other is the only blocker.
+void init_line_tables(thrawn::Position* pos)
+{
+    for (int from = 0; from < BOARD_SIZE; from++)
+    {
+        for (int to = 0; to < BOARD_SIZE; to++)
+        {
+            pos->between_bb[from][to] = 0ULL;
+            pos->line_bb[from][to] = 0ULL;
+            if (from == to)
+                continue;
+
+            const uint64_t endpoints = square_bb(from) | square_bb(to);
+            if (get_bishop_attacks(pos, from, 0ULL) & square_bb(to))
+            {
+                pos->line_bb[from][to] = (get_bishop_attacks(pos, from, 0ULL) &
+                                          get_bishop_attacks(pos, to, 0ULL)) | endpoints;
+                pos->between_bb[from][to] = get_bishop_attacks(pos, from, square_bb(to)) &
+                                            get_bishop_attacks(pos, to, square_bb(from));
+            }
+            else if (get_rook_attacks(pos, from, 0ULL) & square_bb(to))
+            {
+                pos->line_bb[from][to] = (get_rook_attacks(pos, from, 0ULL) &
+                                          get_rook_attacks(pos, to, 0ULL)) | endpoints;
+                pos->between_bb[from][to] = get_rook_attacks(pos, from, square_bb(to)) &
+                                            get_rook_attacks(pos, to, square_bb(from));
+            }
+        }
+    }
+}
+
 void init_leaping_attacks(thrawn::Position* pos)
 {
     for (int square = 0; square < BOARD_SIZE; square++) 

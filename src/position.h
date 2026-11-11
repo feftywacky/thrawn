@@ -153,6 +153,12 @@ public:
     static std::array<std::array<uint64_t, 4096>, 64> rook_attacks;
 #endif
 
+    // For two squares on a common rank, file or diagonal: between_bb holds the
+    // squares strictly between them, line_bb the whole board line through both
+    // (endpoints included). Both are 0 for squares that are not aligned.
+    static std::array<std::array<uint64_t, 64>, 64> between_bb;
+    static std::array<std::array<uint64_t, 64>, 64> line_bb;
+
     static uint64_t piece_hashkey[12][64];
     static uint64_t enpassant_hashkey[64];
     static uint64_t castling_hashkey[16];

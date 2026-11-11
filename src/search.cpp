@@ -1056,73 +1056,6 @@ struct FixedBuffer {
     const T* end() const { return values.data() + count; }
 };
 
-int next_square_on_step(int square, int step) {
-    const int next = square + step;
-    if (next < a8 || next > h1)
-        return null_sq;
-
-    const int fileDelta = std::abs((next % 8) - (square % 8));
-    const int rankDelta = std::abs((next / 8) - (square / 8));
-    if (fileDelta > 1 || rankDelta > 1)
-        return null_sq;
-
-    return next;
-}
-
-int direction_between_squares(int from, int to) {
-    const int fromFile = from % 8;
-    const int fromRank = from / 8;
-    const int toFile = to % 8;
-    const int toRank = to / 8;
-    const int fileDelta = toFile - fromFile;
-    const int rankDelta = toRank - fromRank;
-
-    if (fileDelta == 0 && rankDelta != 0)
-        return rankDelta > 0 ? 8 : -8;
-    if (rankDelta == 0 && fileDelta != 0)
-        return fileDelta > 0 ? 1 : -1;
-    if (std::abs(fileDelta) == std::abs(rankDelta) && fileDelta != 0)
-        return (rankDelta > 0 ? 8 : -8) + (fileDelta > 0 ? 1 : -1);
-
-    return 0;
-}
-
-bool is_diagonal_step(int step) {
-    return step == -9 || step == -7 || step == 7 || step == 9;
-}
-
-bool is_orthogonal_step(int step) {
-    return step == -8 || step == -1 || step == 1 || step == 8;
-}
-
-bool slider_matches_pin_ray(int piece, int step) {
-    const int type = piece % 6;
-    return type == QUEEN ||
-           (is_diagonal_step(step) && type == BISHOP) ||
-           (is_orthogonal_step(step) && type == ROOK);
-}
-
-int first_occupied_square_on_ray(thrawn::Position* pos, int from, int step) {
-    for (int sq = next_square_on_step(from, step); sq != null_sq;
-         sq = next_square_on_step(sq, step)) {
-        if (get_bit(pos->occupancies[both], sq))
-            return sq;
-    }
-    return null_sq;
-}
-
-bool target_stays_between_king_and_slider(int kingSquare, int target,
-                                          int sliderSquare, int step) {
-    for (int sq = next_square_on_step(kingSquare, step); sq != null_sq;
-         sq = next_square_on_step(sq, step)) {
-        if (sq == target)
-            return true;
-        if (sq == sliderSquare)
-            return false;
-    }
-    return false;
-}
-
 uint64_t enemy_piece_bb_after_king_move(thrawn::Position* pos, int enemy,
                                         int whitePiece, int blackPiece,
                                         uint64_t capturedTarget) {
@@ -1186,66 +1119,105 @@ bool king_target_attacked_after_move(thrawn::Position* pos, int move) {
     return false;
 }
 
-bool move_respects_absolute_pin(thrawn::Position* pos, int move) {
-    if (get_is_move_enpassant(move))
-        return true;
+// Check and pin state of the side to move, built once per node from the
+// current occupancy. checkMask holds the squares a non-king move must land on:
+// every square when not in check, the checker and the squares between it and
+// the king for a single check, none for a double check.
+struct LegalityContext {
+    uint64_t checkers = 0ULL;
+    uint64_t pinned = 0ULL;
+    uint64_t checkMask = ~0ULL;
+    int kingSquare = null_sq;
+};
 
+LegalityContext make_legality_context(const thrawn::Position* pos) {
+    LegalityContext context;
     const int side = pos->colour_to_move;
-    const int piece = get_move_piece(move);
-    if (piece % 6 == KING)
-        return !king_target_attacked_after_move(pos, move);
-
+    const int enemy = side ^ 1;
     const uint64_t kingBb = pos->piece_bitboards[side == white ? K : k];
     if (!kingBb)
-        return true;
+        return context;
 
     const int kingSquare = get_lsb_index(kingBb);
-    const int source = get_move_source(move);
-    const int target = get_move_target(move);
-    const int step = direction_between_squares(kingSquare, source);
-    if (!step)
-        return true;
+    context.kingSquare = kingSquare;
 
-    if (first_occupied_square_on_ray(pos, kingSquare, step) != source)
-        return true;
+    const uint64_t occupancy = pos->occupancies[both];
+    const uint64_t diagonalSliders = enemy == white
+        ? (pos->piece_bitboards[B] | pos->piece_bitboards[Q])
+        : (pos->piece_bitboards[b] | pos->piece_bitboards[q]);
+    const uint64_t orthogonalSliders = enemy == white
+        ? (pos->piece_bitboards[R] | pos->piece_bitboards[Q])
+        : (pos->piece_bitboards[r] | pos->piece_bitboards[q]);
 
-    const int sliderSquare = first_occupied_square_on_ray(pos, source, step);
-    if (sliderSquare == null_sq)
-        return true;
+    context.checkers =
+        (pos->pawn_attacks[side][kingSquare] &
+         pos->piece_bitboards[enemy == white ? P : p]) |
+        (pos->knight_attacks[kingSquare] &
+         pos->piece_bitboards[enemy == white ? N : n]) |
+        (get_bishop_attacks(pos, kingSquare, occupancy) & diagonalSliders) |
+        (get_rook_attacks(pos, kingSquare, occupancy) & orthogonalSliders);
 
-    const int enemyStart = side == white ? p : P;
-    const int enemyEnd = side == white ? k : K;
-    // sliderSquare is occupied, so the mailbox holds its occupant. Only an
-    // enemy slider can pin, so anything else clears the move.
-    const int occupant = pos->mailbox[sliderSquare];
-    const int slider = (occupant >= enemyStart && occupant <= enemyEnd) ? occupant : -1;
+    // Seen through our own pieces, the enemy sliders aimed at the king. Each
+    // one with exactly one piece between it and the king pins that piece when
+    // it is ours (with none between, it is a checker).
+    const uint64_t enemyPieces = pos->occupancies[enemy];
+    uint64_t snipers =
+        (get_bishop_attacks(pos, kingSquare, enemyPieces) & diagonalSliders) |
+        (get_rook_attacks(pos, kingSquare, enemyPieces) & orthogonalSliders);
+    while (snipers) {
+        const int sniper = pop_lsb(snipers);
+        const uint64_t blockers = pos->between_bb[kingSquare][sniper] & occupancy;
+        if (blockers && !(blockers & (blockers - 1)))
+            context.pinned |= blockers & pos->occupancies[side];
+    }
 
-    if (slider == -1 || !slider_matches_pin_ray(slider, step))
-        return true;
+    if (context.checkers) {
+        context.checkMask = (context.checkers & (context.checkers - 1))
+            ? 0ULL
+            : pos->between_bb[kingSquare][get_lsb_index(context.checkers)] |
+              context.checkers;
+    }
 
-    return direction_between_squares(kingSquare, target) == step &&
-           target_stays_between_king_and_slider(kingSquare, target, sliderSquare, step);
+    return context;
 }
 
-bool move_passes_fast_legal_filter(thrawn::Position* pos, int move, bool inCheck) {
+// Exact for every move except en passant, which can still expose the king by
+// clearing two pawns off a line at once; make_move has the final say there.
+bool move_passes_fast_legal_filter(thrawn::Position* pos, int move,
+                                   const LegalityContext& legality) {
     const int piece = get_move_piece(move);
     if (piece % 6 == KING)
         return !king_target_attacked_after_move(pos, move);
-    if (inCheck)
-        return true;
-    return move_respects_absolute_pin(pos, move);
+
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    if (!(legality.checkMask & square_bb(target))) {
+        // En passant resolves a single pawn check by removing the checker
+        // from a square other than its target.
+        if (!get_is_move_enpassant(move))
+            return false;
+        const int capturedSquare =
+            pos->colour_to_move == white ? target + 8 : target - 8;
+        if (legality.checkers != square_bb(capturedSquare))
+            return false;
+    }
+
+    // No move along a pin line lands on the check mask (the pinned piece
+    // cannot pass the king), so in check this needs no special case.
+    return !(legality.pinned & square_bb(source)) ||
+           (pos->line_bb[source][target] & square_bb(legality.kingSquare));
 }
 
 class MovePicker {
 public:
     MovePicker(thrawn::Position* pos, ThreadData* td, int ttMove,
-               bool followPv, int moveType, bool inCheck)
+               bool followPv, int moveType, const LegalityContext& legality)
         : pos(pos),
           td(td),
           ttMove(ttMove),
           pvMove(followPv && pos->ply < MAX_DEPTH ? td->pv_table[0][pos->ply] : 0),
           moveType(moveType),
-          inCheck(inCheck),
+          legality(legality),
           stage(Stage::TtMove) {}
 
     // Once the node has decided quiets are hopeless, skip straight past the
@@ -1350,7 +1322,7 @@ private:
     int ttMove;
     int pvMove;
     int moveType;
-    bool inCheck;
+    LegalityContext legality;
     Stage stage;
     bool quietsSkipped = false;
     FixedBuffer<ScoredMove, MAX_GENERATED_MOVES> tacticals;
@@ -1385,7 +1357,7 @@ private:
     bool try_special(int move, PickedMove& picked) {
         if (!move || already_tried(move) ||
             !move_is_pseudo_legal(pos, move, moveType) ||
-            !move_passes_fast_legal_filter(pos, move, inCheck)) {
+            !move_passes_fast_legal_filter(pos, move, legality)) {
             return false;
         }
 
@@ -1451,7 +1423,7 @@ private:
 
     void add_tactical(int move) {
         if (already_tried(move) ||
-            !move_passes_fast_legal_filter(pos, move, inCheck)) {
+            !move_passes_fast_legal_filter(pos, move, legality)) {
             return;
         }
         tacticals.push_back({move, tactical_move_score(pos, td, move), 0, false});
@@ -1459,7 +1431,7 @@ private:
 
     void add_quiet(int move) {
         if (already_tried(move) ||
-            !move_passes_fast_legal_filter(pos, move, inCheck)) {
+            !move_passes_fast_legal_filter(pos, move, legality)) {
             return;
         }
         quietMoves.push_back({move, quiet_move_score(td, pos->colour_to_move, pos->ply, move), 0, false});
@@ -1584,13 +1556,8 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
     const bool isPvNode = (beta - alpha) > 1;
 
-    const bool inCheck = is_square_under_attack(
-        pos,
-        (pos->colour_to_move == white ?
-            get_lsb_index(pos->piece_bitboards[K]) :
-            get_lsb_index(pos->piece_bitboards[k])),
-        pos->colour_to_move ^ 1
-    );
+    const LegalityContext legality = make_legality_context(pos);
+    const bool inCheck = legality.checkers != 0ULL;
 
     // Check extension, applied before the TT probe so the stored entry matches
     // the depth actually searched.
@@ -1639,7 +1606,6 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     eval = static_eval;
     td->static_eval_stack[pos->ply] = static_eval;
     td->in_check_stack[pos->ply] = inCheck;
-    set_threats(td, pos);
 
     nodeContext = make_node_context(td, pos->ply, static_eval, cutNode);
 
@@ -1742,7 +1708,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
 
         if (!ttRefutesProbCut)
         {
-            MovePicker probCutPicker(pos, td, ttMove, false, only_captures, inCheck);
+            MovePicker probCutPicker(pos, td, ttMove, false, only_captures, legality);
             PickedMove probCutPicked;
             while (probCutPicker.next(probCutPicked))
             {
@@ -1817,8 +1783,11 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         depth -= SEARCH_IIR_REDUCTION;
     }
 
+    // Only quiet ordering and quiet history at this ply read the threats, so they
+    // are computed here, after every pruning step that can return without them.
+    set_threats(td, pos);
     const bool nodeFollowPv = td->follow_pv_flag;
-    MovePicker movePicker(pos, td, ttMove, nodeFollowPv, all_moves, inCheck);
+    MovePicker movePicker(pos, td, ttMove, nodeFollowPv, all_moves, legality);
 
     int moves_searched = 0;
     int move_count = 0;
@@ -2188,13 +2157,8 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
 
     count_node(td);
 
-    const bool inCheck = is_square_under_attack(
-        pos,
-        (pos->colour_to_move == white)
-            ? get_lsb_index(pos->piece_bitboards[K])
-            : get_lsb_index(pos->piece_bitboards[k]),
-        pos->colour_to_move ^ 1
-    );
+    const LegalityContext legality = make_legality_context(pos);
+    const bool inCheck = legality.checkers != 0ULL;
 
     if (pos->ply >= MAX_DEPTH - 1)
         return inCheck ? -mateVal + pos->ply : evaluate(pos);
@@ -2267,7 +2231,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     // Evasions include quiets, and their ordering reads this ply's threats.
     if (inCheck)
         set_threats(td, pos);
-    MovePicker movePicker(pos, td, ttMove, false, move_type, inCheck);
+    MovePicker movePicker(pos, td, ttMove, false, move_type, legality);
 
     int valid_moves = 0;
     int bestMove = 0;
