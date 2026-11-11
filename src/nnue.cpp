@@ -293,6 +293,11 @@ struct LoadedNetwork {
 
     std::array<int32_t, kExpectedFc0OutputSize> fc0_bias{};
     alignas(64) std::array<std::array<int8_t, kFc0InputSize>, kExpectedFc0OutputSize> fc0_weight_t{};
+#if defined(USE_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    // fc0 weights again, input-major for the chunk-sparse kernel: for each 4-input
+    // chunk c, 16 bytes per output group k hold weights[4k + o][4c + t] at o * 4 + t.
+    alignas(64) std::array<int8_t, kFc0InputSize * kExpectedFc0OutputSize> fc0_weight_chunked{};
+#endif
 
     std::array<int32_t, kExpectedFc1OutputSize> fc1_bias{};
     alignas(64) std::array<std::array<int8_t, kFc1InputPaddedSize>, kExpectedFc1OutputSize> fc1_weight_t{};
@@ -2334,6 +2339,116 @@ constexpr Fc1InputGatherIndices make_fc1_input_gather_indices() {
 
 constexpr Fc1InputGatherIndices kFc1InputGather = make_fc1_input_gather_indices();
 
+#if defined(__ARM_FEATURE_DOTPROD)
+constexpr int kFc0InputChunks = kFc0InputSize / 4;
+static_assert(kFc0InputChunks % 16 == 0, "fc0 chunk scan reads 16 chunks per step");
+static_assert(kFc0InputChunks <= 65536, "fc0 chunk indices must fit uint16");
+
+// For every 8-bit mask, the positions of its set bits in ascending order, padded
+// with 0, and the number of set bits.
+struct NonzeroChunkTable {
+    alignas(16) uint16_t index[256][8];
+    uint8_t count[256];
+};
+
+constexpr NonzeroChunkTable make_nonzero_chunk_table() {
+    NonzeroChunkTable result{};
+    for (int mask = 0; mask < 256; ++mask) {
+        int n = 0;
+        for (int bit = 0; bit < 8; ++bit) {
+            if (mask & (1 << bit)) {
+                result.index[mask][n++] = static_cast<uint16_t>(bit);
+            }
+        }
+        result.count[mask] = static_cast<uint8_t>(n);
+    }
+    return result;
+}
+
+constexpr NonzeroChunkTable kNonzeroChunkTable = make_nonzero_chunk_table();
+
+// Writes the indices of the non-zero 4-byte chunks of the fc0 input to `out` in
+// ascending order and returns their count. `out` needs 8 entries of slack past
+// the last chunk, since every step stores 8 indices.
+static inline int find_nonzero_fc0_chunks_neon(const uint8_t* act, uint16_t* out) {
+    alignas(16) static constexpr uint8_t kBitWeights[16] = {1, 2, 4, 8, 16, 32, 64, 128,
+                                                            1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t bit_weights = vld1q_u8(kBitWeights);
+    const uint16x8_t step = vdupq_n_u16(8);
+    uint16x8_t base = vdupq_n_u16(0);
+    int count = 0;
+    auto append = [&](uint32_t mask) {
+        vst1q_u16(out + count, vaddq_u16(base, vld1q_u16(kNonzeroChunkTable.index[mask])));
+        count += kNonzeroChunkTable.count[mask];
+        base = vaddq_u16(base, step);
+    };
+    for (int c = 0; c < kFc0InputChunks; c += 16) {
+        const uint8x16x4_t bytes = vld1q_u8_x4(act + 4 * c);
+        uint32x4_t nonzero[4];
+        for (int k = 0; k < 4; ++k) {
+            const uint32x4_t chunk = vreinterpretq_u32_u8(bytes.val[k]);
+            nonzero[k] = vtstq_u32(chunk, chunk);
+        }
+        const uint16x8_t lo = vcombine_u16(vmovn_u32(nonzero[0]), vmovn_u32(nonzero[1]));
+        const uint16x8_t hi = vcombine_u16(vmovn_u32(nonzero[2]), vmovn_u32(nonzero[3]));
+        const uint8x16_t flags = vandq_u8(vcombine_u8(vmovn_u16(lo), vmovn_u16(hi)), bit_weights);
+        append(vaddv_u8(vget_low_u8(flags)));
+        append(vaddv_u8(vget_high_u8(flags)));
+    }
+    return count;
+}
+
+// fc0 dot products over the non-zero input chunks only. Each chunk's 4 bytes are
+// broadcast and dotted against its 8 weight vectors, so lane o of sums[k] is
+// output 4k + o. Two accumulator sets alternate between chunks to halve the
+// sdot dependency chain; integer sums are exact in any order.
+static inline void fc0_dot_sparse_neon(const uint8_t* act, const LoadedNetwork& network,
+                                       int32x4_t sums[kExpectedFc0OutputSize / 4]) {
+    static_assert(kExpectedFc0OutputSize == 32, "fc0 sparse kernel keeps 8 output vectors");
+    constexpr int kChunkBytes = kExpectedFc0OutputSize * 4;
+
+    alignas(16) uint16_t chunks[kFc0InputChunks + 8];
+    const int count = find_nonzero_fc0_chunks_neon(act, chunks);
+    const int8_t* weights = network.fc0_weight_chunked.data();
+
+    auto broadcast = [act](int chunk) {
+        uint32_t bytes;
+        std::memcpy(&bytes, act + 4 * chunk, sizeof(bytes));
+        return vreinterpretq_s8_u32(vdupq_n_u32(bytes));
+    };
+
+    int32x4_t a[8];
+    int32x4_t b[8];
+    for (int k = 0; k < 8; ++k) {
+        a[k] = vdupq_n_s32(0);
+        b[k] = vdupq_n_s32(0);
+    }
+
+    int i = 0;
+    for (; i + 1 < count; i += 2) {
+        const int8x16_t x0 = broadcast(chunks[i]);
+        const int8x16_t x1 = broadcast(chunks[i + 1]);
+        const int8_t* w0 = weights + chunks[i] * kChunkBytes;
+        const int8_t* w1 = weights + chunks[i + 1] * kChunkBytes;
+        for (int k = 0; k < 8; ++k) {
+            a[k] = vdotq_s32(a[k], vld1q_s8(w0 + 16 * k), x0);
+            b[k] = vdotq_s32(b[k], vld1q_s8(w1 + 16 * k), x1);
+        }
+    }
+    if (i < count) {
+        const int8x16_t x0 = broadcast(chunks[i]);
+        const int8_t* w0 = weights + chunks[i] * kChunkBytes;
+        for (int k = 0; k < 8; ++k) {
+            a[k] = vdotq_s32(a[k], vld1q_s8(w0 + 16 * k), x0);
+        }
+    }
+
+    for (int k = 0; k < 8; ++k) {
+        sums[k] = vaddq_s32(a[k], b[k]);
+    }
+}
+#endif
+
 // Forward pass that keeps everything after fc0 in registers: fc0 sums come back
 // as vectors, the rounding divisions, bias adds, clamps and the screlu table
 // lookup run lane-wise, and fc1/fc2 read their inputs from registers instead of
@@ -2357,6 +2472,13 @@ IntEvaluationResult evaluate_accumulators_int_quantized_neon(const AccumulatorVi
     // fc0: bias + div_round(dot, act_one), wrapped to int32 like the generic path.
     const RoundingDividerNeon div_act_one(network.div_act_one);
     int32x4_t fc0[kExpectedFc0OutputSize / 4];
+#if defined(__ARM_FEATURE_DOTPROD)
+    int32x4_t fc0_dot[kExpectedFc0OutputSize / 4];
+    fc0_dot_sparse_neon(act.data(), network, fc0_dot);
+    for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 4) {
+        fc0[j / 4] = vaddq_s32(vld1q_s32(network.fc0_bias.data() + j), div_act_one.div_round(fc0_dot[j / 4]));
+    }
+#else
     for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 4) {
         const int32x4_t dot = dot_u8_i8_x4_neon(act.data(),
                                                 network.fc0_weight_t[j].data(),
@@ -2366,6 +2488,7 @@ IntEvaluationResult evaluate_accumulators_int_quantized_neon(const AccumulatorVi
                                                 kFc0InputSize);
         fc0[j / 4] = vaddq_s32(vld1q_s32(network.fc0_bias.data() + j), div_act_one.div_round(dot));
     }
+#endif
     const int32_t forward = vgetq_lane_s32(fc0[kExpectedHiddenSize / 4], kExpectedHiddenSize % 4);
 
     // CReLU to [0, qfc0], then screlu_lut over those bytes.
@@ -2439,11 +2562,227 @@ IntEvaluationResult evaluate_accumulators_int_quantized_neon(const AccumulatorVi
 }
 #endif
 
+#if defined(USE_AVX2) || (defined(USE_AVX512) && defined(__AVX512VNNI__))
+// The x86 dot products read u8 x i8 operands, so |sum| <= inputs * 255 * 128.
+// Adding the rounding half (< 128) must stay below 2^31, where the vector
+// multiply-shift quotient below is exact.
+static_assert(static_cast<int64_t>(kFc0InputSize) * 255 * 128 + 128 <
+                  (int64_t{1} << RoundingDivider::kMagicBits),
+              "fc0 dot products exceed the exact multiply-shift range");
+static_assert(static_cast<int64_t>(kFc1InputPaddedSize) * 255 * 128 + 128 <
+                  (int64_t{1} << RoundingDivider::kMagicBits),
+              "fc1 dot products exceed the exact multiply-shift range");
+static_assert(255 * 255 + 128 < (int64_t{1} << RoundingDivider::kMagicBits),
+              "squared activation exceeds the exact multiply-shift range");
+
+// Accumulates the u8 x i8 products of 32-byte x and w into the eight int32 lanes
+// of acc. It pairs bytes exactly as this build's dense kernels do (VNNI is exact;
+// the maddubs fallback saturates the same byte pairs), so every sum matches theirs.
+static inline __m256i forward_dot_acc_avx2(__m256i acc, __m256i x, __m256i w) {
+#if defined(USE_AVX512)
+    const __m512i x512 = _mm512_inserti64x4(_mm512_setzero_si512(), x, 0);
+    const __m512i w512 = _mm512_inserti64x4(_mm512_setzero_si512(), w, 0);
+    return _mm512_castsi512_si256(_mm512_dpbusd_epi32(_mm512_castsi256_si512(acc), x512, w512));
+#else
+    return add_dot_u8_i8_epi32(acc, x, w, _mm256_set1_epi16(1));
+#endif
+}
+
+// Folds four per-row partial-sum vectors into {sum(r0), sum(r1), sum(r2), sum(r3)}.
+static inline __m128i forward_reduce_x4_avx2(__m256i r0, __m256i r1, __m256i r2, __m256i r3) {
+    const __m256i sums = _mm256_hadd_epi32(_mm256_hadd_epi32(r0, r1), _mm256_hadd_epi32(r2, r3));
+    return _mm_add_epi32(_mm256_castsi256_si128(sums), _mm256_extracti128_si256(sums, 1));
+}
+
+// Four fc0 dot products of x against w0..w3, returned as one vector of the four sums.
+static inline __m128i forward_fc0_dot_x4(const uint8_t* x,
+                                         const int8_t* w0,
+                                         const int8_t* w1,
+                                         const int8_t* w2,
+                                         const int8_t* w3) {
+#if defined(USE_AVX512)
+    int32_t s0;
+    int32_t s1;
+    int32_t s2;
+    int32_t s3;
+    dot_u8_i8_x4_avx512(x, w0, w1, w2, w3, kFc0InputSize, s0, s1, s2, s3);
+    return _mm_setr_epi32(s0, s1, s2, s3);
+#else
+    __m256i a00 = _mm256_setzero_si256();
+    __m256i a01 = _mm256_setzero_si256();
+    __m256i a10 = _mm256_setzero_si256();
+    __m256i a11 = _mm256_setzero_si256();
+    __m256i a20 = _mm256_setzero_si256();
+    __m256i a21 = _mm256_setzero_si256();
+    __m256i a30 = _mm256_setzero_si256();
+    __m256i a31 = _mm256_setzero_si256();
+
+    for (int i = 0; i < kFc0InputSize; i += 64) {
+        const __m256i xv0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
+        const __m256i xv1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + 32));
+        a00 = forward_dot_acc_avx2(a00, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i)));
+        a01 = forward_dot_acc_avx2(a01, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + i + 32)));
+        a10 = forward_dot_acc_avx2(a10, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i)));
+        a11 = forward_dot_acc_avx2(a11, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + i + 32)));
+        a20 = forward_dot_acc_avx2(a20, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i)));
+        a21 = forward_dot_acc_avx2(a21, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + i + 32)));
+        a30 = forward_dot_acc_avx2(a30, xv0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + i)));
+        a31 = forward_dot_acc_avx2(a31, xv1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + i + 32)));
+    }
+
+    return forward_reduce_x4_avx2(_mm256_add_epi32(a00, a01), _mm256_add_epi32(a10, a11),
+                                  _mm256_add_epi32(a20, a21), _mm256_add_epi32(a30, a31));
+#endif
+}
+
+// Lane-wise RoundingDivider::div_round for |v| + half < 2^31 (see the bounds
+// above): q = ((|v| + half) * magic) >> shift with full 64-bit products of the
+// even and odd lanes, then the sign of v reapplied, so each lane equals the
+// scalar result.
+struct RoundingDividerAvx2 {
+    __m256i magic;
+    __m128i shift;
+    __m256i half;
+
+    explicit RoundingDividerAvx2(const RoundingDivider& divider)
+        : magic(_mm256_set1_epi32(static_cast<int32_t>(static_cast<uint32_t>(divider.magic)))),
+          shift(_mm_cvtsi32_si128(static_cast<int>(divider.shift))),
+          half(_mm256_set1_epi32(static_cast<int32_t>(divider.half))) {}
+
+    __m256i div_round(__m256i v) const {
+        const __m256i n = _mm256_add_epi32(_mm256_abs_epi32(v), half);
+        const __m256i even = _mm256_srl_epi64(_mm256_mul_epu32(n, magic), shift);
+        const __m256i odd = _mm256_srl_epi64(_mm256_mul_epu32(_mm256_srli_epi64(n, 32), magic), shift);
+        const __m256i q = _mm256_blend_epi32(even, _mm256_slli_epi64(odd, 32), 0xAA);
+        return _mm256_sign_epi32(q, v);
+    }
+};
+
+// Narrows four int32x8 vectors already clamped to [0, 255] into 32 bytes in order.
+static inline __m256i narrow_u8_avx2(__m256i v0, __m256i v1, __m256i v2, __m256i v3) {
+    const __m256i bytes = _mm256_packus_epi16(_mm256_packs_epi32(v0, v1), _mm256_packs_epi32(v2, v3));
+    return _mm256_permutevar8x32_epi32(bytes, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+}
+
+// Forward pass that keeps everything after fc0 in registers, the x86 twin of
+// evaluate_accumulators_int_quantized_neon: the rounding divisions, bias adds and
+// clamps run lane-wise, the squared activation is computed instead of looked up,
+// and fc1/fc2 read their inputs from registers. Bit-identical to
+// evaluate_accumulators_int_quantized_generic.
+IntEvaluationResult evaluate_accumulators_int_quantized_avx2(const AccumulatorView& accumulators,
+                                                             const LoadedNetwork& network,
+                                                             int colour_to_move) {
+    static_assert(kExpectedFc0OutputSize == 32, "fc0 output must fill four int32x8 vectors");
+    static_assert(kExpectedFc1OutputSize == 32, "fc1 output must fill four int32x8 vectors");
+    static_assert(kExpectedHiddenSize == 31 && kFc1InputPaddedSize == 64,
+                  "fc1 input assembly assumes [screlu(31) | crelu(31) | 0, 0]");
+
+    alignas(64) std::array<uint8_t, kFc0InputSize> act;
+
+    const auto& us = (colour_to_move == white) ? *accumulators.white : *accumulators.black;
+    const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
+
+    ft_pairwise_screlu(us.data(), act.data(), kFtActivationHalf, network.ft_one, network.act_shift);
+    ft_pairwise_screlu(them.data(), act.data() + kFtActivationHalf,
+                       kFtActivationHalf, network.ft_one, network.act_shift);
+
+    // fc0: bias + div_round(dot, act_one), wrapped to int32 like the generic path.
+    const RoundingDividerAvx2 div_act_one(network.div_act_one);
+    __m256i fc0[kExpectedFc0OutputSize / 8];
+    for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 8) {
+        const __m128i lo = forward_fc0_dot_x4(act.data(),
+                                              network.fc0_weight_t[j].data(),
+                                              network.fc0_weight_t[j + 1].data(),
+                                              network.fc0_weight_t[j + 2].data(),
+                                              network.fc0_weight_t[j + 3].data());
+        const __m128i hi = forward_fc0_dot_x4(act.data(),
+                                              network.fc0_weight_t[j + 4].data(),
+                                              network.fc0_weight_t[j + 5].data(),
+                                              network.fc0_weight_t[j + 6].data(),
+                                              network.fc0_weight_t[j + 7].data());
+        const __m256i dot = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+        const __m256i bias = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(network.fc0_bias.data() + j));
+        fc0[j / 8] = _mm256_add_epi32(bias, div_act_one.div_round(dot));
+    }
+    alignas(32) int32_t forward_lanes[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(forward_lanes), fc0[kExpectedHiddenSize / 8]);
+    const int32_t forward = forward_lanes[kExpectedHiddenSize % 8];
+
+    // CReLU to [0, qfc0], and screlu_lut[c] == div_round(c * c, qfc0) computed directly.
+    const RoundingDividerAvx2 div_qfc0(network.div_qfc0);
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i qfc0 = _mm256_set1_epi32(network.qfc0);
+    __m256i crelu[kExpectedFc0OutputSize / 8];
+    __m256i screlu[kExpectedFc0OutputSize / 8];
+    for (int k = 0; k < static_cast<int>(kExpectedFc0OutputSize / 8); ++k) {
+        crelu[k] = _mm256_min_epi32(_mm256_max_epi32(fc0[k], zero), qfc0);
+        screlu[k] = div_qfc0.div_round(_mm256_mullo_epi32(crelu[k], crelu[k]));
+    }
+    const __m256i crelu_bytes = narrow_u8_avx2(crelu[0], crelu[1], crelu[2], crelu[3]);
+    const __m256i screlu_bytes = narrow_u8_avx2(screlu[0], screlu[1], screlu[2], screlu[3]);
+
+    // fc1 input [screlu 0..30 | crelu 0..30 | 0, 0]: byte 31 takes crelu 0, and the
+    // upper 32 bytes are crelu shifted down one byte with the last two cleared.
+    const __m256i keep_31 = _mm256_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0);
+    const __m256i keep_30 = _mm256_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0);
+    const __m256i crelu_first_at_31 =
+        _mm256_slli_si256(_mm256_permute2x128_si256(crelu_bytes, crelu_bytes, 0x08), 15);
+    const __m256i crelu_down_one =
+        _mm256_alignr_epi8(_mm256_permute2x128_si256(crelu_bytes, crelu_bytes, 0x81), crelu_bytes, 1);
+    const __m256i x0 = _mm256_or_si256(_mm256_and_si256(screlu_bytes, keep_31), crelu_first_at_31);
+    const __m256i x1 = _mm256_and_si256(crelu_down_one, keep_30);
+
+    // fc1: CReLU(bias + div_round(dot, qfc0)) to [0, qfc1]. The generic path adds in
+    // int64 before clamping; |div_round(dot)| < 2^21, so clamping the bias to
+    // +-2^30 first keeps the int32 add exact without changing the clamped result.
+    const __m256i qfc1 = _mm256_set1_epi32(network.qfc1);
+    const __m256i bias_max = _mm256_set1_epi32(1 << 30);
+    const __m256i bias_min = _mm256_set1_epi32(-(1 << 30));
+    __m256i fc1[kExpectedFc1OutputSize / 8];
+    for (int j = 0; j < static_cast<int>(kExpectedFc1OutputSize); j += 8) {
+        __m128i half_dots[2];
+        for (int h = 0; h < 2; ++h) {
+            __m256i rows[4];
+            for (int r = 0; r < 4; ++r) {
+                const int8_t* w = network.fc1_weight_t[j + 4 * h + r].data();
+                rows[r] = forward_dot_acc_avx2(
+                    forward_dot_acc_avx2(zero, x0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w))),
+                    x1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + 32)));
+            }
+            half_dots[h] = forward_reduce_x4_avx2(rows[0], rows[1], rows[2], rows[3]);
+        }
+        const __m256i dot = _mm256_inserti128_si256(_mm256_castsi128_si256(half_dots[0]), half_dots[1], 1);
+        const __m256i bias = _mm256_min_epi32(
+            _mm256_max_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(network.fc1_bias.data() + j)),
+                             bias_min),
+            bias_max);
+        const __m256i sum = _mm256_add_epi32(bias, div_qfc0.div_round(dot));
+        fc1[j / 8] = _mm256_min_epi32(_mm256_max_epi32(sum, zero), qfc1);
+    }
+    const __m256i a1 = narrow_u8_avx2(fc1[0], fc1[1], fc1[2], fc1[3]);
+
+    const __m256i fc2_acc = forward_dot_acc_avx2(
+        zero, a1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(network.fc2_weight.data())));
+    const __m128i fc2_sum4 = _mm_add_epi32(_mm256_castsi256_si128(fc2_acc), _mm256_extracti128_si256(fc2_acc, 1));
+    const __m128i fc2_sum2 = _mm_add_epi32(fc2_sum4, _mm_unpackhi_epi64(fc2_sum4, fc2_sum4));
+    const int32_t fc2_dot = _mm_cvtsi128_si32(fc2_sum2) + _mm_extract_epi32(fc2_sum2, 1);
+    return {
+        static_cast<int32_t>(static_cast<int64_t>(network.fc2_bias) +
+                             network.div_qfc1.div_round(fc2_dot)),
+        forward
+    };
+}
+#endif
+
 IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& accumulators,
                                                         const LoadedNetwork& network,
                                                         int colour_to_move) {
 #if defined(USE_NEON)
     return evaluate_accumulators_int_quantized_neon(accumulators, network, colour_to_move);
+#elif defined(USE_AVX2) || (defined(USE_AVX512) && defined(__AVX512VNNI__))
+    return evaluate_accumulators_int_quantized_avx2(accumulators, network, colour_to_move);
 #else
     return evaluate_accumulators_int_quantized_generic(accumulators, network, colour_to_move);
 #endif
@@ -2853,6 +3192,15 @@ bool load_network_from_stream(std::istream& stream,
                 fc0_weight_q[static_cast<std::size_t>(i) * kExpectedFc0OutputSize + j];
         }
     }
+#if defined(USE_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    for (int i = 0; i < kFc0InputSize; ++i) {
+        for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); ++j) {
+            network.fc0_weight_chunked[static_cast<std::size_t>(i / 4) * kExpectedFc0OutputSize * 4 +
+                                       static_cast<std::size_t>(j) * 4 + static_cast<std::size_t>(i % 4)] =
+                network.fc0_weight_t[j][i];
+        }
+    }
+#endif
 
     for (int j = 0; j < static_cast<int>(kExpectedFc1OutputSize); ++j) {
         for (int i = 0; i < static_cast<int>(kExpectedFc1InputSize); ++i) {
