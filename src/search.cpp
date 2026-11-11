@@ -1208,6 +1208,25 @@ bool move_passes_fast_legal_filter(thrawn::Position* pos, int move,
            (pos->line_bb[source][target] & square_bb(legality.kingSquare));
 }
 
+// Key of the position after `move`, close enough for an early TT prefetch: it
+// leaves out the castling rook and rights, the en passant victim and a newly
+// set en passant square, since a wrong key only wastes the hint.
+uint64_t approximate_child_key(const thrawn::Position* pos, int move) {
+    const int piece = get_move_piece(move);
+    const int source = get_move_source(move);
+    const int target = get_move_target(move);
+    const int promoted = get_promoted_piece(move);
+    uint64_t key = pos->zobristKey ^ pos->colour_to_move_hashkey ^
+                   pos->piece_hashkey[piece][source] ^
+                   pos->piece_hashkey[promoted ? promoted : piece][target];
+    const int captured = pos->mailbox[target];
+    if (captured >= 0)
+        key ^= pos->piece_hashkey[captured][target];
+    if (pos->enpassant != null_sq)
+        key ^= pos->enpassant_hashkey[pos->enpassant];
+    return key;
+}
+
 class MovePicker {
 public:
     MovePicker(thrawn::Position* pos, ThreadData* td, int ttMove,
@@ -1730,7 +1749,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
                 pos->repetition_index++;
                 pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
-                if (!make_move_on_board(pos, move, all_moves, pos->ply))
+                if (!make_move_known_legal(pos, move, all_moves, pos->ply))
                 {
                     pos->ply--;
                     pos->repetition_index--;
@@ -1804,6 +1823,9 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
             continue;
 
         move_count++;
+        // The exact prefetch after make_move comes too late to hide much of
+        // the child's TT miss; this one starts the load before the pruning.
+        tt->prefetch(approximate_child_key(pos, move));
 
         const bool quietMove = is_quiet_move(move);
         const bool captureMove = get_is_capture_move(move);
@@ -1948,7 +1970,7 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
-        if (!make_move_on_board(pos, move, all_moves, pos->ply))
+        if (!make_move_known_legal(pos, move, all_moves, pos->ply))
         {
             pos->ply--;
             pos->repetition_index--;
@@ -2240,6 +2262,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
     while (movePicker.next(picked))
     {
         const int move = picked.move;
+        tt->prefetch(approximate_child_key(pos, move));
 
         if (!inCheck && !get_promoted_piece(move) && !is_mate_score(bestScore))
         {
@@ -2259,7 +2282,7 @@ int quiescence(thrawn::Position* pos, ThreadData* td,
         pos->repetition_index++;
         pos->repetition_table[pos->repetition_index] = pos->zobristKey;
 
-        if (!make_move_on_board(pos, move, move_type, pos->ply))
+        if (!make_move_known_legal(pos, move, move_type, pos->ply))
         {
             pos->ply--;
             pos->repetition_index--;
