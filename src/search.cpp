@@ -1606,7 +1606,6 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
     eval = static_eval;
     td->static_eval_stack[pos->ply] = static_eval;
     td->in_check_stack[pos->ply] = inCheck;
-    set_threats(td, pos);
 
     nodeContext = make_node_context(td, pos->ply, static_eval, cutNode);
 
@@ -1784,6 +1783,9 @@ int negamax_impl(thrawn::Position* pos, ThreadData* td, int depth, int alpha,
         depth -= SEARCH_IIR_REDUCTION;
     }
 
+    // Only quiet ordering and quiet history at this ply read the threats, so they
+    // are computed here, after every pruning step that can return without them.
+    set_threats(td, pos);
     const bool nodeFollowPv = td->follow_pv_flag;
     MovePicker movePicker(pos, td, ttMove, nodeFollowPv, all_moves, legality);
 
