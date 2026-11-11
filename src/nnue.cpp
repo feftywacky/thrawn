@@ -229,6 +229,12 @@ struct RoundingDivider {
         }
         shift = kMagicBits + l;
         magic = ((uint64_t{1} << shift) + d - 1) / d;
+        // The integer d > 2^(l-1) keeps 2^(N+l) / d < 2^32 with a gap far wider
+        // than the ceiling's rounding, so m < 2^32 for every scale in [1, 255]. The
+        // NEON forward pass relies on this for its 32x32->64-bit multiply.
+        if (magic > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
         half = d / 2U;
         divisor = d;
         return true;
@@ -464,15 +470,15 @@ int engine_to_model_square(int square) {
     return square ^ 56;
 }
 
-bool is_white_piece(int piece) {
+constexpr bool is_white_piece(int piece) {
     return piece >= P && piece <= K;
 }
 
-bool is_king_piece(int piece) {
+constexpr bool is_king_piece(int piece) {
     return piece == K || piece == k;
 }
 
-int piece_type_index(int piece) {
+constexpr int piece_type_index(int piece) {
     switch (piece) {
         case P:
         case p:
@@ -494,7 +500,7 @@ int piece_type_index(int piece) {
     }
 }
 
-int piece_square_offset(int piece, bool white_perspective) {
+constexpr int piece_square_offset_reference(int piece, bool white_perspective) {
     if (is_king_piece(piece)) {
         return kKingPlaneOffset;
     }
@@ -506,6 +512,29 @@ int piece_square_offset(int piece, bool white_perspective) {
 
     const bool friendly = white_perspective == is_white_piece(piece);
     return (ptype * 2 + (friendly ? 0 : 1)) * 64;
+}
+
+struct PieceSquareOffsetTable {
+    int offset[2][12];
+};
+
+constexpr PieceSquareOffsetTable make_piece_square_offset_table() {
+    PieceSquareOffsetTable table{};
+    for (int perspective = 0; perspective < 2; ++perspective) {
+        for (int piece = P; piece <= k; ++piece) {
+            table.offset[perspective][piece] = piece_square_offset_reference(piece, perspective == 0);
+        }
+    }
+    return table;
+}
+
+constexpr PieceSquareOffsetTable kPieceSquareOffsets = make_piece_square_offset_table();
+
+int piece_square_offset(int piece, bool white_perspective) {
+    if (static_cast<unsigned>(piece) > static_cast<unsigned>(k)) {
+        return -1;
+    }
+    return kPieceSquareOffsets.offset[white_perspective ? 0 : 1][piece];
 }
 
 int halfkav2_hm_index(int piece,
@@ -670,6 +699,54 @@ static inline void acc_add_sub_row_from_avx2(int16_t* dst, const int16_t* src,
     }
 }
 
+// Capture shape: dst = src + add - sub1 - sub2 (moving piece added at its target,
+// removed from its origin, captured piece removed).
+static inline void acc_add_sub_sub_row_from_avx2(int16_t* dst, const int16_t* src, const int16_t* add,
+                                                 const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_sub_epi16(
+            _mm256_sub_epi16(
+                _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i)),
+                                 _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i))),
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(sub1 + i))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub2 + i)));
+        const __m256i a1 = _mm256_sub_epi16(
+            _mm256_sub_epi16(
+                _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i + 16)),
+                                 _mm256_load_si256(reinterpret_cast<const __m256i*>(add + i + 16))),
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(sub1 + i + 16))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub2 + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i + 16), a1);
+    }
+}
+
+// Castling shape: dst = src + add1 + add2 - sub1 - sub2 (king and rook both move).
+static inline void acc_add2_sub2_row_from_avx2(int16_t* dst, const int16_t* src,
+                                               const int16_t* add1, const int16_t* add2,
+                                               const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
+        const __m256i a0 = _mm256_sub_epi16(
+            _mm256_sub_epi16(
+                _mm256_add_epi16(
+                    _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i)),
+                                     _mm256_load_si256(reinterpret_cast<const __m256i*>(add1 + i))),
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(add2 + i))),
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(sub1 + i))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub2 + i)));
+        const __m256i a1 = _mm256_sub_epi16(
+            _mm256_sub_epi16(
+                _mm256_add_epi16(
+                    _mm256_add_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(src + i + 16)),
+                                     _mm256_load_si256(reinterpret_cast<const __m256i*>(add1 + i + 16))),
+                    _mm256_load_si256(reinterpret_cast<const __m256i*>(add2 + i + 16))),
+                _mm256_load_si256(reinterpret_cast<const __m256i*>(sub1 + i + 16))),
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(sub2 + i + 16)));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i), a0);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(dst + i + 16), a1);
+    }
+}
+
 // Pairwise SqrCReLU on one perspective's accumulator: for i in [0, half)
 //   out[i] = (clamp(acc[i], 0, ft_one) * clamp(acc[i + half], 0, ft_one)) >> shift
 // ft_one <= 255 keeps clamp(a)*clamp(b) < 2^16, so _mm256_mullo_epi16 yields the
@@ -795,6 +872,54 @@ static inline void acc_add_sub_row_from_avx512(int16_t* dst, const int16_t* src,
     }
 }
 
+// Capture shape: dst = src + add - sub1 - sub2 (moving piece added at its target,
+// removed from its origin, captured piece removed).
+static inline void acc_add_sub_sub_row_from_avx512(int16_t* dst, const int16_t* src, const int16_t* add,
+                                                   const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_sub_epi16(
+            _mm512_sub_epi16(
+                _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i)),
+                                 _mm512_load_si512(reinterpret_cast<const void*>(add + i))),
+                _mm512_load_si512(reinterpret_cast<const void*>(sub1 + i))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub2 + i)));
+        const __m512i a1 = _mm512_sub_epi16(
+            _mm512_sub_epi16(
+                _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i + 32)),
+                                 _mm512_load_si512(reinterpret_cast<const void*>(add + i + 32))),
+                _mm512_load_si512(reinterpret_cast<const void*>(sub1 + i + 32))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub2 + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i + 32), a1);
+    }
+}
+
+// Castling shape: dst = src + add1 + add2 - sub1 - sub2 (king and rook both move).
+static inline void acc_add2_sub2_row_from_avx512(int16_t* dst, const int16_t* src,
+                                                 const int16_t* add1, const int16_t* add2,
+                                                 const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 64) {
+        const __m512i a0 = _mm512_sub_epi16(
+            _mm512_sub_epi16(
+                _mm512_add_epi16(
+                    _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i)),
+                                     _mm512_load_si512(reinterpret_cast<const void*>(add1 + i))),
+                    _mm512_load_si512(reinterpret_cast<const void*>(add2 + i))),
+                _mm512_load_si512(reinterpret_cast<const void*>(sub1 + i))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub2 + i)));
+        const __m512i a1 = _mm512_sub_epi16(
+            _mm512_sub_epi16(
+                _mm512_add_epi16(
+                    _mm512_add_epi16(_mm512_load_si512(reinterpret_cast<const void*>(src + i + 32)),
+                                     _mm512_load_si512(reinterpret_cast<const void*>(add1 + i + 32))),
+                    _mm512_load_si512(reinterpret_cast<const void*>(add2 + i + 32))),
+                _mm512_load_si512(reinterpret_cast<const void*>(sub1 + i + 32))),
+            _mm512_load_si512(reinterpret_cast<const void*>(sub2 + i + 32)));
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i), a0);
+        _mm512_store_si512(reinterpret_cast<void*>(dst + i + 32), a1);
+    }
+}
+
 // Pairwise SqrCReLU (see the AVX2 twin for the math). ft_one <= 255 keeps
 // clamp(a)*clamp(b) < 2^16, so _mm512_mullo_epi16 yields the exact product and
 // _mm512_srl_epi16 (logical) renormalizes it into [0, act_one]. Since every result
@@ -876,6 +1001,40 @@ static inline void acc_sub_row_from_neon(int16_t* dst, const int16_t* src, const
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
         vst1q_s16(dst + i,     vsubq_s16(vld1q_s16(src + i),     vld1q_s16(sub + i)));
         vst1q_s16(dst + i + 8, vsubq_s16(vld1q_s16(src + i + 8), vld1q_s16(sub + i + 8)));
+    }
+}
+
+// Capture shape: dst = src + add - sub1 - sub2 (moving piece added at its target,
+// removed from its origin, captured piece removed).
+static inline void acc_add_sub_sub_row_from_neon(int16_t* dst, const int16_t* src, const int16_t* add,
+                                                 const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        const int16x8_t a0 = vsubq_s16(vsubq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(add + i)),
+                                                 vld1q_s16(sub1 + i)),
+                                       vld1q_s16(sub2 + i));
+        const int16x8_t a1 = vsubq_s16(vsubq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(add + i + 8)),
+                                                 vld1q_s16(sub1 + i + 8)),
+                                       vld1q_s16(sub2 + i + 8));
+        vst1q_s16(dst + i, a0);
+        vst1q_s16(dst + i + 8, a1);
+    }
+}
+
+// Castling shape: dst = src + add1 + add2 - sub1 - sub2 (king and rook both move).
+static inline void acc_add2_sub2_row_from_neon(int16_t* dst, const int16_t* src,
+                                               const int16_t* add1, const int16_t* add2,
+                                               const int16_t* sub1, const int16_t* sub2) {
+    for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
+        const int16x8_t a0 = vsubq_s16(
+            vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(add1 + i)), vld1q_s16(add2 + i)),
+                      vld1q_s16(sub1 + i)),
+            vld1q_s16(sub2 + i));
+        const int16x8_t a1 = vsubq_s16(
+            vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(add1 + i + 8)), vld1q_s16(add2 + i + 8)),
+                      vld1q_s16(sub1 + i + 8)),
+            vld1q_s16(sub2 + i + 8));
+        vst1q_s16(dst + i, a0);
+        vst1q_s16(dst + i + 8, a1);
     }
 }
 
@@ -966,7 +1125,15 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
         acc_add_sub_row_from_avx512(d, s, add_rows[0], sub_rows[0]);
         return true;
     }
-    // General case (castling / multi-piece batches): still a single fused pass —
+    if (add_count == 1 && sub_count == 2) {
+        acc_add_sub_sub_row_from_avx512(d, s, add_rows[0], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    if (add_count == 2 && sub_count == 2) {
+        acc_add2_sub2_row_from_avx512(d, s, add_rows[0], add_rows[1], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    // General case (multi-piece batches): still a single fused pass —
     // read src once, fold every add/sub row, write dst once.
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 32) {
         __m512i a = _mm512_load_si512(reinterpret_cast<const void*>(s + i));
@@ -992,7 +1159,15 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
         acc_add_sub_row_from_avx2(d, s, add_rows[0], sub_rows[0]);
         return true;
     }
-    // General case (castling / multi-piece batches): still a single fused pass —
+    if (add_count == 1 && sub_count == 2) {
+        acc_add_sub_sub_row_from_avx2(d, s, add_rows[0], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    if (add_count == 2 && sub_count == 2) {
+        acc_add2_sub2_row_from_avx2(d, s, add_rows[0], add_rows[1], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    // General case (multi-piece batches): still a single fused pass —
     // read src once, fold every add/sub row, write dst once.
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 16) {
         __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(s + i));
@@ -1016,6 +1191,14 @@ bool update_accumulator_rows_from(std::array<int16_t, kExpectedFtSize>& dst,
     }
     if (add_count == 1 && sub_count == 1) {
         acc_add_sub_row_from_neon(d, s, add_rows[0], sub_rows[0]);
+        return true;
+    }
+    if (add_count == 1 && sub_count == 2) {
+        acc_add_sub_sub_row_from_neon(d, s, add_rows[0], sub_rows[0], sub_rows[1]);
+        return true;
+    }
+    if (add_count == 2 && sub_count == 2) {
+        acc_add2_sub2_row_from_neon(d, s, add_rows[0], add_rows[1], sub_rows[0], sub_rows[1]);
         return true;
     }
     for (int i = 0; i < static_cast<int>(kExpectedFtSize); i += 8) {
@@ -1821,16 +2004,30 @@ int32_t dot_u8_i8_neon(const uint8_t* x_u8, const int8_t* w, int count) {
 #endif
 }
 
-void dot_u8_i8_x4_neon(const uint8_t* x_u8,
-                       const int8_t* w0,
-                       const int8_t* w1,
-                       const int8_t* w2,
-                       const int8_t* w3,
-                       int count,
-                       int32_t& s0,
-                       int32_t& s1,
-                       int32_t& s2,
-                       int32_t& s3) {
+// Accumulates one 16-byte slice of a dot product into `acc`. Both operands are
+// read as int8, matching dot_u8_i8_neon.
+static inline int32x4_t dot_acc_s8_neon(int32x4_t acc, int8x16_t x, int8x16_t w) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vdotq_s32(acc, x, w);
+#else
+    const int16x8_t lo = vmull_s8(vget_low_s8(x), vget_low_s8(w));
+    const int16x8_t hi = vmull_s8(vget_high_s8(x), vget_high_s8(w));
+    return vaddq_s32(acc, vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi)));
+#endif
+}
+
+// Folds four per-row partial-sum vectors into {sum(r0), sum(r1), sum(r2), sum(r3)}.
+static inline int32x4_t reduce_x4_neon(int32x4_t r0, int32x4_t r1, int32x4_t r2, int32x4_t r3) {
+    return vpaddq_s32(vpaddq_s32(r0, r1), vpaddq_s32(r2, r3));
+}
+
+// Four dot products of x against w0..w3, returned as one vector of the four sums.
+int32x4_t dot_u8_i8_x4_neon(const uint8_t* x_u8,
+                            const int8_t* w0,
+                            const int8_t* w1,
+                            const int8_t* w2,
+                            const int8_t* w3,
+                            int count) {
     const int8_t* x = reinterpret_cast<const int8_t*>(x_u8);
 
     int32x4_t a00 = vdupq_n_s32(0);
@@ -1842,43 +2039,22 @@ void dot_u8_i8_x4_neon(const uint8_t* x_u8,
     int32x4_t a30 = vdupq_n_s32(0);
     int32x4_t a31 = vdupq_n_s32(0);
 
-#if !defined(__ARM_FEATURE_DOTPROD)
-    auto accumulate = [](int32x4_t acc, int8x16_t xv, int8x16_t wv) {
-        const int16x8_t lo = vmull_s8(vget_low_s8(xv), vget_low_s8(wv));
-        const int16x8_t hi = vmull_s8(vget_high_s8(xv), vget_high_s8(wv));
-        return vaddq_s32(acc, vaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi)));
-    };
-#endif
-
     int i = 0;
     for (; i + 31 < count; i += 32) {
         const int8x16_t x0 = vld1q_s8(x + i);
         const int8x16_t x1 = vld1q_s8(x + i + 16);
-#if defined(__ARM_FEATURE_DOTPROD)
-        a00 = vdotq_s32(a00, x0, vld1q_s8(w0 + i));
-        a01 = vdotq_s32(a01, x1, vld1q_s8(w0 + i + 16));
-        a10 = vdotq_s32(a10, x0, vld1q_s8(w1 + i));
-        a11 = vdotq_s32(a11, x1, vld1q_s8(w1 + i + 16));
-        a20 = vdotq_s32(a20, x0, vld1q_s8(w2 + i));
-        a21 = vdotq_s32(a21, x1, vld1q_s8(w2 + i + 16));
-        a30 = vdotq_s32(a30, x0, vld1q_s8(w3 + i));
-        a31 = vdotq_s32(a31, x1, vld1q_s8(w3 + i + 16));
-#else
-        a00 = accumulate(a00, x0, vld1q_s8(w0 + i));
-        a01 = accumulate(a01, x1, vld1q_s8(w0 + i + 16));
-        a10 = accumulate(a10, x0, vld1q_s8(w1 + i));
-        a11 = accumulate(a11, x1, vld1q_s8(w1 + i + 16));
-        a20 = accumulate(a20, x0, vld1q_s8(w2 + i));
-        a21 = accumulate(a21, x1, vld1q_s8(w2 + i + 16));
-        a30 = accumulate(a30, x0, vld1q_s8(w3 + i));
-        a31 = accumulate(a31, x1, vld1q_s8(w3 + i + 16));
-#endif
+        a00 = dot_acc_s8_neon(a00, x0, vld1q_s8(w0 + i));
+        a01 = dot_acc_s8_neon(a01, x1, vld1q_s8(w0 + i + 16));
+        a10 = dot_acc_s8_neon(a10, x0, vld1q_s8(w1 + i));
+        a11 = dot_acc_s8_neon(a11, x1, vld1q_s8(w1 + i + 16));
+        a20 = dot_acc_s8_neon(a20, x0, vld1q_s8(w2 + i));
+        a21 = dot_acc_s8_neon(a21, x1, vld1q_s8(w2 + i + 16));
+        a30 = dot_acc_s8_neon(a30, x0, vld1q_s8(w3 + i));
+        a31 = dot_acc_s8_neon(a31, x1, vld1q_s8(w3 + i + 16));
     }
 
-    s0 = vaddvq_s32(vaddq_s32(a00, a01));
-    s1 = vaddvq_s32(vaddq_s32(a10, a11));
-    s2 = vaddvq_s32(vaddq_s32(a20, a21));
-    s3 = vaddvq_s32(vaddq_s32(a30, a31));
+    return reduce_x4_neon(vaddq_s32(a00, a01), vaddq_s32(a10, a11),
+                          vaddq_s32(a20, a21), vaddq_s32(a30, a31));
 }
 #endif
 
@@ -1988,7 +2164,11 @@ void dot_u8_i8_x4(const uint8_t* x,
     }
 #elif defined(USE_NEON)
     if (count % 16 == 0) {
-        dot_u8_i8_x4_neon(x, w0, w1, w2, w3, count, s0, s1, s2, s3);
+        const int32x4_t sums = dot_u8_i8_x4_neon(x, w0, w1, w2, w3, count);
+        s0 = vgetq_lane_s32(sums, 0);
+        s1 = vgetq_lane_s32(sums, 1);
+        s2 = vgetq_lane_s32(sums, 2);
+        s3 = vgetq_lane_s32(sums, 3);
         return;
     }
 #endif
@@ -2006,9 +2186,9 @@ uint8_t crelu_to_u8(int64_t value, int32_t scale) {
     return static_cast<uint8_t>(value);
 }
 
-IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& accumulators,
-                                                        const LoadedNetwork& network,
-                                                        int colour_to_move) {
+// Portable forward pass, also the reference the SIMD forward pass must match.
+[[maybe_unused]] IntEvaluationResult evaluate_accumulators_int_quantized_generic(
+    const AccumulatorView& accumulators, const LoadedNetwork& network, int colour_to_move) {
     alignas(64) std::array<uint8_t, kFc0InputSize> act;
     alignas(64) std::array<int32_t, kExpectedFc0OutputSize> fc0;
     alignas(64) std::array<uint8_t, kFc1InputPaddedSize> a0;
@@ -2085,6 +2265,188 @@ IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& a
                              network.div_qfc1.div_round(fc2_dot)),
         fc0[static_cast<int>(kExpectedHiddenSize)]
     };
+}
+
+#if defined(USE_NEON)
+// Every dot product the NEON forward pass divides reads both operands as int8,
+// so |sum| <= inputs * 128 * 128. Adding the rounding half (< 128) must stay
+// below 2^31 = 2^RoundingDivider::kMagicBits, where the multiply-shift quotient
+// is exact and RoundingDivider::div_round never takes its division fallback.
+static_assert(static_cast<int64_t>(kFc0InputSize) * 128 * 128 + 128 <
+                  (int64_t{1} << RoundingDivider::kMagicBits),
+              "fc0 dot products exceed the exact multiply-shift range");
+static_assert(static_cast<int64_t>(kFc1InputPaddedSize) * 128 * 128 + 128 <
+                  (int64_t{1} << RoundingDivider::kMagicBits),
+              "fc1 dot products exceed the exact multiply-shift range");
+// The squared CReLU (<= 255 * 255) plus its rounding half stays in the same range.
+static_assert(255 * 255 + 128 < (int64_t{1} << RoundingDivider::kMagicBits),
+              "squared activation exceeds the exact multiply-shift range");
+
+// Lane-wise RoundingDivider::div_round for |v| + half < 2^31 (see the bounds
+// above): q = ((|v| + half) * magic) >> shift with a full 64-bit product, then
+// the sign of v reapplied, so each lane equals the scalar result.
+struct RoundingDividerNeon {
+    uint32x4_t magic;
+    int64x2_t neg_shift;
+    uint32x4_t half;
+
+    explicit RoundingDividerNeon(const RoundingDivider& divider)
+        : magic(vdupq_n_u32(static_cast<uint32_t>(divider.magic))),
+          neg_shift(vdupq_n_s64(-static_cast<int64_t>(divider.shift))),
+          half(vdupq_n_u32(divider.half)) {}
+
+    int32x4_t div_round(int32x4_t v) const {
+        const uint32x4_t n = vaddq_u32(vreinterpretq_u32_s32(vabsq_s32(v)), half);
+        const uint64x2_t lo = vshlq_u64(vmull_u32(vget_low_u32(n), vget_low_u32(magic)), neg_shift);
+        const uint64x2_t hi = vshlq_u64(vmull_high_u32(n, magic), neg_shift);
+        const int32x4_t q = vreinterpretq_s32_u32(vcombine_u32(vmovn_u64(lo), vmovn_u64(hi)));
+        const int32x4_t sign = vshrq_n_s32(v, 31);
+        return vsubq_s32(veorq_s32(q, sign), sign);
+    }
+};
+
+// Narrows four int32x4 lanes already clamped to [0, 255] into one uint8x16.
+static inline uint8x16_t narrow_u8_neon(int32x4_t v0, int32x4_t v1, int32x4_t v2, int32x4_t v3) {
+    const uint16x8_t lo = vcombine_u16(vmovn_u32(vreinterpretq_u32_s32(v0)),
+                                       vmovn_u32(vreinterpretq_u32_s32(v1)));
+    const uint16x8_t hi = vcombine_u16(vmovn_u32(vreinterpretq_u32_s32(v2)),
+                                       vmovn_u32(vreinterpretq_u32_s32(v3)));
+    return vcombine_u8(vmovn_u16(lo), vmovn_u16(hi));
+}
+
+// fc1 input layout as byte indices into the 64-byte table [screlu(fc0) | crelu(fc0)]
+// (32 lanes each): fc1 input i < H reads screlu lane i, H <= i < 2H reads crelu
+// lane i - H, and the padding reads 0xFF, which vqtbl4q_u8 turns into 0.
+struct Fc1InputGatherIndices {
+    alignas(16) uint8_t index[kFc1InputPaddedSize];
+};
+
+constexpr Fc1InputGatherIndices make_fc1_input_gather_indices() {
+    Fc1InputGatherIndices result{};
+    constexpr int hidden = static_cast<int>(kExpectedHiddenSize);
+    for (int i = 0; i < kFc1InputPaddedSize; ++i) {
+        result.index[i] = i < hidden       ? static_cast<uint8_t>(i)
+                        : i < 2 * hidden   ? static_cast<uint8_t>(32 + i - hidden)
+                                           : uint8_t{0xFF};
+    }
+    return result;
+}
+
+constexpr Fc1InputGatherIndices kFc1InputGather = make_fc1_input_gather_indices();
+
+// Forward pass that keeps everything after fc0 in registers: fc0 sums come back
+// as vectors, the rounding divisions, bias adds, clamps and the screlu table
+// lookup run lane-wise, and fc1/fc2 read their inputs from registers instead of
+// byte-written buffers. Bit-identical to evaluate_accumulators_int_quantized_generic.
+IntEvaluationResult evaluate_accumulators_int_quantized_neon(const AccumulatorView& accumulators,
+                                                             const LoadedNetwork& network,
+                                                             int colour_to_move) {
+    static_assert(kExpectedFc0OutputSize == 32, "fc0 output must fill two uint8x16 vectors");
+    static_assert(kExpectedFc1OutputSize == 32, "fc1 output must fill two uint8x16 vectors");
+    static_assert(kFc1InputPaddedSize == 64, "fc1 input must fill four uint8x16 vectors");
+
+    alignas(64) std::array<uint8_t, kFc0InputSize> act;
+
+    const auto& us = (colour_to_move == white) ? *accumulators.white : *accumulators.black;
+    const auto& them = (colour_to_move == white) ? *accumulators.black : *accumulators.white;
+
+    ft_pairwise_screlu(us.data(), act.data(), kFtActivationHalf, network.ft_one, network.act_shift);
+    ft_pairwise_screlu(them.data(), act.data() + kFtActivationHalf,
+                       kFtActivationHalf, network.ft_one, network.act_shift);
+
+    // fc0: bias + div_round(dot, act_one), wrapped to int32 like the generic path.
+    const RoundingDividerNeon div_act_one(network.div_act_one);
+    int32x4_t fc0[kExpectedFc0OutputSize / 4];
+    for (int j = 0; j < static_cast<int>(kExpectedFc0OutputSize); j += 4) {
+        const int32x4_t dot = dot_u8_i8_x4_neon(act.data(),
+                                                network.fc0_weight_t[j].data(),
+                                                network.fc0_weight_t[j + 1].data(),
+                                                network.fc0_weight_t[j + 2].data(),
+                                                network.fc0_weight_t[j + 3].data(),
+                                                kFc0InputSize);
+        fc0[j / 4] = vaddq_s32(vld1q_s32(network.fc0_bias.data() + j), div_act_one.div_round(dot));
+    }
+    const int32_t forward = vgetq_lane_s32(fc0[kExpectedHiddenSize / 4], kExpectedHiddenSize % 4);
+
+    // CReLU to [0, qfc0], then screlu_lut over those bytes.
+    const int32x4_t zero = vdupq_n_s32(0);
+    const int32x4_t qfc0 = vdupq_n_s32(network.qfc0);
+    int32x4_t crelu[kExpectedFc0OutputSize / 4];
+    for (int k = 0; k < static_cast<int>(kExpectedFc0OutputSize / 4); ++k) {
+        crelu[k] = vminq_s32(vmaxq_s32(fc0[k], zero), qfc0);
+    }
+    const uint8x16_t crelu_lo = narrow_u8_neon(crelu[0], crelu[1], crelu[2], crelu[3]);
+    const uint8x16_t crelu_hi = narrow_u8_neon(crelu[4], crelu[5], crelu[6], crelu[7]);
+
+    const uint8_t* lut = network.screlu_lut.data();
+    const uint8x16x4_t lut0 = vld1q_u8_x4(lut);
+    const uint8x16x4_t lut1 = vld1q_u8_x4(lut + 64);
+    const uint8x16x4_t lut2 = vld1q_u8_x4(lut + 128);
+    const uint8x16x4_t lut3 = vld1q_u8_x4(lut + 192);
+    const uint8x16_t step = vdupq_n_u8(64);
+    auto screlu = [&](uint8x16_t c) {
+        uint8x16_t r = vqtbl4q_u8(lut0, c);
+        c = vsubq_u8(c, step);
+        r = vqtbx4q_u8(r, lut1, c);
+        c = vsubq_u8(c, step);
+        r = vqtbx4q_u8(r, lut2, c);
+        c = vsubq_u8(c, step);
+        return vqtbx4q_u8(r, lut3, c);
+    };
+
+    uint8x16x4_t fc1_table;
+    fc1_table.val[0] = screlu(crelu_lo);
+    fc1_table.val[1] = screlu(crelu_hi);
+    fc1_table.val[2] = crelu_lo;
+    fc1_table.val[3] = crelu_hi;
+
+    int8x16_t x[4];
+    for (int k = 0; k < 4; ++k) {
+        x[k] = vreinterpretq_s8_u8(vqtbl4q_u8(fc1_table, vld1q_u8(kFc1InputGather.index + 16 * k)));
+    }
+
+    // fc1: CReLU(bias + div_round(dot, qfc0)) to [0, qfc1]. The generic path adds in
+    // int64 before clamping; a saturating int32 add clamps to the same value.
+    const RoundingDividerNeon div_qfc0(network.div_qfc0);
+    const int32x4_t qfc1 = vdupq_n_s32(network.qfc1);
+    int32x4_t fc1[kExpectedFc1OutputSize / 4];
+    for (int j = 0; j < static_cast<int>(kExpectedFc1OutputSize); j += 4) {
+        int32x4_t rows[4];
+        for (int r = 0; r < 4; ++r) {
+            const int8_t* w = network.fc1_weight_t[j + r].data();
+            const int32x4_t even = dot_acc_s8_neon(dot_acc_s8_neon(vdupq_n_s32(0), x[0], vld1q_s8(w)),
+                                                   x[2], vld1q_s8(w + 32));
+            const int32x4_t odd = dot_acc_s8_neon(dot_acc_s8_neon(vdupq_n_s32(0), x[1], vld1q_s8(w + 16)),
+                                                  x[3], vld1q_s8(w + 48));
+            rows[r] = vaddq_s32(even, odd);
+        }
+        const int32x4_t dot = reduce_x4_neon(rows[0], rows[1], rows[2], rows[3]);
+        const int32x4_t sum = vqaddq_s32(vld1q_s32(network.fc1_bias.data() + j), div_qfc0.div_round(dot));
+        fc1[j / 4] = vminq_s32(vmaxq_s32(sum, zero), qfc1);
+    }
+    const int8x16_t a1_lo = vreinterpretq_s8_u8(narrow_u8_neon(fc1[0], fc1[1], fc1[2], fc1[3]));
+    const int8x16_t a1_hi = vreinterpretq_s8_u8(narrow_u8_neon(fc1[4], fc1[5], fc1[6], fc1[7]));
+
+    const int32x4_t fc2_acc = dot_acc_s8_neon(dot_acc_s8_neon(vdupq_n_s32(0), a1_lo,
+                                                              vld1q_s8(network.fc2_weight.data())),
+                                              a1_hi, vld1q_s8(network.fc2_weight.data() + 16));
+    const int32_t fc2_dot = vaddvq_s32(fc2_acc);
+    return {
+        static_cast<int32_t>(static_cast<int64_t>(network.fc2_bias) +
+                             network.div_qfc1.div_round(fc2_dot)),
+        forward
+    };
+}
+#endif
+
+IntEvaluationResult evaluate_accumulators_int_quantized(const AccumulatorView& accumulators,
+                                                        const LoadedNetwork& network,
+                                                        int colour_to_move) {
+#if defined(USE_NEON)
+    return evaluate_accumulators_int_quantized_neon(accumulators, network, colour_to_move);
+#else
+    return evaluate_accumulators_int_quantized_generic(accumulators, network, colour_to_move);
+#endif
 }
 
 double raw_output_from_quantized(const IntEvaluationResult& result,
