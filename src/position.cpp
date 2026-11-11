@@ -13,6 +13,7 @@ void init_position_tables(thrawn::Position* pos) {
     init_leaping_attacks(pos);
     init_sliding_attacks(pos, bishop);
     init_sliding_attacks(pos, rook);
+    init_line_tables(pos);
     init_hashkeys(pos);
 }
 
@@ -35,6 +36,9 @@ std::array<uint64_t, Position::ROOK_TABLE_SIZE> Position::rook_attacks{};
 std::array<std::array<uint64_t, 512>, 64> Position::bishop_attacks{};
 std::array<std::array<uint64_t, 4096>, 64> Position::rook_attacks{};
 #endif
+
+std::array<std::array<uint64_t, 64>, 64> Position::between_bb{};
+std::array<std::array<uint64_t, 64>, 64> Position::line_bb{};
 
 uint64_t Position::piece_hashkey[12][64]{};
 uint64_t Position::enpassant_hashkey[64]{};
