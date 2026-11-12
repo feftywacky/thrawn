@@ -6,7 +6,7 @@
 #include "globals.h"
 #include "constants.h"
 
-const std::string version = " v3.2";
+const std::string version = " v3.3";
 
 
 void init_all()
