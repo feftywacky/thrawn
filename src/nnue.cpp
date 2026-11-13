@@ -288,7 +288,9 @@ struct LoadedNetwork {
     RoundingDivider div_qfc1;
     std::array<uint8_t, 256> screlu_lut{};
 
-    std::array<int16_t, kExpectedFtSize> ft_bias{};
+    // Full AVX2/AVX-512 refreshes read this buffer with aligned SIMD loads.
+    // Keep the bias aligned just like the accumulator and feature rows.
+    alignas(thrawn::NNUE_SIMD_ALIGNMENT) std::array<int16_t, kExpectedFtSize> ft_bias{};
     AlignedFtWeights ft_weight;
 
     std::array<int32_t, kExpectedFc0OutputSize> fc0_bias{};
