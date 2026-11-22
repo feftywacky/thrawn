@@ -3,16 +3,27 @@
 Thrawn is a high performance uci-compliant chess engine written in C++.
 
 ## Rating
-Thrawn's ratings are tracked by [CCRL](https://computerchess.org.uk/ccrl/404/).
+Thrawn's ratings are tracked by [CCRL](https://computerchess.org.uk/ccrl/404/). The main rating is CCRL Blitz (2'+1"); CCRL 40/15 is listed below.
+
+### CCRL Blitz
 
 | Version | Rating | Eval |
 | --- | --- | --- |
-| [v3.2](https://computerchess.org.uk/404/cgi/compare_engines.cgi?family=Thrawn&print=Rating+list&print=Results+table&print=LOS+table&print=Ponder+hit+table&print=Eval+difference+table&print=Comopp+gamenum+table&print=Overlap+table&print=Score+with+common+opponents) | ~3591 ELO | [thrawn-nn-2](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-2) |
+| [v3.3](https://computerchess.org.uk/404/cgi/compare_engines.cgi?family=Thrawn&print=Rating+list&print=Results+table&print=LOS+table&print=Ponder+hit+table&print=Eval+difference+table&print=Comopp+gamenum+table&print=Overlap+table&print=Score+with+common+opponents) | ~3636 ELO | [thrawn-nn-2](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-2) |
+| [v3.2](https://computerchess.org.uk/404/cgi/compare_engines.cgi?family=Thrawn&print=Rating+list&print=Results+table&print=LOS+table&print=Ponder+hit+table&print=Eval+difference+table&print=Comopp+gamenum+table&print=Overlap+table&print=Score+with+common+opponents) | ~3592 ELO | [thrawn-nn-2](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-2) |
 | [v3.1](https://computerchess.org.uk/404/cgi/compare_engines.cgi?family=Thrawn&print=Rating+list&print=Results+table&print=LOS+table&print=Ponder+hit+table&print=Eval+difference+table&print=Comopp+gamenum+table&print=Overlap+table&print=Score+with+common+opponents) | ~3469 ELO | [thrawn-nn-2](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-2) |
 | [v3.0](https://computerchess.org.uk/404/cgi/compare_engines.cgi?family=Thrawn&print=Rating+list&print=Results+table&print=LOS+table&print=Ponder+hit+table&print=Eval+difference+table&print=Comopp+gamenum+table&print=Overlap+table&print=Score+with+common+opponents) | ~2941 ELO | [thrawn-nn-1](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-1) |
 | v2.2 | ~2900 ELO | Stockfish NNUE |
 | v2.0 | ~2800 ELO | Stockfish NNUE |
 | [v1.1](https://computerchess.org.uk/ccrl/404/cgi/compare_engines.cgi?class=None&only_best_in_class=on&num_best_in_class=1&e=Thrawn+1.1+64-bit&print=Rating+list&profile_step=50&profile_numbers=1&print=Results+table&print=LOS+table&table_size=100&ct_from_elo=0&ct_to_elo=10000&match_length=30&cross_tables_for_best_versions_only=1&sort_tables=by+rating&diag=0&reference_list=None&recalibrate=no) | ~1897 ELO | HCE |
+
+### CCRL 40/15
+
+| Version | Rating | Eval |
+| --- | --- | --- |
+| [v3.2](https://computerchess.org.uk/404/cgi/compare_engines.cgi?family=Thrawn&print=Rating+list&print=Results+table&print=LOS+table&print=Ponder+hit+table&print=Eval+difference+table&print=Comopp+gamenum+table&print=Overlap+table&print=Score+with+common+opponents) | ~3525 ELO | [thrawn-nn-2](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-2) |
+| v3.3 | ~3518 ELO (provisional, 38 games, ±66) | [thrawn-nn-2](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-2) |
+| v3.1 | ~3397 ELO | [thrawn-nn-2](https://github.com/feftywacky/thrawn-nnue/releases/tag/thrawn-nn-2) |
 
 ## Getting Started
 Download from latest release or build from source. Released binaries have the
